@@ -1,0 +1,122 @@
+<?xml version="1.0" ?>
+<NetAnim version="3.0">
+  <Node id="0" name="GEO Satellite (H=35786km)" type="satellite" color="#FFD700">
+    <Position x="500" y="500" z="0"/>
+  </Node>
+  <Node id="1" name="Gateway Station" type="gateway" color="#4169E1">
+    <Position x="300" y="500" z="0"/>
+  </Node>
+  <Node id="2" name="Beam 0 (Color 0)" type="beam" color="#FF0000">
+    <Position x="500" y="500" z="0"/>
+  </Node>
+  <Node id="3" name="Beam 1 (Color 1)" type="beam" color="#00FF00">
+    <Position x="700.0" y="500.0" z="0"/>
+  </Node>
+  <Node id="4" name="Beam 2 (Color 2)" type="beam" color="#0000FF">
+    <Position x="600.0" y="673.2050807568877" z="0"/>
+  </Node>
+  <Node id="5" name="Beam 3 (Color 3)" type="beam" color="#FFFF00">
+    <Position x="400.00000000000006" y="673.2050807568878" z="0"/>
+  </Node>
+  <Node id="6" name="Beam 4 (Color 4)" type="beam" color="#FF00FF">
+    <Position x="300.0" y="500.0" z="0"/>
+  </Node>
+  <Node id="7" name="Beam 5 (Color 5)" type="beam" color="#00FFFF">
+    <Position x="399.9999999999999" y="326.7949192431123" z="0"/>
+  </Node>
+  <Node id="8" name="Beam 6 (Color 6)" type="beam" color="#FFA500">
+    <Position x="600.0" y="326.7949192431123" z="0"/>
+  </Node>
+  <Node id="10" name="UE-0 (Beam-0)" type="ue" color="#FF0000">
+    <Position x="-338375.42865433136" y="208797.342722321" z="0"/>
+  </Node>
+  <Node id="11" name="UE-1 (Beam-0)" type="ue" color="#FF0000">
+    <Position x="-31787.57026281844" y="13184.98362330544" z="0"/>
+  </Node>
+  <Node id="12" name="UE-2 (Beam-0)" type="ue" color="#FF0000">
+    <Position x="212531.87314115113" y="66295.64164342983" z="0"/>
+  </Node>
+  <Node id="13" name="UE-3 (Beam-1)" type="ue" color="#00FF00">
+    <Position x="29008.88154882481" y="-66676.17688769553" z="0"/>
+  </Node>
+  <Node id="14" name="UE-4 (Beam-1)" type="ue" color="#00FF00">
+    <Position x="-10.002350362253878" y="-330949.5244478424" z="0"/>
+  </Node>
+  <Node id="15" name="UE-5 (Beam-1)" type="ue" color="#00FF00">
+    <Position x="-67043.92899374562" y="177660.63487097496" z="0"/>
+  </Node>
+  <Node id="16" name="UE-6 (Beam-2)" type="ue" color="#0000FF">
+    <Position x="-322619.5960028942" y="-229551.6081434196" z="0"/>
+  </Node>
+  <Node id="17" name="UE-7 (Beam-2)" type="ue" color="#0000FF">
+    <Position x="-136606.91032812218" y="106048.85544119254" z="0"/>
+  </Node>
+  <Node id="18" name="UE-8 (Beam-2)" type="ue" color="#0000FF">
+    <Position x="-6326.175243042594" y="6583.435388742524" z="0"/>
+  </Node>
+  <Node id="19" name="UE-9 (Beam-3)" type="ue" color="#FFFF00">
+    <Position x="-188800.74152078843" y="-52826.07601513699" z="0"/>
+  </Node>
+  <Node id="20" name="UE-10 (Beam-3)" type="ue" color="#FFFF00">
+    <Position x="252511.2828274005" y="-194975.40912945234" z="0"/>
+  </Node>
+  <Node id="21" name="UE-11 (Beam-3)" type="ue" color="#FFFF00">
+    <Position x="-59007.529847940656" y="-24495.08624188692" z="0"/>
+  </Node>
+  <Node id="22" name="UE-12 (Beam-4)" type="ue" color="#FF00FF">
+    <Position x="364959.32209862006" y="9306.708802163594" z="0"/>
+  </Node>
+  <Node id="23" name="UE-13 (Beam-4)" type="ue" color="#FF00FF">
+    <Position x="-115901.3925075986" y="-104477.6225200016" z="0"/>
+  </Node>
+  <Node id="24" name="UE-14 (Beam-4)" type="ue" color="#FF00FF">
+    <Position x="-39747.043420849994" y="-84165.84737702602" z="0"/>
+  </Node>
+  <Node id="25" name="UE-15 (Beam-5)" type="ue" color="#00FFFF">
+    <Position x="9554.471345663404" y="-147869.12508660572" z="0"/>
+  </Node>
+  <Node id="26" name="UE-16 (Beam-5)" type="ue" color="#00FFFF">
+    <Position x="-62670.34003626082" y="37054.79127715699" z="0"/>
+  </Node>
+  <Node id="27" name="UE-17 (Beam-5)" type="ue" color="#00FFFF">
+    <Position x="65847.03116537632" y="-70098.69626552169" z="0"/>
+  </Node>
+  <Node id="28" name="UE-18 (Beam-6)" type="ue" color="#FFA500">
+    <Position x="10558.289107770825" y="369759.0341064414" z="0"/>
+  </Node>
+  <Node id="29" name="UE-19 (Beam-6)" type="ue" color="#FFA500">
+    <Position x="-118735.52949543539" y="-116029.90365747178" z="0"/>
+  </Node>
+  <Node id="30" name="UE-20 (Beam-6)" type="ue" color="#FFA500">
+    <Position x="280629.9144995996" y="97747.1954156445" z="0"/>
+  </Node>
+  <Link src="0" dst="1" type="feeder"/>
+  <Link src="1" dst="2" type="feeder"/>
+  <Link src="1" dst="3" type="feeder"/>
+  <Link src="1" dst="4" type="feeder"/>
+  <Link src="1" dst="5" type="feeder"/>
+  <Link src="1" dst="6" type="feeder"/>
+  <Link src="1" dst="7" type="feeder"/>
+  <Link src="1" dst="8" type="feeder"/>
+  <Link src="2" dst="10" type="user"/>
+  <Link src="2" dst="11" type="user"/>
+  <Link src="2" dst="12" type="user"/>
+  <Link src="3" dst="13" type="user"/>
+  <Link src="3" dst="14" type="user"/>
+  <Link src="3" dst="15" type="user"/>
+  <Link src="4" dst="16" type="user"/>
+  <Link src="4" dst="17" type="user"/>
+  <Link src="4" dst="18" type="user"/>
+  <Link src="5" dst="19" type="user"/>
+  <Link src="5" dst="20" type="user"/>
+  <Link src="5" dst="21" type="user"/>
+  <Link src="6" dst="22" type="user"/>
+  <Link src="6" dst="23" type="user"/>
+  <Link src="6" dst="24" type="user"/>
+  <Link src="7" dst="25" type="user"/>
+  <Link src="7" dst="26" type="user"/>
+  <Link src="7" dst="27" type="user"/>
+  <Link src="8" dst="28" type="user"/>
+  <Link src="8" dst="29" type="user"/>
+  <Link src="8" dst="30" type="user"/>
+</NetAnim>
