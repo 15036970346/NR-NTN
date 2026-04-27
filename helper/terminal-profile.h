@@ -4,7 +4,15 @@
 #include "ns3/object.h"
 #include "../model/resource-manager.h"
 
+#include <string>
+
 namespace ns3 {
+
+enum SatDataServiceType {
+  SAT_DATA_HTTP,
+  SAT_DATA_FTP
+};
+
 
 /**
  * \brief Lightweight per-UE profile attached directly to each node.
@@ -26,9 +34,19 @@ public:
   void SetBeamId (uint16_t beamId);
   uint16_t GetBeamId () const;
 
+  void SetVoiceEnabled (bool enabled);
+  bool HasVoiceService () const;
+
+  void SetDataServiceType (SatDataServiceType type);
+  SatDataServiceType GetDataServiceType () const;
+
+  std::string DescribeTrafficProfile () const;
+
 private:
   UtType m_terminalType;
   uint16_t m_beamId;
+  bool m_voiceEnabled;
+  SatDataServiceType m_dataServiceType;
 };
 
 } // namespace ns3

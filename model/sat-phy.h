@@ -16,6 +16,7 @@
 #include "ns3/ptr.h"
 #include "ns3/packet.h"
 #include "ns3/net-device.h"
+#include "ns3/callback.h"
 // [Fix] 必须包含这个文件，否则编译器找不到基类的定义
 #include "ns3/spectrum-signal-parameters.h"
 
@@ -53,6 +54,7 @@ public:
   Ptr<Object> GetPhyRx () const;
   void SetPhyTx (Ptr<Object> tx);
   void SetPhyRx (Ptr<Object> rx);
+  void SetRxPacketCallback (Callback<void, Ptr<Packet>> callback);
 
   Ptr<SpectrumChannel> GetTxChannel () const;
 
@@ -98,6 +100,7 @@ protected:
 
   Ptr<Object> m_phyTxObj;
   Ptr<Object> m_phyRxObj;
+  Callback<void, Ptr<Packet>> m_rxPacketCallback;
 
   TracedCallback<Ptr<const Packet>> m_txTrace;
   TracedCallback<Ptr<const Packet>> m_rxTrace;

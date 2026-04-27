@@ -7,9 +7,9 @@
 #include "ns3/nstime.h"
 #include "ns3/traced-callback.h"
 #include "sat-mac-common.h"
+#include "resource-manager.h"
 #include "sat-phy.h"        // 引入物理层
 #include "sat-ut-phy.h"     // 引入终端物理层(含MultipleAccessMode枚举)
-#include "resource-manager.h"  // UtType 定义
 
 namespace ns3 {
 
@@ -38,7 +38,7 @@ public:
     void ProcessDciAndSchedule (DciInfo dci);
 
     // 核心任务2：执行实际的数据传输操作
-    void DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs);
+    void DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs, double txPowerDbm);
 
     // 核心任务3：接收下行数据
     void ReceiveData (Ptr<Packet> packet, const DciInfo& dci);
@@ -65,10 +65,10 @@ public:
     void SendBsr (uint8_t lcgId, uint32_t bufferSize);
 
     // 设置BSR回调 (用于通知调度器有数据需要发送)
-    void SetBsrCallback (Callback<void, BsR_MAC_CE> callback);
+    void SetBsrCallback (Callback<void, const BsR_MAC_CE&> callback);
 
     // 设置PUCCH回调 (用于向信关站发送UCI)
-    void SetPucchCallback (Callback<void, PucchInfo> callback);
+    void SetPucchCallback (Callback<void, const PucchInfo&> callback);
 
     // 设置PRACH回调 (用于随机接入)
     void SetPrachCallback (Callback<void, const PrachPreamble&> callback);
@@ -86,6 +86,7 @@ public:
 
     // Msg3: 组装 RRCSetupRequest (携带自身 ueIdentity 与收到的 tcRnti) 并上送
     void SendMsg3 ();
+    void DeliverPendingMsg3 ();
 
     // Msg4: 接收 RRCSetup, 比对回显的 ueIdentity 完成竞争解决
     void ReceiveMsg4 (const RrcSetupMessage& msg4);
@@ -109,6 +110,9 @@ public:
     // 设置本 UE 的唯一身份 (40-bit contention resolution ID)
     void SetUeIdentity (uint64_t ueIdentity);
     uint64_t GetUeIdentity () const;
+    void SetUtType (UtType utType);
+    void SetRnti (uint16_t rnti);
+    uint16_t GetActiveRnti () const;
 
     // 配置 RA 定时器和最大重传次数
     void SetRaTimers (Time raResponseWindow, Time contentionResolutionTimer, uint8_t maxAttempts);
@@ -117,8 +121,8 @@ public:
     void SetNumPreambles (uint32_t n);
     uint32_t GetNumPreambles () const;
 
-    // 设置 Msg3 发送回调 (上送到 GeoBeamScheduler::ReceiveMsg3)
-    void SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback);
+    // 设置 Msg3 发送回调 (上送到 GeoBeamScheduler::ReceiveMsg3Packet)
+    void SetMsg3Callback (Callback<void, Ptr<Packet>> callback);
 
     // 随机接入完成 (成功/失败) 回调, 便于测试统计
     enum RaResult {
@@ -167,8 +171,8 @@ private:
     bool m_srPending;       // SR挂起标志
     uint8_t m_pendingCqi;   // 待发送的CQI值
     bool m_pendingHarqAck;  // 待发送的HARQ ACK/NACK
-    Callback<void, BsR_MAC_CE> m_bsrCallback;
-    Callback<void, PucchInfo> m_pucchCallback;
+    Callback<void, const BsR_MAC_CE&> m_bsrCallback;
+    Callback<void, const PucchInfo&> m_pucchCallback;
     Callback<void, const PrachPreamble&> m_prachCallback;
     uint32_t m_currentBufferBytes; // 当前缓冲区字节数
     
@@ -178,8 +182,11 @@ private:
     bool m_isRaInitiated;                      // 是否正在执行 RA
     uint32_t m_pendingUlGrant;                 // RAR 中收到的 UL Grant (PRB 数)
     uint8_t m_pendingUlGrantMcs;               // RAR 中收到的 Msg3 MCS
+    double m_pendingUlGrantTxPowerDbm;         // RAR 中收到的 Msg3 目标发射功率
 
     uint64_t m_ueIdentity;                     // 本 UE 的竞争解决身份
+    UtType m_utType;                          // 终端类型
+    uint16_t m_rnti;                          // 已连接业务面使用的 UE 标识
     uint32_t m_currentPreambleId;              // 当前本次 RA 使用的 preambleId
     uint32_t m_currentRaRnti;                  // 当前本次 RA 的 RA-RNTI (区分 PRACH occasion)
     uint16_t m_tcRnti;                         // Msg2 中分配给本 UE 的 TC-RNTI (0 表示尚未获得)
@@ -195,7 +202,7 @@ private:
     EventId m_contentionResolutionTimer;       // 竞争解决定时器 (等 Msg4)
     EventId m_msg3TxEvent;                     // Msg3 延迟发送事件
 
-    Callback<void, const RrcSetupRequest&> m_msg3Callback;
+    Callback<void, Ptr<Packet>>            m_msg3Callback;
     Callback<void, RaResult>                m_raCompleteCallback;
 
     // ---------- 接入过程统计计数器 ----------
@@ -209,17 +216,11 @@ private:
     TracedCallback<uint16_t, int64_t>  m_queueDelayTrace;   // (rnti, delay_ns)
 
     // ---------- 信道质量门限 ----------
-    // 基线：卫星 EIRP - 路损(190dB) + 手机天线增益(0dBi) = -93 dBm
-    // 链路余量 1.5 dB → RSRP 门限 = -94.5 dBm
-    // 消费级手机 SNR 门限: 3.3 - 1.5 = 1.8 dB
-    // 便携终端 SNR 门限: 22.3 - 1.5 = 20.8 dB
     static constexpr double RSRP_THRESHOLD_DBM    = -94.5;
     static constexpr double SNR_THRESHOLD_CONSUMER = 1.8;
     static constexpr double SNR_THRESHOLD_PORTABLE = 20.8;
 
-    bool CheckChannelQuality () const;  // true = 满足门限, false = 信道不足
-
-    UtType m_utType;                               // 终端类型 (影响 SNR 门限选择)
+    bool CheckChannelQuality () const;
 
     // ---------- 2 步随机接入状态 ----------
     RachType m_rachType;                           // 当前 RA 模式 (默认 FOUR_STEP)
@@ -229,6 +230,11 @@ private:
 
     // ---------- MAC 层队列时延追踪 ----------
     Time m_bufferArrivalTime;  // 最早未发送数据的入队时间
+
+    // ---------- Msg3 Packet 缓存 (qyh) ----------
+    bool m_hasPendingMsg3;
+    RrcSetupRequest m_pendingMsg3Request;
+    Ptr<Packet> m_pendingMsg3Packet;
 };
 
 } // namespace ns3

@@ -9,6 +9,7 @@
 #include "ns3/nr-mac-csched-sap.h"
 #include "ns3/nr-mac-sched-sap.h"
 #include "ns3/log.h"
+#include "ns3/packet.h"
 #include "ns3/vector.h"
 #include "sat-mac-common.h"
 #include "resource-manager.h"
@@ -22,15 +23,22 @@ struct SatUeContext {
   uint16_t rnti;
   uint32_t currentBeamId;
   double latestCqi;
-  uint32_t bufferStatus;
-  double averageThroughput;
+  double latestRsrp;
+  uint32_t dlBufferStatus;
+  uint32_t ulBufferStatus;
+  uint32_t pendingUlGrantRbs;
+  uint32_t pendingUlGrantBytes;
+  bool srPending;
+  double dlAverageThroughput;
+  double ulAverageThroughput;
   Vector position;             // UE位置 (用于IPF算法)
 
   UtType utType;
   TrafficType trafficType;
   ServicePriority priority;     // 业务优先级
   double wrrWeight;            // WRR权重
-  Time lastScheduledTime;      // 上次调度时间
+  Time lastDlScheduledTime;    // 上次下行调度时间
+  Time lastUlScheduledTime;    // 上次上行调度时间
 };
 
 // 用于切换上下文转移的结构体
@@ -39,10 +47,19 @@ struct HandoverUeContext {
     uint32_t sourceBeamId;
     uint32_t targetBeamId;
     double latestCqi;
-    uint32_t unsentBufferBytes;
-    double averageThroughput;
+    double latestRsrp;
+    uint32_t unsentDlBufferBytes;
+    uint32_t unsentUlBufferBytes;
+    uint32_t pendingUlGrantRbs;
+    uint32_t pendingUlGrantBytes;
+    bool srPending;
+    double dlAverageThroughput;
+    double ulAverageThroughput;
     UtType utType;
     TrafficType trafficType;
+    Callback<void, DciInfo> dciCallback;
+    Time lastDlScheduledTime;
+    Time lastUlScheduledTime;
 };
 
 class GeoBeamScheduler : public NrMacScheduler
@@ -64,6 +81,8 @@ public:
   void ExecuteHandover (uint16_t rnti, uint32_t targetBeamId);
 
   void UpdateUeCsi (uint16_t rnti, double cqi);
+  void UpdateUeDlBufferStatus (uint16_t rnti, uint32_t bufferBytes);
+  void UpdateUeUlBufferStatus (uint16_t rnti, uint32_t bufferBytes);
   void UpdateUePosition (uint16_t rnti, Vector position);
   void PreProcessRequests ();
 
@@ -72,21 +91,25 @@ public:
 
   void ReceiveMeasReport (const MeasReport& report);
   void SendDciToUe (uint16_t ueId, const DciInfo& dci);
+  void RegisterUeDciCallback (uint16_t ueId, Callback<void, DciInfo> dciCb);
 
   // ==================== 准入控制接口 ====================
   void SetAdmitControl (Ptr<AdmitControl> admitControl);
-  bool CheckHandoverAdmission (uint32_t targetBeamId, ServicePriority priority, uint32_t requiredRbs);
+  bool CheckHandoverAdmission (uint32_t targetBeamId, ServicePriority priority, UtType utType,
+                               TrafficType trafficType, uint32_t requiredRbs, bool isUplink = false);
 
   // ==================== PUCCH/BSR 处理接口 ====================
   void ReceivePucchInfo (const PucchInfo& pucchInfo);
   void ReceiveBsr (const BsR_MAC_CE& bsr);
-  void ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs);
+  void ReceiveUlMacPdu (Ptr<Packet> packet);
+  uint32_t ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs);
 
   // ==================== 4 步随机接入接口 (基站侧) ====================
   // Msg1: UE → gNB, 前导码收集
   void ReceivePrachPreamble (const PrachPreamble& preamble);
   // Msg3: UE → gNB, RRC 连接建立请求 (承载在 PUSCH 上)
   void ReceiveMsg3 (const RrcSetupRequest& req);
+  void ReceiveMsg3Packet (Ptr<Packet> packet);
   // UE 订阅下行 RA 消息 (RAR/Msg4) 的广播回调
   void RegisterUeRaCallbacks (Callback<void, const RarMessage&> rarCb,
                               Callback<void, const RrcSetupMessage&> msg4Cb);
@@ -122,9 +145,21 @@ public:
   virtual int64_t AssignStreams (int64_t stream) override;
 
 private:
-  uint8_t GetMcsFromCqi (double cqi);
+  uint8_t GetMcsFromCqi (double cqi) const;
   ServicePriority MapTrafficTypeToPriority (TrafficType trafficType);
   double CalculateWrrWeight (ServicePriority priority, UtType utType);
+  double EstimateBytesPerRb (double cqi) const;
+  double CalculateLocationFactor (const Vector& position) const;
+  double CalculateSchedulerMetric (const SatUeContext& ctx,
+                                   uint32_t queueBudget,
+                                   bool isUplink,
+                                   double urgencyBoost,
+                                   double demandBytes) const;
+  void BeginUlSchedulingPeriod (uint32_t beamId, uint64_t schedulingRoundId = 0);
+  void RunUlScheduler ();
+  void RunUlSchedulerForBeam (uint32_t beamId);
+  uint32_t GetEffectiveUlDemandBytes (const SatUeContext& ctx) const;
+  void RefreshPendingUlGrantEstimate (SatUeContext& ctx) const;
 
   // ---------- 随机接入辅助 ----------
   // 上行到达后延迟入缓冲 (模拟上行传播)
@@ -147,6 +182,7 @@ private:
 
   std::map<uint16_t, SatUeContext> m_ueContextMap;           
   std::map<uint32_t, std::vector<uint16_t>> m_beamToUesMap;  
+  std::map<uint16_t, Callback<void, DciInfo>> m_ueDciCallbackMap;
   
   Time m_defaultK2Delay; 
   uint32_t m_myBeamId;   
@@ -162,11 +198,22 @@ private:
   // IPF参数
   double m_ipfLocationWeight;   // 位置权重因子 (0-1)
   double m_ipfFairnessWeight;    // 公平性权重因子
+  double m_emergencyDelayThresholdSeconds;
+  double m_referencePathLossDb;
+  uint32_t m_srGrantRbs;
+  uint8_t m_srGrantMcs;
+  uint32_t m_msg3RequestedRbs;
+  uint8_t m_msg3GrantMcs;
+  uint32_t m_msg3DefaultUtTypeValue;
+  std::map<uint32_t, uint64_t> m_ulSchedulingRoundIdByBeam;
+  uint64_t m_nextUlSchedulingRoundId;
+  std::map<uint16_t, Time> m_admissionQueueSince;
 
   // ---------- 4 步 RA 运行时状态 ----------
   // 每条记录一次 preamble 到达；末尾字段为真实发送时间戳 (tie-break 用)
   struct PreambleArrival {
     uint32_t preambleId;
+    UtType   utType;
     Time     arrivalTime;
     uint32_t raRnti;       // UE 提供的 RA-RNTI, 区分不同 PRACH occasion
   };

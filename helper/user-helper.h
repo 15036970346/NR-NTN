@@ -46,6 +46,7 @@ public:
   
   void SetNrHelper (Ptr<NrHelper> nrHelper);
   void SetConsumerShare (double consumerShare);
+  void SetPortableHttpShare (double portableHttpShare);
 
   /**
    * \brief 设置多个波束信息
@@ -90,6 +91,7 @@ private:
 
   uint16_t m_beamId;
   double m_consumerShare;
+  double m_portableHttpShare;
   std::vector<BeamInfo> m_beams;  //!< 多个波束信息
   MobilityHelper m_mobility;
   Ipv4AddressHelper m_ipv4;  //!< 保持兼容，保留私有成员

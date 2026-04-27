@@ -16,7 +16,9 @@ SatTerminalProfile::GetTypeId (void)
 
 SatTerminalProfile::SatTerminalProfile ()
   : m_terminalType (UT_CONSUMER),
-    m_beamId (0)
+    m_beamId (0),
+    m_voiceEnabled (true),
+    m_dataServiceType (SAT_DATA_HTTP)
 {
 }
 
@@ -44,6 +46,39 @@ uint16_t
 SatTerminalProfile::GetBeamId () const
 {
   return m_beamId;
+}
+
+void
+SatTerminalProfile::SetVoiceEnabled (bool enabled)
+{
+  m_voiceEnabled = enabled;
+}
+
+bool
+SatTerminalProfile::HasVoiceService () const
+{
+  return m_voiceEnabled;
+}
+
+void
+SatTerminalProfile::SetDataServiceType (SatDataServiceType type)
+{
+  m_dataServiceType = type;
+}
+
+SatDataServiceType
+SatTerminalProfile::GetDataServiceType () const
+{
+  return m_dataServiceType;
+}
+
+std::string
+SatTerminalProfile::DescribeTrafficProfile () const
+{
+  std::string terminal = (m_terminalType == UT_CONSUMER) ? "UT_CONSUMER" : "UT_PORTABLE";
+  std::string data = (m_dataServiceType == SAT_DATA_HTTP) ? "HTTP" : "FTP";
+  std::string voice = m_voiceEnabled ? "VoIP" : "NoVoice";
+  return terminal + "/" + voice + "+" + data;
 }
 
 } // namespace ns3

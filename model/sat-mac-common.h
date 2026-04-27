@@ -5,6 +5,8 @@
 #ifndef SAT_MAC_COMMON_H
 #define SAT_MAC_COMMON_H
 
+#include "ns3/buffer.h"
+#include "ns3/header.h"
 #include "ns3/nstime.h"
 #include "ns3/vector.h"
 #include <stdint.h>
@@ -32,6 +34,7 @@ struct DciInfo {
     bool isUplinkGrant;      // 是否为上行授权
     uint32_t rbAllocation;   // 分配的 RB 数量
     uint8_t mcs;             // 调制编码策略
+    double txPowerDbm;       // 上行授权对应的目标发射功率 (DL调度时置0)
     Time delayToStart;       // 调度延迟 (K2)
     Time duration;           // 授权持续时间
 };
@@ -78,6 +81,7 @@ struct PrachPreamble {
     uint16_t rnti;           // 用户标识 (如果已分配)
     uint32_t preambleId;      // 前导码ID (0-63)
     uint8_t format;          // PRACH格式 (0-4)
+    uint8_t utType;          // 终端类型 (0=portable, 1=consumer)
     Time transmissionTime;    // 传输时间
     bool isRetransmission;   // 是否为重传
     uint32_t raRnti;         // RA-RNTI: 由 PRACH 发送时刻派生, 区分不同 PRACH occasion
@@ -105,6 +109,7 @@ struct RarMessage {
     Time     timingAdvance;       // 定时提前量 (GEO ~300 ms)
     uint32_t ulGrantRbs;          // Msg3 的 UL Grant (PRB 数)
     uint8_t  ulGrantMcs;          // Msg3 的 MCS
+    double   ulGrantTxPowerDbm;   // Msg3 的目标发射功率
     Time     msg3DelayToStart;    // Msg3 相对 RAR 的触发延迟 (K2)
     Time     transmissionTime;    // 发送时间戳
 };
@@ -118,6 +123,164 @@ struct RrcSetupRequest {
     uint8_t  establishmentCause;  // 0=mt-Access 1=mo-Signalling 2=mo-Data ...
     uint32_t preambleIdUsed;      // 发起本次接入时使用的 PreambleId (调试/追踪)
     Time     transmissionTime;    // 发送时间戳
+};
+
+class GenericUlMacHeader : public Header
+{
+public:
+    static TypeId GetTypeId (void)
+    {
+        static TypeId tid = TypeId ("ns3::GenericUlMacHeader")
+            .SetParent<Header> ()
+            .SetGroupName ("SatGeo")
+            .AddConstructor<GenericUlMacHeader> ();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId () const override
+    {
+        return GetTypeId ();
+    }
+
+    uint32_t GetSerializedSize () const override
+    {
+        return 14;
+    }
+
+    void Serialize (Buffer::Iterator start) const override
+    {
+        start.WriteU16 (m_rnti);
+        start.WriteU32 (m_payloadBytes);
+        start.WriteU64 (m_transmissionTimeNs);
+    }
+
+    uint32_t Deserialize (Buffer::Iterator start) override
+    {
+        m_rnti = start.ReadU16 ();
+        m_payloadBytes = start.ReadU32 ();
+        m_transmissionTimeNs = start.ReadU64 ();
+        return GetSerializedSize ();
+    }
+
+    void Print (std::ostream& os) const override
+    {
+        os << "rnti=" << m_rnti
+           << " payloadBytes=" << m_payloadBytes
+           << " txNs=" << m_transmissionTimeNs;
+    }
+
+    void SetRnti (uint16_t rnti)
+    {
+        m_rnti = rnti;
+    }
+
+    uint16_t GetRnti () const
+    {
+        return m_rnti;
+    }
+
+    void SetPayloadBytes (uint32_t payloadBytes)
+    {
+        m_payloadBytes = payloadBytes;
+    }
+
+    uint32_t GetPayloadBytes () const
+    {
+        return m_payloadBytes;
+    }
+
+    void SetTransmissionTime (Time txTime)
+    {
+        m_transmissionTimeNs = static_cast<uint64_t> (txTime.GetNanoSeconds ());
+    }
+
+    Time GetTransmissionTime () const
+    {
+        return NanoSeconds (m_transmissionTimeNs);
+    }
+
+private:
+    uint16_t m_rnti {0};
+    uint32_t m_payloadBytes {0};
+    uint64_t m_transmissionTimeNs {0};
+};
+
+class Msg3MacHeader : public Header
+{
+public:
+    static TypeId GetTypeId (void)
+    {
+        static TypeId tid = TypeId ("ns3::Msg3MacHeader")
+            .SetParent<Header> ()
+            .SetGroupName ("SatGeo")
+            .AddConstructor<Msg3MacHeader> ();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId () const override
+    {
+        return GetTypeId ();
+    }
+
+    uint32_t GetSerializedSize () const override
+    {
+        return 23;
+    }
+
+    void Serialize (Buffer::Iterator start) const override
+    {
+        start.WriteU16 (m_tcRnti);
+        start.WriteU64 (m_ueIdentity);
+        start.WriteU8 (m_establishmentCause);
+        start.WriteU32 (m_preambleIdUsed);
+        start.WriteU64 (m_transmissionTimeNs);
+    }
+
+    uint32_t Deserialize (Buffer::Iterator start) override
+    {
+        m_tcRnti = start.ReadU16 ();
+        m_ueIdentity = start.ReadU64 ();
+        m_establishmentCause = start.ReadU8 ();
+        m_preambleIdUsed = start.ReadU32 ();
+        m_transmissionTimeNs = start.ReadU64 ();
+        return GetSerializedSize ();
+    }
+
+    void Print (std::ostream& os) const override
+    {
+        os << "tcRnti=" << m_tcRnti
+           << " ueIdentity=" << m_ueIdentity
+           << " cause=" << static_cast<uint32_t> (m_establishmentCause)
+           << " preambleId=" << m_preambleIdUsed
+           << " txNs=" << m_transmissionTimeNs;
+    }
+
+    void SetRequest (const RrcSetupRequest& req)
+    {
+        m_tcRnti = req.tcRnti;
+        m_ueIdentity = req.ueIdentity;
+        m_establishmentCause = req.establishmentCause;
+        m_preambleIdUsed = req.preambleIdUsed;
+        m_transmissionTimeNs = static_cast<uint64_t> (req.transmissionTime.GetNanoSeconds ());
+    }
+
+    RrcSetupRequest ToRequest () const
+    {
+        RrcSetupRequest req;
+        req.tcRnti = m_tcRnti;
+        req.ueIdentity = m_ueIdentity;
+        req.establishmentCause = m_establishmentCause;
+        req.preambleIdUsed = m_preambleIdUsed;
+        req.transmissionTime = NanoSeconds (m_transmissionTimeNs);
+        return req;
+    }
+
+private:
+    uint16_t m_tcRnti {0};
+    uint64_t m_ueIdentity {0};
+    uint8_t m_establishmentCause {0};
+    uint32_t m_preambleIdUsed {0};
+    uint64_t m_transmissionTimeNs {0};
 };
 
 // Msg4: RRCSetup (gNB → UE) —— 完成竞争解决

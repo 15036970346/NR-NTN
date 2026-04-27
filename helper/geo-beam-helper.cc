@@ -21,7 +21,7 @@ NS_LOG_COMPONENT_DEFINE ("GeoBeamHelper");
  * \brief 4色复用频率配置
  * \details
  * - 名义总波束带宽: 35 MHz (7 beams x 5 MHz)
- * - 每个复用色组: 5 MHz
+ * - 每个复用色组: 5 MHz (25 PRB, 子载波间隔15kHz)
  * - 频点分配: 7个波束映射到4个中心频点
  * - S频段下行: 2170-2200 MHz
  *
@@ -45,7 +45,7 @@ const std::vector<BeamFrequencyConfig> g_4ColorFrequencyConfig = {
  * \brief 7色复用频率配置
  * \details
  * - 名义总波束带宽: 35 MHz (7 beams x 5 MHz)
- * - 每波束带宽: 5 MHz
+ * - 每波束带宽: 5 MHz (25 PRB, 子载波间隔15kHz)
  * - 频点分配: 7个波束使用7个不重叠的中心频点
  * - S频段下行: 2170-2200 MHz
  *

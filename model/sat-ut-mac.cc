@@ -45,7 +45,10 @@ SatUtMac::SatUtMac ()
       m_isRaInitiated (false),
       m_pendingUlGrant (0),
       m_pendingUlGrantMcs (0),
+      m_pendingUlGrantTxPowerDbm (23.0),
       m_ueIdentity (0),
+      m_utType (UT_PORTABLE),
+      m_rnti (0),
       m_currentPreambleId (0),
       m_currentRaRnti (0),
       m_tcRnti (0),
@@ -63,9 +66,9 @@ SatUtMac::SatUtMac ()
       m_totalMsgBTimeouts (0),
       m_utType (UT_CONSUMER),
       m_rachType (RachType::FOUR_STEP),
-      // MsgB 响应窗口: UL prop(300) + processing(2) + DL prop(300) + margin
       m_msgBResponseWindow (MilliSeconds (1500)),
-      m_bufferArrivalTime (Seconds (0))
+      m_bufferArrivalTime (Seconds (0)),
+      m_hasPendingMsg3 (false)
 {
     NS_LOG_FUNCTION (this);
 
@@ -90,22 +93,24 @@ void SatUtMac::ProcessDciAndSchedule (DciInfo dci) {
     NS_LOG_FUNCTION (this);
     
     if (m_state == MAC_IDLE) {
-        NS_LOG_WARN ("UT 处于 IDLE 状态，忽略 DCI 调度。");
-        return;
+        const bool allowRaMsg3Grant = dci.isUplinkGrant && m_isRaInitiated && m_tcRnti != 0;
+        if (!allowRaMsg3Grant) {
+            NS_LOG_WARN ("UT 处于 IDLE 状态，忽略 DCI 调度。");
+            return;
+        }
+        NS_LOG_INFO ("UT 处于 IDLE，但当前为 RA Msg3 上行授权，允许继续调度。");
     }
 
     if (dci.isUplinkGrant) {
         NS_LOG_INFO ("解析到上行授权(PUSCH)。 RB分配: " << dci.rbAllocation 
                      << ", MCS: " << (uint32_t)dci.mcs
+                     << ", TxPower: " << dci.txPowerDbm << " dBm"
                      << ", 延迟: " << dci.delayToStart.GetMilliSeconds() << "ms");
+        m_srPending = false;
         
         // 如果有待发送的PUCCH信息(PUSCH可以承载BSR)，先发送BSR
         if (m_currentBufferBytes > 0) {
-            BsR_MAC_CE bsr;
-            bsr.rnti = 0;
-            bsr.lcgId = 0;
-            bsr.bufferSize = m_currentBufferBytes;
-            SendBsr (bsr.lcgId, bsr.bufferSize);
+            SendBsr (0, m_currentBufferBytes);
         }
         
         m_txEvent = Simulator::Schedule (dci.delayToStart, 
@@ -113,7 +118,8 @@ void SatUtMac::ProcessDciAndSchedule (DciInfo dci) {
                                          this, 
                                          dci.duration, 
                                          dci.rbAllocation,
-                                         dci.mcs);
+                                         dci.mcs,
+                                         dci.txPowerDbm);
         SwitchState (MAC_TX);
     } else {
         NS_LOG_INFO ("解析到下行调度(PDSCH)。 RB分配: " << dci.rbAllocation 
@@ -129,21 +135,33 @@ void SatUtMac::ProcessDciAndSchedule (DciInfo dci) {
     }
 }
 
-void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs) {
+void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs, double txPowerDbm) {
     NS_LOG_FUNCTION (this);
     
     SwitchState (MAC_TX);
     
     NS_LOG_INFO ("执行PUSCH数据发送. RB: " << rbAllocation << ", MCS: " << (uint32_t)mcs
+                 << ", TxPower: " << txPowerDbm << " dBm"
                  << ", BufferBytes: " << m_currentBufferBytes);
                   
-    Ptr<Packet> macPdu = Create<Packet> (m_currentBufferBytes > 0 ? m_currentBufferBytes : 100);
+    const uint32_t payloadBytes = (m_currentBufferBytes > 0) ? m_currentBufferBytes : 100;
+    Ptr<Packet> macPdu = (m_hasPendingMsg3 && m_pendingMsg3Packet != nullptr) ?
+                         m_pendingMsg3Packet->Copy () :
+                         Create<Packet> (payloadBytes);
+
+    if (!m_hasPendingMsg3)
+      {
+        GenericUlMacHeader ulHeader;
+        ulHeader.SetRnti (GetActiveRnti ());
+        ulHeader.SetPayloadBytes (payloadBytes);
+        ulHeader.SetTransmissionTime (Simulator::Now ());
+        macPdu->AddHeader (ulHeader);
+      }
     
     if (m_phy) {
         Ptr<SatSignalParameters> params = Create<SatSignalParameters> ();
         params->duration = duration;
         
-        double txPowerDbm = 23.0;
         double bandwidthHz = 180000.0 * rbAllocation;
         double psdValue = txPowerDbm - 10.0 * std::log10 (bandwidthHz);
         
@@ -164,6 +182,16 @@ void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs) {
     } else {
         NS_LOG_ERROR ("PHY层指针为空，无法发送！");
     }
+
+    if (m_hasPendingMsg3 && !m_msg3Callback.IsNull ())
+      {
+        NS_LOG_INFO ("[Msg3] PUSCH 已发送, 将在 "
+                     << (duration + m_timingAdvance).GetMilliSeconds ()
+                     << " ms 后送达 gNB");
+        Simulator::Schedule (duration + m_timingAdvance,
+                             &SatUtMac::DeliverPendingMsg3,
+                             this);
+      }
     
     // 触发队列时延统计 (从入队到出队)
     if (m_bufferArrivalTime > Seconds (0)) {
@@ -192,7 +220,7 @@ void SatUtMac::ReceiveData (Ptr<Packet> packet, const DciInfo& dci)
     bool decodeSuccess = true;
     SendHarqAck (decodeSuccess, 1);
     
-    m_rxPduCallback (packet);
+    NS_LOG_INFO ("ReceiveData: 当前示例未连接上层接收回调，数据在 UT MAC 侧记日志后结束");
     
     Simulator::Schedule (dci.duration, &SatUtMac::SwitchState, this, MAC_CONNECTED);
 }
@@ -202,12 +230,17 @@ void SatUtMac::ReceiveData (Ptr<Packet> packet, const DciInfo& dci)
 void SatUtMac::SendSchedulingRequest ()
 {
     NS_LOG_FUNCTION (this);
+    const uint16_t activeRnti = GetActiveRnti ();
+    if (activeRnti == 0) {
+        NS_LOG_WARN ("PUCCH Format 0: 当前没有有效 RNTI，SR 不发送");
+        return;
+    }
     
     m_srPending = true;
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_0;
-    pucch.rnti = 0;
+    pucch.rnti = activeRnti;
     pucch.srPending = true;
     pucch.transmissionTime = Simulator::Now ();
     
@@ -222,12 +255,17 @@ void SatUtMac::SendSchedulingRequest ()
 void SatUtMac::SendCqiReport (uint8_t cqi)
 {
     NS_LOG_FUNCTION (this << (uint32_t)cqi);
+    const uint16_t activeRnti = GetActiveRnti ();
+    if (activeRnti == 0) {
+        NS_LOG_WARN ("PUCCH Format 1: 当前没有有效 RNTI，CQI 不发送");
+        return;
+    }
     
     m_pendingCqi = cqi;
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_1;
-    pucch.rnti = 0;
+    pucch.rnti = activeRnti;
     pucch.cqi = cqi;
     pucch.transmissionTime = Simulator::Now ();
     
@@ -241,12 +279,17 @@ void SatUtMac::SendCqiReport (uint8_t cqi)
 void SatUtMac::SendHarqAck (bool ack, uint8_t bitmap)
 {
     NS_LOG_FUNCTION (this << ack << (uint32_t)bitmap);
+    const uint16_t activeRnti = GetActiveRnti ();
+    if (activeRnti == 0) {
+        NS_LOG_WARN ("PUCCH Format 2: 当前没有有效 RNTI，HARQ 反馈不发送");
+        return;
+    }
     
     m_pendingHarqAck = ack;
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_2;
-    pucch.rnti = 0;
+    pucch.rnti = activeRnti;
     pucch.harqAck = ack;
     pucch.harqBitMap = bitmap;
     pucch.transmissionTime = Simulator::Now ();
@@ -295,6 +338,7 @@ void SatUtMac::SendPrachPreamble (uint32_t preambleId, uint8_t format)
     PrachPreamble preamble;
     preamble.preambleId = preambleId;
     preamble.format = format;
+    preamble.utType = static_cast<uint8_t> (m_utType);
     preamble.transmissionTime = Simulator::Now ();
     preamble.isRetransmission = false;
     
@@ -311,11 +355,16 @@ void SatUtMac::SendPrachPreamble (uint32_t preambleId, uint8_t format)
 void SatUtMac::SendBsr (uint8_t lcgId, uint32_t bufferSize)
 {
     NS_LOG_FUNCTION (this << (uint32_t)lcgId << bufferSize);
+    const uint16_t activeRnti = GetActiveRnti ();
+    if (activeRnti == 0) {
+        NS_LOG_WARN ("BSR MAC CE: 当前没有有效 RNTI，BSR 不发送");
+        return;
+    }
     
     BsR_MAC_CE bsr;
     bsr.lcgId = lcgId;
     bsr.bufferSize = bufferSize;
-    bsr.rnti = 0;
+    bsr.rnti = activeRnti;
     
     NS_LOG_INFO ("BSR MAC CE发送! LCG=" << (uint32_t)lcgId 
                  << ", BufferSize=" << bufferSize << " bytes");
@@ -325,12 +374,12 @@ void SatUtMac::SendBsr (uint8_t lcgId, uint32_t bufferSize)
     }
 }
 
-void SatUtMac::SetBsrCallback (Callback<void, BsR_MAC_CE> callback)
+void SatUtMac::SetBsrCallback (Callback<void, const BsR_MAC_CE&> callback)
 {
     m_bsrCallback = callback;
 }
 
-void SatUtMac::SetPucchCallback (Callback<void, PucchInfo> callback)
+void SatUtMac::SetPucchCallback (Callback<void, const PucchInfo&> callback)
 {
     m_pucchCallback = callback;
 }
@@ -421,6 +470,7 @@ void SatUtMac::DoRandomAccess (uint32_t preambleId, uint8_t format)
     preamble.rnti             = 0;              // 尚未分配
     preamble.preambleId       = preambleId;
     preamble.format           = format;
+    preamble.utType           = static_cast<uint8_t> (m_utType);
     preamble.transmissionTime = Simulator::Now ();
     preamble.isRetransmission = (m_raAttempt > 1);
     preamble.raRnti           = m_currentRaRnti;
@@ -457,7 +507,8 @@ void SatUtMac::ReceiveRar (const RarMessage& rar)
     NS_LOG_INFO ("[Msg2] 收到匹配的 RAR: PreambleID=" << rar.preambleId
                  << " TC-RNTI=0x" << std::hex << rar.tcRnti << std::dec
                  << " TA=" << rar.timingAdvance.GetMicroSeconds () << "μs"
-                 << " UL Grant=" << rar.ulGrantRbs << " PRB");
+                 << " UL Grant=" << rar.ulGrantRbs << " PRB"
+                 << " TxPower=" << rar.ulGrantTxPowerDbm << " dBm");
 
     // 取消 RA Response Timer
     if (m_raResponseTimer.IsRunning ()) {
@@ -469,6 +520,7 @@ void SatUtMac::ReceiveRar (const RarMessage& rar)
     m_timingAdvance     = rar.timingAdvance;
     m_pendingUlGrant    = rar.ulGrantRbs;
     m_pendingUlGrantMcs = rar.ulGrantMcs;
+    m_pendingUlGrantTxPowerDbm = rar.ulGrantTxPowerDbm;
 
     // 在 Msg3 延迟后组装并发送 RRCSetupRequest
     m_msg3TxEvent = Simulator::Schedule (rar.msg3DelayToStart,
@@ -489,11 +541,13 @@ void SatUtMac::SendMsg3 ()
     dci.isUplinkGrant = true;
     dci.rbAllocation  = m_pendingUlGrant;
     dci.mcs           = m_pendingUlGrantMcs;
+    dci.txPowerDbm    = m_pendingUlGrantTxPowerDbm;
     dci.delayToStart  = MicroSeconds (0);
     dci.duration      = MilliSeconds (1);
 
     NS_LOG_INFO ("[Msg3] 组装 DciInfo: RB=" << dci.rbAllocation
                  << " MCS=" << (uint32_t)dci.mcs
+                 << " TxPower=" << dci.txPowerDbm << " dBm"
                  << " TA补偿=" << m_timingAdvance.GetMicroSeconds () << "μs");
 
     // 组装 RRCSetupRequest
@@ -506,12 +560,13 @@ void SatUtMac::SendMsg3 ()
 
     NS_LOG_INFO ("[Msg3] 发送 RRCSetupRequest: TC-RNTI=0x" << std::hex << m_tcRnti
                  << " UE-Id=0x" << m_ueIdentity << std::dec);
-
-    if (!m_msg3Callback.IsNull ()) {
-        m_msg3Callback (req);
-    } else {
-        NS_LOG_WARN ("[Msg3] msg3 callback 未设置, 无法上送 Msg3!");
-    }
+    m_pendingMsg3Request = req;
+    m_hasPendingMsg3 = true;
+    Msg3MacHeader msg3Header;
+    msg3Header.SetRequest (req);
+    m_pendingMsg3Packet = Create<Packet> ();
+    m_pendingMsg3Packet->AddHeader (msg3Header);
+    ProcessDciAndSchedule (dci);
 
     // 启动竞争解决定时器, 等待 Msg4
     NS_LOG_INFO ("[RA] 启动 Contention Resolution Timer: "
@@ -521,6 +576,31 @@ void SatUtMac::SendMsg3 ()
                                                        this);
 
     SwitchState (MAC_TX);
+}
+
+void SatUtMac::DeliverPendingMsg3 ()
+{
+    NS_LOG_FUNCTION (this);
+
+    if (!m_hasPendingMsg3)
+      {
+        return;
+      }
+
+    if (!m_msg3Callback.IsNull () && m_pendingMsg3Packet != nullptr)
+      {
+        NS_LOG_INFO ("[Msg3] PUSCH 已到达 gNB, 开始递交 RRCSetupRequest: TC-RNTI=0x"
+                     << std::hex << m_pendingMsg3Request.tcRnti
+                     << " UE-Id=0x" << m_pendingMsg3Request.ueIdentity << std::dec);
+        m_msg3Callback (m_pendingMsg3Packet->Copy ());
+      }
+    else
+      {
+        NS_LOG_WARN ("[Msg3] msg3 callback 未设置, 无法向 gNB 递交 Msg3!");
+      }
+
+    m_hasPendingMsg3 = false;
+    m_pendingMsg3Packet = nullptr;
 }
 
 void SatUtMac::ReceiveMsg4 (const RrcSetupMessage& msg4)
@@ -566,6 +646,7 @@ void SatUtMac::ReceiveMsg4 (const RrcSetupMessage& msg4)
 
     m_totalMsg4Received++;        // 统计: 收到有效 Msg4 且信道质量达标
     m_cRnti = msg4.cRnti;
+    m_rnti = m_cRnti;
     m_isRaInitiated = false;
     m_raAttempt = 0;
 
@@ -665,9 +746,28 @@ void SatUtMac::SetUeIdentity (uint64_t ueIdentity)
     m_ueIdentity = ueIdentity;
 }
 
+void SatUtMac::SetUtType (UtType utType)
+{
+    m_utType = utType;
+}
+
 uint64_t SatUtMac::GetUeIdentity () const
 {
     return m_ueIdentity;
+}
+
+void SatUtMac::SetRnti (uint16_t rnti)
+{
+    m_rnti = rnti;
+}
+
+uint16_t SatUtMac::GetActiveRnti () const
+{
+    if (m_cRnti != 0) {
+        return m_cRnti;
+    }
+
+    return m_rnti;
 }
 
 void SatUtMac::SetRaTimers (Time raResponseWindow, Time contentionResolutionTimer, uint8_t maxAttempts)
@@ -687,7 +787,7 @@ uint32_t SatUtMac::GetNumPreambles () const
     return m_numPreambles;
 }
 
-void SatUtMac::SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback)
+void SatUtMac::SetMsg3Callback (Callback<void, Ptr<Packet>> callback)
 {
     m_msg3Callback = callback;
 }

@@ -55,9 +55,10 @@ void FrequencyReuse::InitializeColorPattern ()
   m_colorToBeams.clear ();
   
   // 初始化颜色到RB的映射
-  // 每个颜色分配 m_totalRbs / m_reuseFactor 个RB
-  uint32_t rbsPerColor = m_totalRbs / m_reuseFactor;
-  uint32_t remainder = m_totalRbs % m_reuseFactor;
+  // 当前项目重点为7色复用：总RB=175，每波束实际可用RB固定为25，
+  // 7个波束合计恰好占满全部RB，不再额外保留未分配资源。
+  uint32_t rbsPerColor = (m_reuseFactor == 7) ? 25 : (m_totalRbs / m_reuseFactor);
+  uint32_t remainder = (m_reuseFactor == 7) ? 0 : (m_totalRbs % m_reuseFactor);
   
   for (uint8_t color = 0; color < m_reuseFactor; ++color) {
       std::vector<uint32_t> rbsForColor;
@@ -115,6 +116,10 @@ uint8_t FrequencyReuse::GetReuseFactor () const
 
 uint32_t FrequencyReuse::GetAvailableRbsPerBeam () const
 {
+  if (m_reuseFactor == 7)
+    {
+      return 25;
+    }
   return m_totalRbs / m_reuseFactor;
 }
 

@@ -28,8 +28,15 @@ SatSignalParameters::SatSignalParameters ()
 {}
 
 SatSignalParameters::SatSignalParameters (const SatSignalParameters& p)
-  : SpectrumSignalParameters (p)
 {
+  if (p.psd)
+    {
+      psd = p.psd->Copy ();
+    }
+  duration = p.duration;
+  txPhy = p.txPhy;
+  txAntenna = p.txAntenna;
+
   if (p.packet)
     {
       packet = p.packet->Copy ();
@@ -123,6 +130,7 @@ Ptr<Object> SatPhy::GetPhyTx () const { return m_phyTxObj; }
 Ptr<Object> SatPhy::GetPhyRx () const { return m_phyRxObj; }
 void SatPhy::SetPhyTx (Ptr<Object> tx) { m_phyTxObj = tx; }
 void SatPhy::SetPhyRx (Ptr<Object> rx) { m_phyRxObj = rx; }
+void SatPhy::SetRxPacketCallback (Callback<void, Ptr<Packet>> callback) { m_rxPacketCallback = callback; }
 
 Ptr<SpectrumChannel> SatPhy::GetTxChannel () const { return m_channel; }
 
@@ -146,6 +154,11 @@ SatPhy::Receive (Ptr<SpectrumSignalParameters> params)
 
   m_rxTrace (p);
 
+  if (!m_rxPacketCallback.IsNull ())
+    {
+      m_rxPacketCallback (p->Copy ());
+    }
+
   bool hasError = false; 
   if (hasError)
     {
@@ -158,8 +171,6 @@ void
 SatPhy::SendPdu (Ptr<Packet> p, Ptr<SpectrumSignalParameters> params)
 {
   NS_LOG_FUNCTION (this << p);
-
-  if (!m_channel) return;
 
   m_txTrace (p);
 
@@ -183,6 +194,19 @@ SatPhy::SendPdu (Ptr<Packet> p, Ptr<SpectrumSignalParameters> params)
 
   params->txPhy = GetObject<SpectrumPhy> ();
   params->txAntenna = m_antenna;
+
+  if (!m_channel)
+    {
+      if (m_peerPhy)
+        {
+          NS_LOG_INFO ("SatPhy: no SpectrumChannel, using direct peer delivery fallback.");
+          Simulator::Schedule (m_processingDelay,
+                               &SatPhy::StartRx,
+                               m_peerPhy,
+                               satParams->Copy ());
+        }
+      return;
+    }
 
   m_channel->StartTx (params);
 }
@@ -232,6 +256,22 @@ SatGeoUserPhy::Receive (Ptr<SpectrumSignalParameters> params)
 
   // Copy() 会调用我们自定义的 SatSignalParameters::Copy，保留 packet
   Ptr<SpectrumSignalParameters> forwardedParams = params->Copy ();
+  if (!forwardedParams->psd)
+    {
+      NS_LOG_WARN ("SatGeoUserPhy: PSD unavailable, bypassing SINR/noise processing for packet forwarding.");
+
+      Ptr<SatSignalParameters> satForwardParams = DynamicCast<SatSignalParameters> (forwardedParams);
+      if (satForwardParams && satForwardParams->packet)
+        {
+          Ptr<Packet> p = satForwardParams->packet;
+          Ptr<SatGeoFeederPhy> feeder = DynamicCast<SatGeoFeederPhy>(m_peerPhy);
+          if (feeder)
+            {
+              Simulator::Schedule (m_processingDelay, &SatGeoFeederPhy::SendPduWithParams, feeder, p, forwardedParams);
+            }
+        }
+      return;
+    }
   
   const double k = 1.380649e-23;
   double noiseVal = k * m_temperature * m_noiseFigureLin; 
@@ -311,6 +351,22 @@ SatGeoFeederPhy::Receive (Ptr<SpectrumSignalParameters> params)
   if (!m_peerPhy) return;
 
   Ptr<SpectrumSignalParameters> forwardedParams = params->Copy ();
+  if (!forwardedParams->psd)
+    {
+      NS_LOG_WARN ("SatGeoFeederPhy: PSD unavailable, bypassing SINR/noise processing for packet forwarding.");
+
+      Ptr<SatSignalParameters> satForwardParams = DynamicCast<SatSignalParameters> (forwardedParams);
+      if (satForwardParams && satForwardParams->packet)
+        {
+          Ptr<Packet> p = satForwardParams->packet;
+          Ptr<SatGeoUserPhy> userPhy = DynamicCast<SatGeoUserPhy>(m_peerPhy);
+          if (userPhy)
+            {
+              Simulator::Schedule (m_processingDelay, &SatGeoUserPhy::SendPduWithParams, userPhy, p, forwardedParams);
+            }
+        }
+      return;
+    }
   
   const double k = 1.380649e-23;
   double noiseVal = k * m_temperature * m_noiseFigureLin;
