@@ -54,6 +54,37 @@ void CqiReportCallback (uint8_t cqi)
     std::cout << "[CQI Callback] Received CQI: " << (uint32_t)cqi << std::endl;
 }
 
+void TrafficQueueFeedbackLog (double utilizationPercent)
+{
+    std::cout << "[Traffic Feedback] Queue utilization=" << utilizationPercent << "%" << std::endl;
+}
+
+void FeedTrafficGeneratorFromBeamUtilization (Ptr<SatTrafficGenerator> trafficGen,
+                                              Ptr<AdmitControl> admitControl,
+                                              uint32_t beamId,
+                                              Time period,
+                                              Time stopTime)
+{
+    if (trafficGen == nullptr || admitControl == nullptr)
+      {
+        return;
+      }
+
+    BeamResourceStatus beamStatus = admitControl->GetBeamResourceStatus (beamId);
+    trafficGen->ReportQueueUtilization (beamStatus.utilizationRatio * 100.0);
+
+    if (Simulator::Now () + period < stopTime)
+      {
+        Simulator::Schedule (period,
+                             &FeedTrafficGeneratorFromBeamUtilization,
+                             trafficGen,
+                             admitControl,
+                             beamId,
+                             period,
+                             stopTime);
+      }
+}
+
 // [新增] 4 步 RA 完成回调
 static uint32_t g_raSuccessCount = 0;
 static uint32_t g_raFailedCount  = 0;
@@ -72,6 +103,24 @@ NS_LOG_COMPONENT_DEFINE ("NtnPhase1Sim");
 
 int main (int argc, char *argv[])
 {
+    std::string mode = "all";
+    CommandLine cmd;
+    cmd.AddValue ("mode",
+                  "Example mode: all | dl | ul | ra | misc",
+                  mode);
+    cmd.Parse (argc, argv);
+
+    const bool runDlMode = (mode == "all" || mode == "dl");
+    const bool runUlMode = (mode == "all" || mode == "ul");
+    const bool runRaMode = (mode == "all" || mode == "ra");
+    const bool runMiscMode = (mode == "all" || mode == "misc");
+
+    if (!runDlMode && !runUlMode && !runRaMode && !runMiscMode)
+      {
+        NS_LOG_INFO ("Unsupported mode=" << mode
+                                         << ", fallback to mode=all");
+      }
+
     LogComponentEnable ("NtnPhase1Sim", LOG_LEVEL_INFO);
     LogComponentEnable ("SatUserHelper", LOG_LEVEL_INFO);
     //LogComponentEnable ("SatGwMac", LOG_LEVEL_INFO); 
@@ -138,39 +187,58 @@ int main (int argc, char *argv[])
     // 6. 注入业务流量
     NS_LOG_INFO ("Generating Traffic...");
     Ptr<SatTrafficGenerator> trafficGen = CreateObject<SatTrafficGenerator> ();
-    trafficGen->GenerateVoiceTraffic (NodeContainer (ues.Get (0)), gwAddress);
-    trafficGen->GeneratePortableDataTraffic (NodeContainer (ues.Get (1)), gwAddress, true);
+    trafficGen->SetApplicationWindow (Seconds (1.0), Seconds (10.0));
+    trafficGen->EnableClosedLoopControl (true, 80);
+    trafficGen->SetQueueStateCallback (MakeCallback (&TrafficQueueFeedbackLog));
+    trafficGen->InstallSink (gwNode);
+    trafficGen->InstallVoipRtp (NodeContainer (ues.Get (0)), gwAddress, true);
+    trafficGen->InstallFtp (NodeContainer (ues.Get (1)), gwAddress, true);
 
     // ------------------------------------------------------------
     // [新增测试] 7. 验证队友的准入控制模块 (AdmitControl)
     // ------------------------------------------------------------
     NS_LOG_INFO ("=== Testing AdmitControl (准入控制) ===");
     Ptr<AdmitControl> admitControl = CreateObject<AdmitControl> ();
-    admitControl->SetBeamTotalRbs (1, 160);  // 波束1: 160 RB
-    admitControl->SetBeamTotalRbs (2, 160);  // 波束2: 160 RB
-    admitControl->SetBeamTotalRbs (3, 160);  // 波束3: 160 RB
+    Ptr<ResourceManager> admitDemoRm = CreateObject<ResourceManager> ();
+    admitControl->SetResourceManager (admitDemoRm);
+    admitControl->SetBeamTotalRbs (1, 25);  // 波束1: 25 RB
+    admitControl->SetBeamTotalRbs (2, 25);  // 波束2: 25 RB
+    admitControl->SetBeamTotalRbs (3, 25);  // 波束3: 25 RB
     
-    // 测试1: 应急业务接入判断
-    NS_LOG_INFO ("Test AdmitControl: Emergency UE to Beam 1");
+    // 测试1: 空闲波束上的应急业务接入
+    NS_LOG_INFO ("Test AdmitControl: Emergency UE to empty Beam 1");
     AdmitDecision decision1 = admitControl->CanAdmitUe (1, ServicePriority::PRIORITY_EMERGENCY, 
-                                                          UT_CONSUMER, TRAFFIC_DATA, 50);
+                                                          UT_CONSUMER, TRAFFIC_DATA, 1);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision1);
     
-    // 测试2: 普通数据接入判断
-    NS_LOG_INFO ("Test AdmitControl: Normal DATA UE to Beam 1");
+    // 先人为占满 beam 1 的大部分数据资源，再验证数据业务重定向
+    admitDemoRm->ResetBeamAllocation (1, false);
+    admitDemoRm->AllocateSpectrum (1, 24, false);
+    // 测试2: 数据业务在高负载 beam 上的重定向判断
+    NS_LOG_INFO ("Test AdmitControl: Normal DATA UE to loaded Beam 1");
     AdmitDecision decision2 = admitControl->CanAdmitUe (1, ServicePriority::PRIORITY_DATA, 
-                                                          UT_CONSUMER, TRAFFIC_DATA, 30);
+                                                          UT_CONSUMER, TRAFFIC_DATA, 1);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision2);
     
-    // 测试3: 切换准入判断
-    NS_LOG_INFO ("Test AdmitControl: Handover from Beam 1 to Beam 2");
+    // 测试3: 高容量业务切换准入判断
+    NS_LOG_INFO ("Test AdmitControl: Handover of high-capacity flow from Beam 1 to Beam 2");
     admitControl->RegisterUeToBeam (1, 1, ServicePriority::PRIORITY_DATA, UT_CONSUMER, TRAFFIC_DATA, Vector (100, 100, 0));
-    AdmitDecision decision3 = admitControl->CanHandoverUe (1, 2, ServicePriority::PRIORITY_DATA, 40);
+    AdmitDecision decision3 = admitControl->CanHandoverUe (1,
+                                                           2,
+                                                           ServicePriority::PRIORITY_DATA,
+                                                           UT_CONSUMER,
+                                                           TRAFFIC_HIGH_CAPACITY,
+                                                           2);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision3);
     
     // 测试4: 获取推荐波束
-    NS_LOG_INFO ("Test AdmitControl: Get Recommended Beams");
-    std::vector<uint32_t> recommendedBeams = admitControl->GetRecommendedBeams (1, ServicePriority::PRIORITY_EMERGENCY);
+    NS_LOG_INFO ("Test AdmitControl: Get Recommended Beams for emergency user");
+    std::vector<uint32_t> recommendedBeams =
+      admitControl->GetRecommendedBeams (1,
+                                         ServicePriority::PRIORITY_EMERGENCY,
+                                         UT_PORTABLE,
+                                         TRAFFIC_DATA,
+                                         1);
     std::cout << "  Recommended beams: ";
     for (uint32_t beam : recommendedBeams) {
         std::cout << beam << " ";
@@ -190,12 +258,36 @@ int main (int argc, char *argv[])
     scheduler->Initialize (1, 1);
     scheduler->SetAdmitControl (admitControl);  // 连接准入控制
 
+    Simulator::Schedule (Seconds (0.5),
+                         &FeedTrafficGeneratorFromBeamUtilization,
+                         trafficGen,
+                         admitControl,
+                         1u,
+                         MilliSeconds (200),
+                         Seconds (10.0));
+
+    // 为普通 UL 测试 UE 提供统一的真实 PHY 路径:
+    // SatUtMac -> SatGeoUserPhy -> SatGeoFeederPhy
+    Ptr<SatGeoFeederPhy> genericUlFeederPhy = CreateObject<SatGeoFeederPhy> ();
+    genericUlFeederPhy->SetRxPacketCallback (MakeCallback (&GeoBeamScheduler::ReceiveUlMacPdu,
+                                                           scheduler));
+
     // 模拟 UE 1：大容量业务 (消费级终端) + 优秀的信道质量 + 近波束中心
     uint16_t rnti1 = 1;
     scheduler->AddUeContext (rnti1, UT_CONSUMER, TRAFFIC_HIGH_CAPACITY);
     scheduler->AddUeInfo (rnti1, 1);
     scheduler->UpdateUeCsi (rnti1, 14.0);
     scheduler->UpdateUePosition (rnti1, Vector (10.0, 10.0, 0.0));  // 近中心
+    scheduler->UpdateUeDlBufferStatus (rnti1, 5000u);
+    Ptr<SatUtMac> schedUeMac1 = CreateObject<SatUtMac> ();
+    Ptr<SatGeoUserPhy> schedUePhy1 = CreateObject<SatGeoUserPhy> ();
+    schedUePhy1->SetPeer (genericUlFeederPhy);
+    schedUeMac1->SetPhy (schedUePhy1);
+    schedUeMac1->SetRnti (rnti1);
+    schedUeMac1->SwitchState (SatUtMac::MAC_CONNECTED);
+    schedUeMac1->SetBsrCallback (MakeCallback (&GeoBeamScheduler::ReceiveBsr, scheduler));
+    schedUeMac1->SetPucchCallback (MakeCallback (&GeoBeamScheduler::ReceivePucchInfo, scheduler));
+    scheduler->RegisterUeDciCallback (rnti1, MakeCallback (&SatUtMac::ProcessDciAndSchedule, schedUeMac1));
 
     // 模拟 UE 2：应急业务 (消费级终端) - WRR优先调度
     uint16_t rnti2 = 2;
@@ -203,6 +295,16 @@ int main (int argc, char *argv[])
     scheduler->AddUeInfo (rnti2, 1);
     scheduler->UpdateUeCsi (rnti2, 10.0);
     scheduler->UpdateUePosition (rnti2, Vector (50.0, 50.0, 0.0));  // 中等距离
+    scheduler->UpdateUeDlBufferStatus (rnti2, 320u);
+    Ptr<SatUtMac> schedUeMac2 = CreateObject<SatUtMac> ();
+    Ptr<SatGeoUserPhy> schedUePhy2 = CreateObject<SatGeoUserPhy> ();
+    schedUePhy2->SetPeer (genericUlFeederPhy);
+    schedUeMac2->SetPhy (schedUePhy2);
+    schedUeMac2->SetRnti (rnti2);
+    schedUeMac2->SwitchState (SatUtMac::MAC_CONNECTED);
+    schedUeMac2->SetBsrCallback (MakeCallback (&GeoBeamScheduler::ReceiveBsr, scheduler));
+    schedUeMac2->SetPucchCallback (MakeCallback (&GeoBeamScheduler::ReceivePucchInfo, scheduler));
+    scheduler->RegisterUeDciCallback (rnti2, MakeCallback (&SatUtMac::ProcessDciAndSchedule, schedUeMac2));
 
     // 模拟 UE 3：便携式终端 + 边缘位置
     uint16_t rnti3 = 3;
@@ -210,19 +312,48 @@ int main (int argc, char *argv[])
     scheduler->AddUeInfo (rnti3, 1);
     scheduler->UpdateUeCsi (rnti3, 6.0);
     scheduler->UpdateUePosition (rnti3, Vector (500.0, 500.0, 0.0));  // 边缘
+    scheduler->UpdateUeDlBufferStatus (rnti3, 1200u);
+    Ptr<SatUtMac> schedUeMac3 = CreateObject<SatUtMac> ();
+    Ptr<SatGeoUserPhy> schedUePhy3 = CreateObject<SatGeoUserPhy> ();
+    schedUePhy3->SetPeer (genericUlFeederPhy);
+    schedUeMac3->SetPhy (schedUePhy3);
+    schedUeMac3->SetRnti (rnti3);
+    schedUeMac3->SwitchState (SatUtMac::MAC_CONNECTED);
+    schedUeMac3->SetBsrCallback (MakeCallback (&GeoBeamScheduler::ReceiveBsr, scheduler));
+    schedUeMac3->SetPucchCallback (MakeCallback (&GeoBeamScheduler::ReceivePucchInfo, scheduler));
+    scheduler->RegisterUeDciCallback (rnti3, MakeCallback (&SatUtMac::ProcessDciAndSchedule, schedUeMac3));
 
     // 利用仿真引擎触发调度
-    Simulator::Schedule (Seconds (1.0), &GeoBeamScheduler::RunScheduler, scheduler);
-    Simulator::Schedule (Seconds (1.5), &GeoBeamScheduler::RunScheduler, scheduler);
+    if (runUlMode)
+      {
+        Simulator::Schedule (Seconds (0.8), &SatUtMac::NotifyDataBuffered, schedUeMac1, 2400u);
+        Simulator::Schedule (Seconds (0.85), &SatUtMac::NotifyDataBuffered, schedUeMac2, 320u);
+        Simulator::Schedule (Seconds (0.9), &SatUtMac::NotifyDataBuffered, schedUeMac3, 1200u);
+        Simulator::Schedule (Seconds (0.95), &SatUtMac::SendCqiReport, schedUeMac1, static_cast<uint8_t> (13));
+        Simulator::Schedule (Seconds (0.96), &SatUtMac::SendCqiReport, schedUeMac2, static_cast<uint8_t> (9));
+        Simulator::Schedule (Seconds (0.97), &SatUtMac::SendCqiReport, schedUeMac3, static_cast<uint8_t> (6));
+      }
+
+    if (runDlMode)
+      {
+        Simulator::Schedule (Seconds (1.0), &GeoBeamScheduler::RunScheduler, scheduler);
+        Simulator::Schedule (Seconds (1.5), &GeoBeamScheduler::RunScheduler, scheduler);
+      }
     // ------------------------------------------------------------
 
     // ------------------------------------------------------------
     // [新增测试] 8. 验证谢昀松的 SatUtMac 终端MAC层
     // ------------------------------------------------------------
+    if (runMiscMode)
+      {
     NS_LOG_INFO ("=== Testing SatUtMac (谢昀松) ===");
     
     // 创建终端MAC层
     Ptr<SatUtMac> utMac = CreateObject<SatUtMac> ();
+    Ptr<SatGeoUserPhy> utPhyMac = CreateObject<SatGeoUserPhy> ();
+    utPhyMac->SetPeer (genericUlFeederPhy);
+    utMac->SetPhy (utPhyMac);
+    utMac->SetRnti (100);
     utMac->SwitchState (SatUtMac::MAC_CONNECTED);  // 先设置为CONNECTED状态
     
     // 模拟接收上行授权 DCI (UL Grant)
@@ -230,22 +361,14 @@ int main (int argc, char *argv[])
     ulGrant.isUplinkGrant = true;
     ulGrant.rbAllocation = 10;
     ulGrant.mcs = 16;
+    ulGrant.txPowerDbm = 23.0;
     ulGrant.delayToStart = MilliSeconds (10);
     ulGrant.duration = MilliSeconds (1);
     
     NS_LOG_INFO ("Test 1: Process UL Grant DCI");
     Simulator::Schedule (Seconds (2.0), &SatUtMac::ProcessDciAndSchedule, utMac, ulGrant);
     
-    // 模拟接收下行调度 DCI (DL Scheduling)
-    DciInfo dlSchedule;
-    dlSchedule.isUplinkGrant = false;
-    dlSchedule.rbAllocation = 20;
-    dlSchedule.mcs = 14;
-    dlSchedule.delayToStart = MilliSeconds (5);
-    dlSchedule.duration = MilliSeconds (1);
-    
-    NS_LOG_INFO ("Test 2: Process DL Scheduling DCI");
-    Simulator::Schedule (Seconds (2.5), &SatUtMac::ProcessDciAndSchedule, utMac, dlSchedule);
+    NS_LOG_INFO ("Test 2 skipped: standalone SatUtMac DL receive demo removed from all-in-one example");
     // ------------------------------------------------------------
 
     // ------------------------------------------------------------
@@ -289,7 +412,7 @@ int main (int argc, char *argv[])
     NS_LOG_INFO ("=== Testing SatUtPhy Enhanced SINR Calculation (C/I + System Interference) ===");
     
     Ptr<SatUtPhy> utPhy = CreateObject<SatUtPhy> ();
-    utPhy->SetAttribute ("Bandwidth", DoubleValue (30e6));  // 30MHz
+    utPhy->SetAttribute ("Bandwidth", DoubleValue (35e6));  // 35MHz
     utPhy->SetAttribute ("NoiseFigure", DoubleValue (5.0));
     utPhy->SetCqiReportCallback (MakeCallback (&CqiReportCallback));
     
@@ -329,11 +452,17 @@ int main (int argc, char *argv[])
     NS_LOG_INFO ("=== Testing Beam Handover (崔博开) ===");
     
     NS_LOG_INFO ("Test 6: Export UE Context for Handover");
-    HandoverUeContext hoCtx = scheduler->ExportUeContext (rnti1, 2);
-    scheduler->ImportUeContext (hoCtx);
+    Simulator::Schedule (Seconds (1.8),
+                         [scheduler, rnti1]() {
+                             HandoverUeContext hoCtx = scheduler->ExportUeContext (rnti1, 2);
+                             scheduler->ImportUeContext (hoCtx);
+                         });
     
     NS_LOG_INFO ("Test 7: Remove UE");
-    scheduler->RemoveUt (rnti2);
+    Simulator::Schedule (Seconds (1.9),
+                         [scheduler, rnti2]() {
+                             scheduler->RemoveUt (rnti2);
+                         });
     // ------------------------------------------------------------
 
     // ------------------------------------------------------------
@@ -367,24 +496,33 @@ int main (int argc, char *argv[])
     // 模拟第二次测量：信号变差，触发TTT
     NS_LOG_INFO ("Test 9: RRC Measurement - Poor Signal (trigger TTT)");
     utRrc->ProcessRawMeasurement (1, -110.0);
+      }
     
     // ------------------------------------------------------------
     // [新增测试] 13. 验证 4 步随机接入 (Msg1→Msg2→Msg3→Msg4)
     // ------------------------------------------------------------
+    if (runRaMode)
+      {
     NS_LOG_INFO ("=== Testing 4-Step Random Access (GEO ~600ms RTT) ===");
 
     // --- 场景 A: 单个 UE 成功完成 4 步 RA ---
     NS_LOG_INFO ("--- Scenario A: Single UE, 4-step RA should SUCCEED ---");
 
     Ptr<SatUtMac> utMacA = CreateObject<SatUtMac> ();
+    Ptr<SatGeoUserPhy> utMsg3PhyA = CreateObject<SatGeoUserPhy> ();
     utMacA->SetMultipleAccessMode (MultipleAccessMode::ESSA);
     utMacA->SwitchState (SatUtMac::MAC_IDLE);
+    utMacA->SetPhy (utMsg3PhyA);
+    utMacA->SetUtType (UT_CONSUMER);
     utMacA->SetUeIdentity (0xA1A1A1A1A1ULL);
     // GEO 场景: RAR 窗口 1000 ms, 竞争解决 1500 ms, 最多 5 次
     utMacA->SetRaTimers (MilliSeconds (1000), MilliSeconds (1500), 5);
     // 连接 UE → gNB 上行回调
     utMacA->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
-    utMacA->SetMsg3Callback  (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    Ptr<SatGeoFeederPhy> feederMsg3Phy = CreateObject<SatGeoFeederPhy> ();
+    feederMsg3Phy->SetRxPacketCallback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
+    utMsg3PhyA->SetPeer (feederMsg3Phy);
+    utMacA->SetMsg3Callback  (MakeNullCallback<void, Ptr<Packet>> ());
     // 将本 UE 订阅到 gNB 的下行 RAR/Msg4 广播
     scheduler->RegisterUeRaCallbacks (
         MakeCallback (&SatUtMac::ReceiveRar, utMacA),
@@ -400,8 +538,14 @@ int main (int argc, char *argv[])
 
     Ptr<SatUtMac> utMacB1 = CreateObject<SatUtMac> ();
     Ptr<SatUtMac> utMacB2 = CreateObject<SatUtMac> ();
+    Ptr<SatGeoUserPhy> utMsg3PhyB1 = CreateObject<SatGeoUserPhy> ();
+    Ptr<SatGeoUserPhy> utMsg3PhyB2 = CreateObject<SatGeoUserPhy> ();
     utMacB1->SwitchState (SatUtMac::MAC_IDLE);
     utMacB2->SwitchState (SatUtMac::MAC_IDLE);
+    utMacB1->SetPhy (utMsg3PhyB1);
+    utMacB2->SetPhy (utMsg3PhyB2);
+    utMacB1->SetUtType (UT_PORTABLE);
+    utMacB2->SetUtType (UT_CONSUMER);
     utMacB1->SetUeIdentity (0xB1B1B1B1B1ULL);
     utMacB2->SetUeIdentity (0xB2B2B2B2B2ULL);
     utMacB1->SetRaTimers (MilliSeconds (1000), MilliSeconds (1500), 3);
@@ -409,8 +553,10 @@ int main (int argc, char *argv[])
 
     utMacB1->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
     utMacB2->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
-    utMacB1->SetMsg3Callback  (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
-    utMacB2->SetMsg3Callback  (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMsg3PhyB1->SetPeer (feederMsg3Phy);
+    utMsg3PhyB2->SetPeer (feederMsg3Phy);
+    utMacB1->SetMsg3Callback  (MakeNullCallback<void, Ptr<Packet>> ());
+    utMacB2->SetMsg3Callback  (MakeNullCallback<void, Ptr<Packet>> ());
 
     scheduler->RegisterUeRaCallbacks (
         MakeCallback (&SatUtMac::ReceiveRar, utMacB1),
@@ -430,14 +576,17 @@ int main (int argc, char *argv[])
                          static_cast<uint32_t> (42), static_cast<uint8_t> (0));
     Simulator::Schedule (Seconds (6.0) + MicroSeconds (50), &SatUtMac::DoRandomAccess, utMacB2,
                          static_cast<uint32_t> (42), static_cast<uint8_t> (0));
+      }
     
     // ------------------------------------------------------------
     // [新增测试] 14. 验证ESSA (Enhanced Slotted ALOHA) 多址接入
     // ------------------------------------------------------------
+    if (runMiscMode)
+      {
     NS_LOG_INFO ("=== Testing ESSA (Enhanced Slotted ALOHA) ===");
     
     Ptr<SatUtPhy> utPhyForEssa = CreateObject<SatUtPhy> ();
-    utPhyForEssa->SetAttribute ("Bandwidth", DoubleValue (30e6));
+    utPhyForEssa->SetAttribute ("Bandwidth", DoubleValue (35e6));
     utPhyForEssa->SetAttribute ("EsssaNumSlots", UintegerValue (16));
     
     // Test 11a: 计算ESSA碰撞概率
@@ -457,6 +606,7 @@ int main (int argc, char *argv[])
     utPhyForEssa->SetMultipleAccessMode (MultipleAccessMode::SLOTTED_ALOHA);
     double collisionProbSaloha = utPhyForEssa->CalculateCollisionProbability (10, 16);
     NS_LOG_INFO ("  Slotted ALOHA Collision Probability: " << collisionProbSaloha * 100 << "%");
+      }
     
     // ------------------------------------------------------------
 
@@ -469,9 +619,12 @@ int main (int argc, char *argv[])
 
     Simulator::Destroy ();
 
-    NS_LOG_INFO ("=== 4-Step RA Summary ===");
-    NS_LOG_INFO ("  SUCCESS = " << g_raSuccessCount);
-    NS_LOG_INFO ("  FAILED  = " << g_raFailedCount);
+    if (runRaMode)
+      {
+        NS_LOG_INFO ("=== 4-Step RA Summary ===");
+        NS_LOG_INFO ("  SUCCESS = " << g_raSuccessCount);
+        NS_LOG_INFO ("  FAILED  = " << g_raFailedCount);
+      }
     NS_LOG_INFO ("Simulation Finished.");
     return 0;
 }

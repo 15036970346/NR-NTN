@@ -17,6 +17,7 @@
 #include "ns3/mobility-helper.h"
 #include "ns3/spectrum-channel.h"
 #include "ns3/vector.h"
+#include "../model/resource-manager.h"
 
 namespace ns3 {
 
@@ -44,6 +45,8 @@ public:
   void SetSatelliteChannel (Ptr<SpectrumChannel> channel);
   
   void SetNrHelper (Ptr<NrHelper> nrHelper);
+  void SetConsumerShare (double consumerShare);
+  void SetPortableHttpShare (double portableHttpShare);
 
   /**
    * \brief 设置多个波束信息
@@ -80,11 +83,15 @@ public:
   void InstallApplication (NodeContainer ues, Ipv4Address destAddress);
 
 private:
+  void AssignTerminalProfiles (NodeContainer ues, uint16_t beamId);
+
   Ptr<NrHelper> m_nrHelper;
 
   Ptr<SpectrumChannel> m_satChannel;
 
   uint16_t m_beamId;
+  double m_consumerShare;
+  double m_portableHttpShare;
   std::vector<BeamInfo> m_beams;  //!< 多个波束信息
   MobilityHelper m_mobility;
   Ipv4AddressHelper m_ipv4;  //!< 保持兼容，保留私有成员

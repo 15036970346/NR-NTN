@@ -114,14 +114,14 @@ def generate_topology_image():
     info_text = """NR NTN GEO Satellite System
     ========================
     Frequency Band: S-band (2 GHz)
-    Bandwidth: 30 MHz
+    Bandwidth: 35 MHz
     SCS: 15 kHz
     
-    DL: 160 PRBs (满发)
+    DL: 175 PRBs (系统总RB)
     UL: 50 PRBs (受限)
     
     Frequency Reuse: 7-color
-    RBs per Beam: ~23
+    RBs per Beam: 25
     
     HARQ: IR (max 4 retx)
     RTT Delay: ~600 ms"""

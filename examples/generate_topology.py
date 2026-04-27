@@ -282,7 +282,7 @@ class TopologyGenerator:
             
         print("\nFrequency Allocation (7-color reuse):")
         for i in range(7):
-            print(f"  Color {i} ({self.beam_colors[i]}): RBs = 160/7 ≈ {160//7} PRBs per beam")
+            print(f"  Color {i} ({self.beam_colors[i]}): usable RBs = 25 PRBs per beam")
             
         print("="*50 + "\n")
 
@@ -317,10 +317,10 @@ def generate_ascii_topology():
     Color 5: Cyan    -> Beam 5, 12, 19...
     Color 6: Orange  -> Beam 6, 13, 20...
     
-    RB Allocation (30 MHz, SCS=15 kHz):
+    RB Allocation (35 MHz, SCS=15 kHz):
     ===================================
-    Total RBs: 160 (DL) / 50 (UL, limited)
-    RBs per Color (1/7 reuse): ≈23 RBs
+    Total RBs: 175 (DL) / 50 (UL, limited)
+    RBs per Color (1/7 reuse): 25 RBs usable per beam
     Reuse Gain: ~8.45 dB
     
     =============================================

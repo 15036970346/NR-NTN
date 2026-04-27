@@ -21,7 +21,7 @@ TypeId SatUtPhy::GetTypeId (void) {
         .SetGroupName ("SatGeo")
         .AddConstructor<SatUtPhy> ()
         .AddAttribute ("Bandwidth", "System bandwidth in Hz",
-                       DoubleValue (30e6),  // 修正为30MHz
+                       DoubleValue (35e6),  // 修正为35MHz
                        MakeDoubleAccessor (&SatUtPhy::m_bandwidthHz),
                        MakeDoubleChecker<double> ())
         .AddAttribute ("NoiseFigure", "Receiver noise figure in dB",
@@ -48,7 +48,7 @@ SatUtPhy::SatUtPhy ()
       m_rnti (1),
       m_currentBeamId (1),
       m_lastCalculatedSinr (0.0),
-      m_bandwidthHz (30e6),
+      m_bandwidthHz (35e6),
       m_noiseFigure (5.0),
       m_antennaGainDbi (0.0),
       m_preambleId (0),

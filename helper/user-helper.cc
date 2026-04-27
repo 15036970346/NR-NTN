@@ -26,10 +26,12 @@
 #include "ns3/position-allocator.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/ipv4-address-helper.h"
+#include "terminal-profile.h"
 #include <vector>
 #include <memory>
 #include <functional>
 #include <cmath>
+#include <algorithm>
 
 namespace ns3 {
 
@@ -50,7 +52,9 @@ SatUserHelper::GetTypeId (void)
 SatUserHelper::SatUserHelper ()
   : m_nrHelper (nullptr),
     m_satChannel (nullptr),
-    m_beamId (0)
+    m_beamId (0),
+    m_consumerShare (0.5),
+    m_portableHttpShare (0.5)
 {
   NS_LOG_FUNCTION (this);
 }
@@ -81,12 +85,27 @@ SatUserHelper::SetNrHelper (Ptr<NrHelper> nrHelper)
   m_nrHelper = nrHelper;
 }
 
+void
+SatUserHelper::SetConsumerShare (double consumerShare)
+{
+  NS_LOG_FUNCTION (this << consumerShare);
+  m_consumerShare = std::max (0.0, std::min (1.0, consumerShare));
+}
+
+void
+SatUserHelper::SetPortableHttpShare (double portableHttpShare)
+{
+  NS_LOG_FUNCTION (this << portableHttpShare);
+  m_portableHttpShare = std::max (0.0, std::min (1.0, portableHttpShare));
+}
+
 NodeContainer
 SatUserHelper::CreateUserNodes (uint32_t count)
 {
   NS_LOG_FUNCTION (this << count);
   NodeContainer ues;
   ues.Create (count);
+  AssignTerminalProfiles (ues, m_beamId);
   NS_LOG_INFO ("Created " << count << " UE nodes.");
   return ues;
 }
@@ -136,7 +155,7 @@ SatUserHelper::InstallStack (NodeContainer ues)
   CcBwpCreator ccBwpCreator;
   const uint8_t numCcPerBand = 1;
   
-  CcBwpCreator::SimpleOperationBandConf bandConf (2.0e9, 20e6, numCcPerBand, BandwidthPartInfo::UMa);
+  CcBwpCreator::SimpleOperationBandConf bandConf (2.0e9, 35e6, numCcPerBand, BandwidthPartInfo::UMa);
   
   OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc (bandConf);
   
@@ -215,7 +234,9 @@ SatUserHelper::CreateUsersInMultipleBeams (uint32_t totalCount)
     }
 
   NodeContainer allUes;
-  std::vector<uint32_t> uesPerBeam;
+  std::vector<uint32_t> uesPerBeam (m_beams.size (), 0);
+  std::vector<std::pair<double, size_t>> beamRemainders;
+  beamRemainders.reserve (m_beams.size ());
 
   // 按波束面积比例分配UE数量
   double totalArea = 0.0;
@@ -224,29 +245,37 @@ SatUserHelper::CreateUsersInMultipleBeams (uint32_t totalCount)
       totalArea += M_PI * beam.radius * beam.radius;
     }
 
-  uint32_t remainingUes = totalCount;
   NS_LOG_INFO ("Distributing " << totalCount << " UEs across " << m_beams.size () << " beams");
 
   for (size_t i = 0; i < m_beams.size (); ++i)
     {
-      uint32_t uesForThisBeam;
-      if (i == m_beams.size () - 1)
-        {
-          // 最后一个波束获取所有剩余UE（确保总数正确）
-          uesForThisBeam = remainingUes;
-        }
-      else
-        {
-          double beamArea = M_PI * m_beams[i].radius * m_beams[i].radius;
-          uesForThisBeam = static_cast<uint32_t> (totalCount * beamArea / totalArea);
-          if (uesForThisBeam > remainingUes)
-            {
-              uesForThisBeam = remainingUes;
-            }
-        }
+      double beamArea = M_PI * m_beams[i].radius * m_beams[i].radius;
+      double exactShare = totalArea > 0.0 ? (static_cast<double> (totalCount) * beamArea / totalArea)
+                                          : 0.0;
+      uint32_t floorShare = static_cast<uint32_t> (std::floor (exactShare));
+      uesPerBeam[i] = floorShare;
+      beamRemainders.emplace_back (exactShare - floorShare, i);
+    }
 
-      remainingUes -= uesForThisBeam;
-      uesPerBeam.push_back (uesForThisBeam);
+  uint32_t assignedUes = 0;
+  for (uint32_t count : uesPerBeam)
+    {
+      assignedUes += count;
+    }
+
+  uint32_t remainingUes = totalCount > assignedUes ? (totalCount - assignedUes) : 0;
+  std::stable_sort (beamRemainders.begin (),
+                    beamRemainders.end (),
+                    [] (const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+
+  for (uint32_t extra = 0; extra < remainingUes && extra < beamRemainders.size (); ++extra)
+    {
+      uesPerBeam[beamRemainders[extra].second]++;
+    }
+
+  for (size_t i = 0; i < m_beams.size (); ++i)
+    {
+      uint32_t uesForThisBeam = uesPerBeam[i];
 
       NS_LOG_INFO ("Beam " << m_beams[i].beamId << ": " << uesForThisBeam << " UEs "
                           << "(center: " << m_beams[i].centerPosition.x << ", "
@@ -275,6 +304,7 @@ SatUserHelper::CreateUsersAroundBeam (const BeamInfo& beamInfo, uint32_t count)
     }
 
   ues.Create (count);
+  AssignTerminalProfiles (ues, beamInfo.beamId);
 
   // 创建随机圆盘位置分配器，在波束中心附近撒点
   Ptr<RandomDiscPositionAllocator> randomDisc = CreateObject<RandomDiscPositionAllocator> ();
@@ -310,6 +340,58 @@ SatUserHelper::CreateUsersAroundBeam (const BeamInfo& beamInfo, uint32_t count)
                           << beamInfo.centerPosition.y << ") with radius " << beamInfo.radius << "m");
 
   return ues;
+}
+
+void
+SatUserHelper::AssignTerminalProfiles (NodeContainer ues, uint16_t beamId)
+{
+  const uint32_t total = ues.GetN ();
+  const uint32_t consumerCount = static_cast<uint32_t> (std::round (total * m_consumerShare));
+  const uint32_t portableCount = total - consumerCount;
+  const uint32_t portableHttpCount =
+      static_cast<uint32_t> (std::round (portableCount * m_portableHttpShare));
+  std::vector<uint32_t> indices;
+  indices.reserve (total);
+  for (uint32_t i = 0; i < total; ++i)
+    {
+      indices.push_back (i);
+    }
+
+  // Randomize terminal-type assignment so it is not coupled to node creation
+  // order within a beam or a single-batch UE creation call.
+  Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable> ();
+  for (uint32_t i = total; i > 1; --i)
+    {
+      uint32_t swapWith = rng->GetInteger (0, i - 1);
+      std::swap (indices[i - 1], indices[swapWith]);
+    }
+
+  for (uint32_t i = 0; i < total; ++i)
+    {
+      Ptr<Node> node = ues.Get (indices[i]);
+      Ptr<SatTerminalProfile> profile = node->GetObject<SatTerminalProfile> ();
+      if (!profile)
+        {
+          profile = CreateObject<SatTerminalProfile> ();
+          node->AggregateObject (profile);
+        }
+
+      profile->SetBeamId (beamId);
+      if (i < consumerCount)
+        {
+          profile->SetTerminalType (UT_CONSUMER);
+          profile->SetVoiceEnabled (true);
+          profile->SetDataServiceType (SAT_DATA_HTTP);
+        }
+      else
+        {
+          const uint32_t portableIndex = i - consumerCount;
+          profile->SetTerminalType (UT_PORTABLE);
+          profile->SetVoiceEnabled (false);
+          profile->SetDataServiceType (portableIndex < portableHttpCount ? SAT_DATA_HTTP
+                                                                         : SAT_DATA_FTP);
+        }
+    }
 }
 
 } // namespace ns3

@@ -14,6 +14,7 @@ set(source_files
     model/sat-ut-phy.cc        # [新增] 你的终端物理层
     model/sat-ut-mac.cc        # [新增] 终端MAC层
     helper/user-helper.cc
+    helper/terminal-profile.cc
     helper/traffic-models.cc
     
     # --- 秦宇航部分 ---
@@ -58,6 +59,7 @@ set(header_files
     model/sat-ut-phy.h         # [新增] 你的终端物理层头文件
     model/sat-ut-mac.h         # [新增] 终端MAC层头文件
     helper/user-helper.h
+    helper/terminal-profile.h
     helper/traffic-models.h
     
     # --- 秦宇航部分 ---
@@ -130,5 +132,17 @@ build_lib_example(
 build_lib_example(
     NAME ntn-system-sim
     SOURCE_FILES examples/ntn-system-sim.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+build_lib_example(
+    NAME resource-manager-validation
+    SOURCE_FILES examples/resource-manager-validation.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+build_lib_example(
+    NAME traffic-model-validation
+    SOURCE_FILES examples/traffic-model-validation.cc
     LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
 )
