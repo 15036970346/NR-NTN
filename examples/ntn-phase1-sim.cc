@@ -138,34 +138,36 @@ int main (int argc, char *argv[])
     // 6. 注入业务流量
     NS_LOG_INFO ("Generating Traffic...");
     Ptr<SatTrafficGenerator> trafficGen = CreateObject<SatTrafficGenerator> ();
-    trafficGen->GenerateVoiceTraffic (NodeContainer (ues.Get (0)), gwAddress);
-    trafficGen->GeneratePortableDataTraffic (NodeContainer (ues.Get (1)), gwAddress, true);
+    trafficGen->SetApplicationWindow (Seconds (1.0), Seconds (10.0));
+    trafficGen->InstallSink (gwNode);
+    trafficGen->InstallVoipRtp (NodeContainer (ues.Get (0)), gwAddress, true);
+    trafficGen->InstallFtp (NodeContainer (ues.Get (1)), gwAddress, true);
 
     // ------------------------------------------------------------
     // [新增测试] 7. 验证队友的准入控制模块 (AdmitControl)
     // ------------------------------------------------------------
     NS_LOG_INFO ("=== Testing AdmitControl (准入控制) ===");
     Ptr<AdmitControl> admitControl = CreateObject<AdmitControl> ();
-    admitControl->SetBeamTotalRbs (1, 160);  // 波束1: 160 RB
-    admitControl->SetBeamTotalRbs (2, 160);  // 波束2: 160 RB
-    admitControl->SetBeamTotalRbs (3, 160);  // 波束3: 160 RB
+    admitControl->SetBeamTotalRbs (1, 25);   // 波束1: 25 RB
+    admitControl->SetBeamTotalRbs (2, 25);   // 波束2: 25 RB
+    admitControl->SetBeamTotalRbs (3, 25);   // 波束3: 25 RB
     
     // 测试1: 应急业务接入判断
     NS_LOG_INFO ("Test AdmitControl: Emergency UE to Beam 1");
     AdmitDecision decision1 = admitControl->CanAdmitUe (1, ServicePriority::PRIORITY_EMERGENCY, 
-                                                          UT_CONSUMER, TRAFFIC_DATA, 50);
+                                                          UT_CONSUMER, TRAFFIC_DATA, 12);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision1);
     
     // 测试2: 普通数据接入判断
     NS_LOG_INFO ("Test AdmitControl: Normal DATA UE to Beam 1");
     AdmitDecision decision2 = admitControl->CanAdmitUe (1, ServicePriority::PRIORITY_DATA, 
-                                                          UT_CONSUMER, TRAFFIC_DATA, 30);
+                                                          UT_CONSUMER, TRAFFIC_DATA, 10);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision2);
     
     // 测试3: 切换准入判断
     NS_LOG_INFO ("Test AdmitControl: Handover from Beam 1 to Beam 2");
     admitControl->RegisterUeToBeam (1, 1, ServicePriority::PRIORITY_DATA, UT_CONSUMER, TRAFFIC_DATA, Vector (100, 100, 0));
-    AdmitDecision decision3 = admitControl->CanHandoverUe (1, 2, ServicePriority::PRIORITY_DATA, 40);
+    AdmitDecision decision3 = admitControl->CanHandoverUe (1, 2, ServicePriority::PRIORITY_DATA, 12);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision3);
     
     // 测试4: 获取推荐波束
@@ -289,7 +291,7 @@ int main (int argc, char *argv[])
     NS_LOG_INFO ("=== Testing SatUtPhy Enhanced SINR Calculation (C/I + System Interference) ===");
     
     Ptr<SatUtPhy> utPhy = CreateObject<SatUtPhy> ();
-    utPhy->SetAttribute ("Bandwidth", DoubleValue (30e6));  // 30MHz
+    utPhy->SetAttribute ("Bandwidth", DoubleValue (5e6));  // 每波束5MHz
     utPhy->SetAttribute ("NoiseFigure", DoubleValue (5.0));
     utPhy->SetCqiReportCallback (MakeCallback (&CqiReportCallback));
     
@@ -432,12 +434,85 @@ int main (int argc, char *argv[])
                          static_cast<uint32_t> (42), static_cast<uint8_t> (0));
     
     // ------------------------------------------------------------
-    // [新增测试] 14. 验证ESSA (Enhanced Slotted ALOHA) 多址接入
+    // [新增测试] 14. 验证 2 步随机接入 (MsgA→MsgB)
+    // ------------------------------------------------------------
+    NS_LOG_INFO ("=== Testing 2-Step Random Access (MsgA/MsgB) ===");
+
+    // --- 场景 C: 单个 UE, 2 步 RA 成功 (SUCCESS_RAR) ---
+    NS_LOG_INFO ("--- Scenario C: Single UE, 2-step RA should SUCCEED ---");
+
+    Ptr<SatUtMac> utMacC = CreateObject<SatUtMac> ();
+    utMacC->SwitchState (SatUtMac::MAC_IDLE);
+    utMacC->SetUeIdentity (0xC1C1C1C1C1ULL);
+    utMacC->SetRachType (RachType::TWO_STEP);
+    utMacC->SetRaTimers (MilliSeconds (1000), MilliSeconds (1500), 5);
+    // MsgA 回调 → gNB 的 ReceiveMsgA
+    utMacC->SetMsgACallback (MakeCallback (&GeoBeamScheduler::ReceiveMsgA, scheduler));
+    // 同时也需要 Msg3 回调 (FALLBACK 时复用)
+    utMacC->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    // 订阅 MsgB 广播
+    scheduler->RegisterUeTwoStepRaCallbacks (
+        MakeCallback (&SatUtMac::ReceiveMsgB, utMacC));
+    // 也订阅 Msg4 (FALLBACK 时需要)
+    scheduler->RegisterUeRaCallbacks (
+        MakeCallback (&SatUtMac::ReceiveRar, utMacC),
+        MakeCallback (&SatUtMac::ReceiveMsg4, utMacC));
+    utMacC->SetRaCompleteCallback (MakeBoundCallback (&RaCompleteCallback, std::string ("UE-C(2step)")));
+
+    // t=10s 发起 2 步 RA, PreambleId=55 (唯一, 无碰撞 → SUCCESS_RAR)
+    Simulator::Schedule (Seconds (10.0), &SatUtMac::InitiateRandomAccess, utMacC,
+                         static_cast<uint32_t> (55), static_cast<uint8_t> (0));
+
+    // --- 场景 D: 两个 UE, 2 步 RA, 同一 PreambleId → FALLBACK_RAR ---
+    NS_LOG_INFO ("--- Scenario D: Two UEs pick SAME PreambleId, 2-step FALLBACK ---");
+
+    Ptr<SatUtMac> utMacD1 = CreateObject<SatUtMac> ();
+    Ptr<SatUtMac> utMacD2 = CreateObject<SatUtMac> ();
+    utMacD1->SwitchState (SatUtMac::MAC_IDLE);
+    utMacD2->SwitchState (SatUtMac::MAC_IDLE);
+    utMacD1->SetUeIdentity (0xD1D1D1D1D1ULL);
+    utMacD2->SetUeIdentity (0xD2D2D2D2D2ULL);
+    utMacD1->SetRachType (RachType::TWO_STEP);
+    utMacD2->SetRachType (RachType::TWO_STEP);
+    utMacD1->SetRaTimers (MilliSeconds (1000), MilliSeconds (1500), 5);
+    utMacD2->SetRaTimers (MilliSeconds (1000), MilliSeconds (1500), 5);
+
+    // MsgA 回调
+    utMacD1->SetMsgACallback (MakeCallback (&GeoBeamScheduler::ReceiveMsgA, scheduler));
+    utMacD2->SetMsgACallback (MakeCallback (&GeoBeamScheduler::ReceiveMsgA, scheduler));
+    // Msg3 回调 (FALLBACK 复用)
+    utMacD1->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMacD2->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+
+    // 订阅 MsgB 广播
+    scheduler->RegisterUeTwoStepRaCallbacks (
+        MakeCallback (&SatUtMac::ReceiveMsgB, utMacD1));
+    scheduler->RegisterUeTwoStepRaCallbacks (
+        MakeCallback (&SatUtMac::ReceiveMsgB, utMacD2));
+    // 订阅 4 步 RAR/Msg4 (FALLBACK 后需要)
+    scheduler->RegisterUeRaCallbacks (
+        MakeCallback (&SatUtMac::ReceiveRar, utMacD1),
+        MakeCallback (&SatUtMac::ReceiveMsg4, utMacD1));
+    scheduler->RegisterUeRaCallbacks (
+        MakeCallback (&SatUtMac::ReceiveRar, utMacD2),
+        MakeCallback (&SatUtMac::ReceiveMsg4, utMacD2));
+
+    utMacD1->SetRaCompleteCallback (MakeBoundCallback (&RaCompleteCallback, std::string ("UE-D1(2step)")));
+    utMacD2->SetRaCompleteCallback (MakeBoundCallback (&RaCompleteCallback, std::string ("UE-D2(2step)")));
+
+    // 两个 UE 几乎同时发 MsgA, 同一 PreambleId=60 → FALLBACK_RAR
+    Simulator::Schedule (Seconds (13.0), &SatUtMac::InitiateRandomAccess, utMacD1,
+                         static_cast<uint32_t> (60), static_cast<uint8_t> (0));
+    Simulator::Schedule (Seconds (13.0) + MicroSeconds (50), &SatUtMac::InitiateRandomAccess, utMacD2,
+                         static_cast<uint32_t> (60), static_cast<uint8_t> (0));
+
+    // ------------------------------------------------------------
+    // [新增测试] 15. 验证ESSA (Enhanced Slotted ALOHA) 多址接入
     // ------------------------------------------------------------
     NS_LOG_INFO ("=== Testing ESSA (Enhanced Slotted ALOHA) ===");
     
     Ptr<SatUtPhy> utPhyForEssa = CreateObject<SatUtPhy> ();
-    utPhyForEssa->SetAttribute ("Bandwidth", DoubleValue (30e6));
+    utPhyForEssa->SetAttribute ("Bandwidth", DoubleValue (5e6));
     utPhyForEssa->SetAttribute ("EsssaNumSlots", UintegerValue (16));
     
     // Test 11a: 计算ESSA碰撞概率
@@ -461,15 +536,15 @@ int main (int argc, char *argv[])
     // ------------------------------------------------------------
 
     // 10. 运行仿真
-    // 4 步 RA 场景: 单次 ~1.2s, 碰撞重传额外 1-2 次 → 预留 18 秒
-    Simulator::Stop (Seconds (18.0));
+    // 4 步 + 2 步 RA 场景: 碰撞重传额外 1-2 次 → 预留 25 秒
+    Simulator::Stop (Seconds (25.0));
     Simulator::Run ();
 
     gwMac->StopPeriodicTransmissions ();
 
     Simulator::Destroy ();
 
-    NS_LOG_INFO ("=== 4-Step RA Summary ===");
+    NS_LOG_INFO ("=== RA Summary (4-Step + 2-Step) ===");
     NS_LOG_INFO ("  SUCCESS = " << g_raSuccessCount);
     NS_LOG_INFO ("  FAILED  = " << g_raFailedCount);
     NS_LOG_INFO ("Simulation Finished.");

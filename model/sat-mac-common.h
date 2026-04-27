@@ -80,6 +80,7 @@ struct PrachPreamble {
     uint8_t format;          // PRACH格式 (0-4)
     Time transmissionTime;    // 传输时间
     bool isRetransmission;   // 是否为重传
+    uint32_t raRnti;         // RA-RNTI: 由 PRACH 发送时刻派生, 区分不同 PRACH occasion
 };
 
 // 7. SSB同步信号块结构体
@@ -98,7 +99,7 @@ struct SsbBlock {
 // preambleId，它们都能"听到"同一个 RAR 并解析同一份 TC-RNTI，这样才能进入
 // Msg3 阶段并在 Msg3 上发生真正的竞争（竞争解决）。
 struct RarMessage {
-    uint32_t raRnti;              // 由 PRACH 时频资源派生
+    uint32_t raRnti;              // 由 PRACH 时频资源派生 (UE 按此过滤所属 PRACH occasion)
     uint32_t preambleId;          // 对应的前导码 ID (UE 用于匹配)
     uint16_t tcRnti;              // 分配的临时 C-RNTI
     Time     timingAdvance;       // 定时提前量 (GEO ~300 ms)
@@ -126,6 +127,49 @@ struct RrcSetupMessage {
     uint16_t tcRnti;              // 对应 Msg2/Msg3 的临时 C-RNTI
     uint64_t echoedUeIdentity;    // 回显 Msg3 中的 ueIdentity (竞争解决 ID)
     uint16_t cRnti;               // 晋升后的正式 C-RNTI
+    Time     transmissionTime;    // 发送时间戳
+};
+
+// ==================== 2 步随机接入 (MsgA/MsgB) — 3GPP Rel-16 ====================
+
+// 每个 UE 的随机接入模式选择
+enum class RachType {
+    FOUR_STEP,   // 传统 4 步 RA (Msg1→Msg2→Msg3→Msg4)
+    TWO_STEP     // 2 步 RA (MsgA→MsgB)
+};
+
+// MsgA: UE → gNB, 将 PRACH 前导码与 RRC 建链请求打包在一起
+struct MsgA {
+    uint32_t preambleId;          // 前导码 ID (1-63)
+    uint8_t  format;              // PRACH 格式
+    uint64_t ueIdentity;          // UE 随机身份 (40-bit)
+    uint32_t bufferStatus;        // 缓冲区状态 (bytes)
+    uint8_t  establishmentCause;  // 建链原因 (0=mt-Access 1=mo-Signalling 2=mo-Data)
+    Time     transmissionTime;    // 发送时间戳
+    bool     isRetransmission;    // 是否为重传
+    uint32_t raRnti;              // RA-RNTI: 区分不同 PRACH occasion
+};
+
+// MsgB 结果类型
+enum class MsgBType {
+    SUCCESS_RAR,   // 无碰撞: 直接分配 C-RNTI, 接入完成
+    FALLBACK_RAR   // 有碰撞: 分配 TC-RNTI + UL Grant, 回退到 4 步 Msg3/Msg4
+};
+
+// MsgB: gNB → UE
+struct MsgB {
+    MsgBType type;                // SUCCESS_RAR 或 FALLBACK_RAR
+    uint32_t preambleId;          // 对应的前导码 ID (UE 用于匹配)
+    uint32_t raRnti;              // RA-RNTI: UE 按此过滤所属 PRACH occasion
+    // SUCCESS_RAR 字段
+    uint16_t cRnti;               // 直接分配的正式 C-RNTI (仅 SUCCESS_RAR 有效)
+    uint64_t echoedUeIdentity;    // 回显 UE 身份 (仅 SUCCESS_RAR 有效)
+    // FALLBACK_RAR 字段
+    uint16_t tcRnti;              // 临时 C-RNTI (仅 FALLBACK_RAR 有效)
+    uint32_t ulGrantRbs;          // Msg3 的 UL Grant PRB 数 (仅 FALLBACK_RAR 有效)
+    uint8_t  ulGrantMcs;          // Msg3 的 MCS (仅 FALLBACK_RAR 有效)
+    // 公共字段
+    Time     timingAdvance;       // 定时提前量 (GEO ~300 ms)
     Time     transmissionTime;    // 发送时间戳
 };
 

@@ -4,10 +4,12 @@
 
 #include "ns3/object.h"
 #include "ns3/event-id.h"
+#include "ns3/nstime.h"
 #include "ns3/traced-callback.h"
 #include "sat-mac-common.h"
-#include "sat-phy.h" // 引入物理层
-#include "sat-ut-phy.h" // 引入终端物理层(含MultipleAccessMode枚举)
+#include "sat-phy.h"        // 引入物理层
+#include "sat-ut-phy.h"     // 引入终端物理层(含MultipleAccessMode枚举)
+#include "resource-manager.h"  // UtType 定义
 
 namespace ns3 {
 
@@ -22,7 +24,8 @@ public:
         MAC_IDLE,           // 空闲态
         MAC_CONNECTED,      // 已连接态
         MAC_TX,             // 正在发送
-        MAC_RX              // 正在接收
+        MAC_RX,             // 正在接收
+        MAC_WAITING_MSGB    // 2 步 RA: 等待 MsgB 响应
     };
 
     // 绑定底层物理层指针 (组装网络时使用)
@@ -110,12 +113,49 @@ public:
     // 配置 RA 定时器和最大重传次数
     void SetRaTimers (Time raResponseWindow, Time contentionResolutionTimer, uint8_t maxAttempts);
 
+    // 设置 preamble 池大小 (默认 63; 双信道可设 128)
+    void SetNumPreambles (uint32_t n);
+    uint32_t GetNumPreambles () const;
+
     // 设置 Msg3 发送回调 (上送到 GeoBeamScheduler::ReceiveMsg3)
     void SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback);
 
     // 随机接入完成 (成功/失败) 回调, 便于测试统计
-    enum RaResult { RA_SUCCESS, RA_FAILED_MAX_ATTEMPTS };
+    enum RaResult {
+        RA_SUCCESS,                  // 接入成功
+        RA_FAILED_MAX_ATTEMPTS,      // 超过最大重传次数
+        RA_FAILED_POOR_CHANNEL       // 信道质量不满足门限
+    };
     void SetRaCompleteCallback (Callback<void, RaResult> callback);
+
+    // 设置终端类型 (用于信道质量门限选取)
+    void SetUtType (UtType utType);
+    UtType GetUtType () const;
+
+    // ==================== 2 步随机接入 (MsgA→MsgB) ====================
+    // 统一入口: 根据 m_rachType 分派到 4 步或 2 步
+    void InitiateRandomAccess (uint32_t preambleId = 0, uint8_t format = 0);
+    // 2 步 RA 核心: 构建 MsgA (preamble+payload 打包) 并发送
+    void DoTwoStepRandomAccess (uint32_t preambleId = 0, uint8_t format = 0);
+    // 接收 MsgB (SUCCESS_RAR 或 FALLBACK_RAR)
+    void ReceiveMsgB (const MsgB& msgB);
+    // MsgB 响应超时
+    void OnMsgBResponseTimeout ();
+    // 设置/获取 RA 类型
+    void SetRachType (RachType rachType);
+    RachType GetRachType () const;
+    // 设置 MsgA 发送回调
+    void SetMsgACallback (Callback<void, const MsgA&> callback);
+
+    // ==================== 接入过程统计计数器 ====================
+    // 总发送 Msg1/MsgA 次数 (每次重传都算一次)
+    uint32_t GetTotalMsg1Sent () const { return m_totalMsg1Sent; }
+    // 收到有效 Msg4 / MsgB-SUCCESS 的次数
+    uint32_t GetTotalMsg4Received () const { return m_totalMsg4Received; }
+    // Contention Resolution Timer 超时次数 (= 碰撞导致未收到 Msg4)
+    uint32_t GetTotalContentionTimeouts () const { return m_totalContentionTimeouts; }
+    // MsgB Response Timer 超时次数 (2 步 RA 专用)
+    uint32_t GetTotalMsgBTimeouts () const { return m_totalMsgBTimeouts; }
 
 private:
     UtMacState m_state;
@@ -141,11 +181,13 @@ private:
 
     uint64_t m_ueIdentity;                     // 本 UE 的竞争解决身份
     uint32_t m_currentPreambleId;              // 当前本次 RA 使用的 preambleId
+    uint32_t m_currentRaRnti;                  // 当前本次 RA 的 RA-RNTI (区分 PRACH occasion)
     uint16_t m_tcRnti;                         // Msg2 中分配给本 UE 的 TC-RNTI (0 表示尚未获得)
     uint16_t m_cRnti;                          // Msg4 成功后晋升的正式 C-RNTI
 
     uint8_t m_raAttempt;                       // 当前已发起的 Msg1 次数
     uint8_t m_maxRaAttempts;                   // 最大 Msg1 次数
+    uint32_t m_numPreambles;                   // preamble 池大小 (默认 63)
     Time m_raResponseWindow;                   // RA Response Timer 时长
     Time m_contentionResolutionTimeout;        // 竞争解决定时器时长
 
@@ -155,6 +197,38 @@ private:
 
     Callback<void, const RrcSetupRequest&> m_msg3Callback;
     Callback<void, RaResult>                m_raCompleteCallback;
+
+    // ---------- 接入过程统计计数器 ----------
+    uint32_t m_totalMsg1Sent;             // 累计发送 Msg1/MsgA 次数
+    uint32_t m_totalMsg4Received;         // 累计收到有效 Msg4 / MsgB-SUCCESS 次数
+    uint32_t m_totalContentionTimeouts;   // 累计竞争解决超时次数 (碰撞)
+    uint32_t m_totalMsgBTimeouts;         // 累计 MsgB 响应超时次数
+
+    // ---------- MAC 层统计 TracedCallbacks ----------
+    TracedCallback<uint16_t, uint32_t> m_queueLengthTrace;  // (rnti, bufferBytes)
+    TracedCallback<uint16_t, int64_t>  m_queueDelayTrace;   // (rnti, delay_ns)
+
+    // ---------- 信道质量门限 ----------
+    // 基线：卫星 EIRP - 路损(190dB) + 手机天线增益(0dBi) = -93 dBm
+    // 链路余量 1.5 dB → RSRP 门限 = -94.5 dBm
+    // 消费级手机 SNR 门限: 3.3 - 1.5 = 1.8 dB
+    // 便携终端 SNR 门限: 22.3 - 1.5 = 20.8 dB
+    static constexpr double RSRP_THRESHOLD_DBM    = -94.5;
+    static constexpr double SNR_THRESHOLD_CONSUMER = 1.8;
+    static constexpr double SNR_THRESHOLD_PORTABLE = 20.8;
+
+    bool CheckChannelQuality () const;  // true = 满足门限, false = 信道不足
+
+    UtType m_utType;                               // 终端类型 (影响 SNR 门限选择)
+
+    // ---------- 2 步随机接入状态 ----------
+    RachType m_rachType;                           // 当前 RA 模式 (默认 FOUR_STEP)
+    Time m_msgBResponseWindow;                     // MsgB 响应窗口 (UL+DL+margin)
+    EventId m_msgBResponseTimer;                   // MsgB 响应定时器
+    Callback<void, const MsgA&> m_msgACallback;    // MsgA 发送回调
+
+    // ---------- MAC 层队列时延追踪 ----------
+    Time m_bufferArrivalTime;  // 最早未发送数据的入队时间
 };
 
 } // namespace ns3

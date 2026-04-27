@@ -24,8 +24,8 @@ TypeId FrequencyReuse::GetTypeId (void)
 }
 
 FrequencyReuse::FrequencyReuse ()
-  : m_totalBandwidthHz (30e6),
-    m_totalRbs (160),
+  : m_totalBandwidthHz (35e6),
+    m_totalRbs (175),
     m_reuseFactor (7)
 {
   NS_LOG_FUNCTION (this);

@@ -6,7 +6,7 @@
  *
  * Performance optimization:
  * - Closed-loop rate control: MAC queue monitoring for adaptive rate control
- * - Full buffer saturation: target to fill 160 PRB downlink capacity (10Mbps+)
+ * - Full buffer saturation: target to fill 25 PRB single-beam downlink capacity
  * - BDP-aware TCP window sizing for GEO RTT (600ms)
  * - ROHC header compression awareness
  */
@@ -58,7 +58,7 @@ TypeId SatTrafficGenerator::GetTypeId (void)
 
     .AddAttribute ("MaxPrbPerTti",
                    "Maximum PRBs per TTI for payload calculation",
-                   UintegerValue (160),
+                   UintegerValue (25),
                    MakeUintegerAccessor (&SatTrafficGenerator::m_maxPrbPerTti),
                    MakeUintegerChecker<uint32_t> (1, 273))
 
@@ -110,8 +110,8 @@ SatTrafficGenerator::CalculateMaxPayloadBytesPerTti () const
   /*
    * Calculate single TTI maximum payload based on 3GPP TR 37.901:
    *
-   * 160 PRB x 12 subcarriers/PRB x 14 symbols/TTI (normal CP) x 6 bits/symbol (64-QAM)
-   * = 160 x 12 x 14 x 6 = 161,280 bits/TTI = 20,160 bytes/TTI
+   * 25 PRB x 12 subcarriers/PRB x 14 symbols/TTI (normal CP) x 6 bits/symbol (64-QAM)
+   * = 25 x 12 x 14 x 6 = 25,200 bits/TTI = 3,150 bytes/TTI
    *
    * Subtract overhead:
    * - ROHC compressed header: ~2 bytes (accounted in m_rohcOverheadBytes)
@@ -120,7 +120,7 @@ SatTrafficGenerator::CalculateMaxPayloadBytesPerTti () const
    * - MAC header: 3 bytes
    * - IP header: 20 bytes (IPv4)
    *
-   * Net payload = 20,160 - (2+2+4+3+20) = 20,129 bytes/TTI
+   * Net payload = 3,150 - (2+2+4+3+20) = 3,119 bytes/TTI
    *
    * Conservative value: 1200 bytes (considering control channel overhead, CCE, etc.)
    */
@@ -136,15 +136,15 @@ SatTrafficGenerator::CalculateTcpWindowBytes () const
   /*
    * TCP BDP (Bandwidth-Delay Product) calculation:
    *
-   * Bandwidth: 160 PRB x 12 subcarriers x 14 symbols x 6 bits / 0.001s (1ms TTI)
-   *          = 161,280 bits / 0.001s = 161.28 Mbps
+   * Bandwidth: 25 PRB x 12 subcarriers x 14 symbols x 6 bits / 0.001s (1ms TTI)
+   *          = 25,200 bits / 0.001s = 25.2 Mbps
    *
    * RTT: m_geoRtt = 630ms
    *
-   * BDP = bandwidth x RTT = 161.28 Mbps x 0.63s = 101.6 Mbits = 12.7 MB
+   * BDP = bandwidth x RTT = 25.2 Mbps x 0.63s = 15.9 Mbits = 1.98 MB
    *
    * TCP window should be 2-3x BDP to handle GEO long RTT:
-   * - Use 3x BDP = 38.1 MB
+   * - Use 3x BDP = 5.95 MB
    * - But ns-3 TCP window is limited by receiver window and memory
    * - Conservatively set to 10 MB (sufficient to fill BDP)
    */
@@ -194,8 +194,8 @@ SatTrafficGenerator::InstallFullBuffer (NodeContainer sourceNodes, Ipv4Address s
 
       Ptr<Application> app = CreateObject<Application> ();
       node->AddApplication (app);
-      app->SetStartTime (Seconds (0.5));
-      app->SetStopTime (Seconds (100.0));
+      app->SetStartTime (m_appStartTime);
+      app->SetStopTime (m_appStopTime);
 
       InetSocketAddress dest = InetSocketAddress (sinkAddress, port);
 
@@ -230,15 +230,12 @@ SatTrafficGenerator::InstallFullBuffer (NodeContainer sourceNodes, Ipv4Address s
         };
 
       m_flows.push_back (fs);
-      Simulator::Schedule (Seconds (0.5), fs->driver);
+      Simulator::Schedule (m_appStartTime, fs->driver);
       m_socketConnected[socket] = true;
       m_socketTxBytes[socket] = 0;
 
       apps.Add (app);
     }
-
-  // Install sink
-  InstallSink (sourceNodes);
 
   NS_LOG_INFO ("[FullBuffer] Installed on " << sourceNodes.GetN ()
                << " nodes, target rate: " << m_targetRateBps / 1e6 << " Mbps");
@@ -290,8 +287,8 @@ SatTrafficGenerator::InstallFtp (NodeContainer sourceNodes, Ipv4Address sinkAddr
 
       Ptr<Application> app = CreateObject<Application> ();
       node->AddApplication (app);
-      app->SetStartTime (Seconds (1.0));
-      app->SetStopTime (Seconds (100.0));
+      app->SetStartTime (m_appStartTime);
+      app->SetStopTime (m_appStopTime);
 
       InetSocketAddress dest = InetSocketAddress (sinkAddress, port);
 
@@ -344,16 +341,9 @@ SatTrafficGenerator::InstallFtp (NodeContainer sourceNodes, Ipv4Address sinkAddr
         };
 
       m_flows.push_back (fs);
-      Simulator::Schedule (Seconds (1.0), fs->driver);
+      Simulator::Schedule (m_appStartTime, fs->driver);
       apps.Add (app);
     }
-
-  // Install TCP sink
-  PacketSinkHelper sinkHelper ("ns3::TcpSocketFactory",
-                               InetSocketAddress (Ipv4Address::GetAny (), port));
-  apps.Add (sinkHelper.Install (sourceNodes));
-  apps.Get (0)->SetStartTime (Seconds (0.0));
-  apps.Get (0)->SetStopTime (Seconds (100.0));
 
   return apps;
 }
@@ -379,10 +369,14 @@ SatTrafficGenerator::InstallHttp (NodeContainer sourceNodes, Ipv4Address sinkAdd
   // Parsing time: Exponential, mean=0.13s
   // Object count: Pareto, mean=25, shape=1.1
 
+  const double paretoShape = 1.1;
+  const double embeddedObjMeanBytes = 7758.0;
+  const double embeddedObjScale = embeddedObjMeanBytes * (paretoShape - 1.0) / paretoShape;
+
   Ptr<ParetoRandomVariable> paretoRng = CreateObject<ParetoRandomVariable> ();
   Ptr<ExponentialRandomVariable> expRng = CreateObject<ExponentialRandomVariable> ();
-  paretoRng->SetAttribute ("Mean", DoubleValue (7758));
-  paretoRng->SetAttribute ("Shape", DoubleValue (1.1));
+  paretoRng->SetAttribute ("Scale", DoubleValue (embeddedObjScale));
+  paretoRng->SetAttribute ("Shape", DoubleValue (paretoShape));
   expRng->SetAttribute ("Mean", DoubleValue (0.13));
 
   for (uint32_t i = 0; i < sourceNodes.GetN (); ++i)
@@ -394,8 +388,8 @@ SatTrafficGenerator::InstallHttp (NodeContainer sourceNodes, Ipv4Address sinkAdd
 
       Ptr<Application> app = CreateObject<Application> ();
       node->AddApplication (app);
-      app->SetStartTime (Seconds (1.0));
-      app->SetStopTime (Seconds (100.0));
+      app->SetStartTime (m_appStartTime);
+      app->SetStopTime (m_appStopTime);
 
       InetSocketAddress dest = InetSocketAddress (sinkAddress, port);
 
@@ -483,16 +477,9 @@ SatTrafficGenerator::InstallHttp (NodeContainer sourceNodes, Ipv4Address sinkAdd
         };
 
       m_flows.push_back (fs);
-      Simulator::Schedule (Seconds (1.0), fs->driver);
+      Simulator::Schedule (m_appStartTime, fs->driver);
       apps.Add (app);
     }
-
-  // Install TCP sink
-  PacketSinkHelper sinkHelper ("ns3::TcpSocketFactory",
-                               InetSocketAddress (Ipv4Address::GetAny (), port));
-  apps.Add (sinkHelper.Install (sourceNodes));
-  apps.Get (0)->SetStartTime (Seconds (0.0));
-  apps.Get (0)->SetStopTime (Seconds (100.0));
 
   return apps;
 }
@@ -547,8 +534,8 @@ SatTrafficGenerator::InstallVoipRtp (NodeContainer sourceNodes, Ipv4Address sink
 
       Ptr<Application> app = CreateObject<Application> ();
       node->AddApplication (app);
-      app->SetStartTime (Seconds (1.0));
-      app->SetStopTime (Seconds (100.0));
+      app->SetStartTime (m_appStartTime);
+      app->SetStopTime (m_appStopTime);
 
       InetSocketAddress dest = InetSocketAddress (sinkAddress, port);
       const uint32_t RTP_TIMESTAMP_STEP = 160; // 20ms @ 8kHz sampling
@@ -587,16 +574,9 @@ SatTrafficGenerator::InstallVoipRtp (NodeContainer sourceNodes, Ipv4Address sink
         };
 
       m_flows.push_back (fs);
-      Simulator::Schedule (Seconds (1.0), fs->driver);
+      Simulator::Schedule (m_appStartTime, fs->driver);
       apps.Add (app);
     }
-
-  // Install UDP sink
-  PacketSinkHelper sinkHelper ("ns3::UdpSocketFactory",
-                               InetSocketAddress (Ipv4Address::GetAny (), port));
-  apps.Add (sinkHelper.Install (sourceNodes));
-  apps.Get (0)->SetStartTime (Seconds (0.0));
-  apps.Get (0)->SetStopTime (Seconds (100.0));
 
   return apps;
 }
@@ -610,43 +590,18 @@ SatTrafficGenerator::InstallLegacyConsumerData (NodeContainer sourceNodes,
                                                  Ipv4Address sinkAddress,
                                                  bool isUplink)
 {
-  NS_LOG_FUNCTION (this << "Legacy Consumer Data");
-  m_modelType = TRAFFIC_LEGACY_DATA;
-
-  InetSocketAddress remote = InetSocketAddress (sinkAddress, m_port);
-  OnOffHelper onOff ("ns3::UdpSocketFactory", remote);
-
-  std::string rate = isUplink ? "0.5Mbps" : "10Mbps";
-
-  onOff.SetAttribute ("DataRate", StringValue (rate));
-  onOff.SetAttribute ("PacketSize", UintegerValue (1472));
-
-  onOff.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable[Mean=1.0]"));
-  onOff.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable[Mean=0.5]"));
-
-  ApplicationContainer apps = onOff.Install (sourceNodes);
-  NS_LOG_INFO ("[Legacy] Consumer Data installed: " << rate);
-  return apps;
+  NS_LOG_FUNCTION (this << "Legacy Consumer Data -> HTTP");
+  NS_LOG_INFO ("[Compat] Redirect legacy consumer data API to TR 37.901 HTTP model");
+  return InstallHttp (sourceNodes, sinkAddress, isUplink);
 }
 
 ApplicationContainer
 SatTrafficGenerator::GenerateVoiceTraffic (NodeContainer sourceNodes,
                                              Ipv4Address sinkAddress)
 {
-  NS_LOG_FUNCTION (this << "Legacy Voice");
-  m_modelType = TRAFFIC_LEGACY_VOICE;
-
-  InetSocketAddress remote = InetSocketAddress (sinkAddress, m_port);
-  OnOffHelper onOff ("ns3::UdpSocketFactory", remote);
-
-  onOff.SetAttribute ("DataRate", StringValue ("2.4kbps"));
-  onOff.SetAttribute ("PacketSize", UintegerValue (100));
-  onOff.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1.0]"));
-  onOff.SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0.0]"));
-
-  ApplicationContainer apps = onOff.Install (sourceNodes);
-  NS_LOG_INFO ("[Legacy] Voice installed: 2.4kbps");
-  return apps;
+  NS_LOG_FUNCTION (this << "Voice -> VoIP/RTP");
+  NS_LOG_INFO ("[Compat] Redirect legacy voice API to TR 37.901 VoIP/RTP model");
+  return InstallVoipRtp (sourceNodes, sinkAddress, false);
 }
 
 ApplicationContainer
@@ -654,7 +609,8 @@ SatTrafficGenerator::GenerateConsumerDataTraffic (NodeContainer sourceNodes,
                                                     Ipv4Address sinkAddress,
                                                     bool isUplink)
 {
-  return InstallLegacyConsumerData (sourceNodes, sinkAddress, isUplink);
+  NS_LOG_INFO ("[Compat] Redirect consumer data API to TR 37.901 HTTP model");
+  return InstallHttp (sourceNodes, sinkAddress, isUplink);
 }
 
 ApplicationContainer
@@ -662,22 +618,9 @@ SatTrafficGenerator::GeneratePortableDataTraffic (NodeContainer sourceNodes,
                                                     Ipv4Address sinkAddress,
                                                     bool isUplink)
 {
-  NS_LOG_FUNCTION (this << "Legacy Portable/Emergency Data");
-  m_modelType = TRAFFIC_LEGACY_DATA;
-
-  InetSocketAddress remote = InetSocketAddress (sinkAddress, m_port);
-  OnOffHelper onOff ("ns3::UdpSocketFactory", remote);
-
-  std::string rate = isUplink ? "10Mbps" : "100Mbps";
-
-  onOff.SetAttribute ("DataRate", StringValue (rate));
-  onOff.SetAttribute ("PacketSize", UintegerValue (1472));
-  onOff.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1.0]"));
-  onOff.SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0.0]"));
-
-  ApplicationContainer apps = onOff.Install (sourceNodes);
-  NS_LOG_INFO ("[Legacy] Portable/Emergency Data installed: " << rate);
-  return apps;
+  NS_LOG_FUNCTION (this << "Portable Data -> FTP");
+  NS_LOG_INFO ("[Compat] Redirect portable data API to TR 37.901 FTP model");
+  return InstallFtp (sourceNodes, sinkAddress, isUplink);
 }
 
 void
@@ -705,10 +648,10 @@ SatTrafficGenerator::AttachUserToBeam (uint16_t beamId, Ptr<Node> userNode,
       app = InstallVoipRtp (nodeCont, destAddress, isUplink);
       break;
     case TRAFFIC_LEGACY_DATA:
-      app = InstallLegacyConsumerData (nodeCont, destAddress, isUplink);
+      app = InstallFtp (nodeCont, destAddress, isUplink);
       break;
     case TRAFFIC_LEGACY_VOICE:
-      app = GenerateVoiceTraffic (nodeCont, destAddress);
+      app = InstallVoipRtp (nodeCont, destAddress, isUplink);
       break;
     default:
       NS_LOG_WARN ("Unknown Traffic Type: " << static_cast<int> (type));
@@ -942,6 +885,15 @@ SatTrafficGenerator::SetRohcOverheadBytes (uint32_t bytes)
 {
   m_rohcOverheadBytes = bytes;
   NS_LOG_INFO ("ROHC overhead set to: " << bytes << " bytes");
+}
+
+void
+SatTrafficGenerator::SetApplicationWindow (Time start, Time stop)
+{
+  m_appStartTime = start;
+  m_appStopTime = stop;
+  NS_LOG_INFO ("Application window set to: start=" << start.GetSeconds ()
+               << "s stop=" << stop.GetSeconds () << "s");
 }
 
 void

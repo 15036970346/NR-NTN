@@ -41,8 +41,8 @@ TypeId AdmitControl::GetTypeId (void)
 
 AdmitControl::AdmitControl ()
   : m_emergencyReservationRatio (0.2),
-    m_totalDlRbs (160),
-    m_totalUlRbs (50),
+    m_totalDlRbs (25),
+    m_totalUlRbs (25),
     m_admissionThreshold (0.9),
     m_handoverBenefitThreshold (0.15)
 {

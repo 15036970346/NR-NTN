@@ -20,8 +20,8 @@ TypeId SatUtPhy::GetTypeId (void) {
         .SetParent<Object> ()
         .SetGroupName ("SatGeo")
         .AddConstructor<SatUtPhy> ()
-        .AddAttribute ("Bandwidth", "System bandwidth in Hz",
-                       DoubleValue (30e6),  // 修正为30MHz
+        .AddAttribute ("Bandwidth", "Per-beam bandwidth in Hz",
+                       DoubleValue (5e6),  // 统一为每波束5MHz
                        MakeDoubleAccessor (&SatUtPhy::m_bandwidthHz),
                        MakeDoubleChecker<double> ())
         .AddAttribute ("NoiseFigure", "Receiver noise figure in dB",
@@ -39,7 +39,19 @@ TypeId SatUtPhy::GetTypeId (void) {
         .AddAttribute ("EsssaNumSlots", "Number of slots for ESSA",
                        UintegerValue (16),
                        MakeUintegerAccessor (&SatUtPhy::m_essaNumSlots),
-                       MakeUintegerChecker<uint32_t> ());
+                       MakeUintegerChecker<uint32_t> ())
+        .AddTraceSource ("RsrpTrace",
+                         "RSRP measurement trace (rnti, rsrp_dBm)",
+                         MakeTraceSourceAccessor (&SatUtPhy::m_rsrpTrace),
+                         "ns3::TracedCallback::UintDouble")
+        .AddTraceSource ("SinrTrace",
+                         "SINR measurement trace (rnti, sinr_dB)",
+                         MakeTraceSourceAccessor (&SatUtPhy::m_sinrTrace),
+                         "ns3::TracedCallback::UintDouble")
+        .AddTraceSource ("RsrqTrace",
+                         "RSRQ measurement trace (rnti, rsrq_dB)",
+                         MakeTraceSourceAccessor (&SatUtPhy::m_rsrqTrace),
+                         "ns3::TracedCallback::UintDouble");
     return tid;
 }
 
@@ -48,14 +60,16 @@ SatUtPhy::SatUtPhy ()
       m_rnti (1),
       m_currentBeamId (1),
       m_lastCalculatedSinr (0.0),
-      m_bandwidthHz (30e6),
+      m_lastRsrp (-120.0),
+      m_bandwidthHz (5e6),
       m_noiseFigure (5.0),
       m_antennaGainDbi (0.0),
       m_preambleId (0),
       m_prachFormat (0),
       m_timingAdvance (MicroSeconds (0)),
       m_maMode (MultipleAccessMode::ESSA),
-      m_essaNumSlots (16)
+      m_essaNumSlots (16),
+      m_lastRsrq (0.0)
 {
     NS_LOG_FUNCTION (this);
 }
@@ -133,6 +147,7 @@ double SatUtPhy::CalculateSinr (double rxPowerDbm, uint32_t beamId) {
 }
 
 double SatUtPhy::CalculateComprehensiveSinr (double rxPowerDbm, uint32_t beamId) {
+    m_lastRsrp = rxPowerDbm;   // 保存 RSRP
     // 完整的SINR计算: SINR = C / (I_cc + I_adj + N)
     // C: 期望信号功率
     // I_cc: 共道干扰 (Co-channel interference)
@@ -160,7 +175,18 @@ double SatUtPhy::CalculateComprehensiveSinr (double rxPowerDbm, uint32_t beamId)
     double sinrDb = 10.0 * std::log10(sinrLinear);
     
     m_lastCalculatedSinr = sinrDb;
-    
+
+    // 计算 RSRQ: N * RSRP / RSSI, 其中 RSSI = C + I_cc + I_adj + N
+    // N = 1 (单个 RB 测量), 简化为 RSRQ = RSRP / RSSI
+    double rssiMw = cMw + iCcMw + iAdjMw + nMw;
+    double rsrqLinear = cMw / rssiMw;
+    m_lastRsrq = 10.0 * std::log10 (rsrqLinear);
+
+    // 触发 PHY 层统计 TracedCallbacks
+    m_rsrpTrace (m_rnti, rxPowerDbm);
+    m_sinrTrace (m_rnti, sinrDb);
+    m_rsrqTrace (m_rnti, m_lastRsrq);
+
     // 5. 日志输出各分量
     NS_LOG_INFO ("=== Comprehensive SINR Calculation ===");
     NS_LOG_INFO ("Signal (C): " << rxPowerDbm << " dBm");
@@ -230,6 +256,27 @@ void SatUtPhy::TriggerCqiReport () {
 
 double SatUtPhy::GetLastCalculatedSinr () const {
     return m_lastCalculatedSinr;
+}
+
+double SatUtPhy::GetLastRsrp () const {
+    return m_lastRsrp;
+}
+
+double SatUtPhy::GetLastRsrq () const {
+    return m_lastRsrq;
+}
+
+double SatUtPhy::CalculateRsrq (double rsrpDbm, uint32_t beamId) {
+    // RSRQ = 10*log10(RSRP / RSSI)
+    // RSSI = 期望信号 + 共道干扰 + 临道干扰 + 热噪声
+    double cMw    = std::pow (10.0, rsrpDbm / 10.0);
+    double iCcMw  = std::pow (10.0, GetCoChannelInterference (beamId) / 10.0);
+    double iAdjMw = std::pow (10.0, GetAdjacentChannelInterference (beamId) / 10.0);
+    double nMw    = std::pow (10.0, CalculateThermalNoise () / 10.0);
+    double rssiMw = cMw + iCcMw + iAdjMw + nMw;
+    double rsrqDb = 10.0 * std::log10 (cMw / rssiMw);
+    m_lastRsrq = rsrqDb;
+    return rsrqDb;
 }
 
 // ==============================================================

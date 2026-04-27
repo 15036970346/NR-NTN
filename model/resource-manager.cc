@@ -1,6 +1,6 @@
 /*
  * 文件路径：contrib/geo-sat/model/resource-manager.cc
- * 功能：卫星无线资源管理模块实现 (S频段专版)
+ * 功能：卫星无线资源管理模块实现 (统一 35MHz / 175 PRB / 单波束25 PRB 口径)
  */
 #include "resource-manager.h"
 #include "ns3/log.h"
@@ -19,18 +19,22 @@ TypeId ResourceManager::GetTypeId (void)
     .SetParent<Object> ()
     .SetGroupName ("SatGeo")
     .AddConstructor<ResourceManager> ()
-    // 支持 S 频段 2GHz 工作频率
-    .AddAttribute ("OperatingFrequency",
-                   "Operating frequency for S-band in Hz.",
-                   DoubleValue (2.0e9), 
-                   MakeDoubleAccessor (&ResourceManager::m_operatingFrequency),
+    .AddAttribute ("P0NominalPusch",
+                   "Target received power P_0 at the satellite gNB (dBm).",
+                   DoubleValue (-90.0), 
+                   MakeDoubleAccessor (&ResourceManager::m_p0NominalPusch),
+                   MakeDoubleChecker<double> ())
+    .AddAttribute ("PathLossCompensationAlpha",
+                   "Fractional path loss compensation factor.",
+                   DoubleValue (0.8), 
+                   MakeDoubleAccessor (&ResourceManager::m_alpha),
                    MakeDoubleChecker<double> ());
   return tid;
 }
 
 ResourceManager::ResourceManager () 
-  : m_minEirpDbw (3.0),   // 表格限定：下限 3 dBW
-    m_maxEirpDbw (20.0)   // 表格限定：上限 20 dBW
+  : m_maxEirpPortable (33.0),   // 对应 3 dBW 的便携式终端发射物理极限
+    m_maxEirpConsumer (50.0)    // 对应 20 dBW 的大型终端发射物理极限
 { 
   NS_LOG_FUNCTION (this); 
 }
@@ -38,84 +42,58 @@ ResourceManager::ResourceManager ()
 ResourceManager::~ResourceManager () { NS_LOG_FUNCTION (this); }
 
 // =================================================================
-// 功能 1：动态分配频谱资源块 (AllocateSpectrum)
+// 物理边界审查 (依据《NR NTN 3.23》核心指标)
 // =================================================================
-uint32_t ResourceManager::AllocateSpectrum (UtType utType, TrafficType trafficType, double cqi, bool isUplink)
+uint32_t ResourceManager::AllocateSpectrum (UtType utType, uint32_t requestedRbs, bool isUplink)
 {
-  NS_LOG_FUNCTION (this << utType << trafficType << cqi << isUplink);
+  NS_LOG_FUNCTION (this << utType << requestedRbs << isUplink);
 
-  uint32_t baseRbs = 0;
-  uint32_t allocatedRbs = 0;
+  const uint32_t beamPrbLimit = 25;
+  uint32_t hardwareLimit = beamPrbLimit;
 
-  // 1. 根据业务类型设定基准 RB 需求
-  if (isUplink) {
-      if (trafficType == TRAFFIC_VOICE)            baseRbs = 10;
-      else if (trafficType == TRAFFIC_DATA)        baseRbs = 25;
-      else if (trafficType == TRAFFIC_HIGH_CAPACITY) baseRbs = 40;
-  } else { // 下行带宽通常更宽
-      if (trafficType == TRAFFIC_VOICE)            baseRbs = 80;
-      else if (trafficType == TRAFFIC_DATA)        baseRbs = 120;
-      else if (trafficType == TRAFFIC_HIGH_CAPACITY) baseRbs = 150;
-  }
+  if (isUplink)
+    {
+      // 当前统一到每波束 5 MHz / 25 PRB，终端类别差异不再突破该单波束上限。
+      hardwareLimit = beamPrbLimit;
+    }
+  else
+    {
+      hardwareLimit = beamPrbLimit;
+    }
 
-  // 2. 根据终端类型微调 (消费级终端通常处理能力更强，可并发处理更多RB)
-  double typeMultiplier = (utType == UT_CONSUMER) ? 1.1 : 1.0;
+  // 核心逻辑：用户需求与物理天花板取最小值
+  uint32_t approvedRbs = std::min(requestedRbs, hardwareLimit);
 
-  // 3. 根据信道质量 (CQI 1~15) 动态补偿
-  // CQI 越低，信道越差，为了维持业务速率，需要分配更多的 RB 资源
-  double cqiFactor = 1.0 + ((15.0 - std::max(1.0, cqi)) * 0.05); 
-
-  // 计算初步需要的 RB 数量
-  allocatedRbs = std::round (baseRbs * typeMultiplier * cqiFactor);
-
-  // 4. 严格执行表格中的硬性边界限制！
-  if (isUplink) {
-      // 上行：6 ~ 50 RB
-      allocatedRbs = std::clamp(allocatedRbs, (uint32_t)6, (uint32_t)50);
-  } else {
-      // 下行：75 ~ 160 RB
-      allocatedRbs = std::clamp(allocatedRbs, (uint32_t)75, (uint32_t)160);
-  }
-
-  NS_LOG_INFO ("Allocated " << allocatedRbs << " RBs for " 
-               << (isUplink ? "UPLINK" : "DOWNLINK") 
-               << " (CQI: " << cqi << ")");
+  NS_LOG_INFO ("RRM Spectrum Review: Requested=" << requestedRbs 
+               << " | Direction=" << (isUplink ? "UL" : "DL")
+               << " | Hardware Ceiling=" << hardwareLimit 
+               << " ===> Approved=" << approvedRbs << " RBs");
                
-  return allocatedRbs;
+  return approvedRbs;
 }
 
 // =================================================================
-// 功能 2：动态调整终端发射功率 (AdjustUtTxPower)
+// 3GPP PUSCH 上行功率控制
 // =================================================================
-double ResourceManager::AdjustUtTxPower (UtType utType, double currentUplinkSnr, uint8_t targetMcs)
+double ResourceManager::AdjustUtTxPower (UtType utType, uint32_t allocatedRbs, double pathLossDb)
 {
-  NS_LOG_FUNCTION (this << utType << currentUplinkSnr << (uint16_t)targetMcs);
+  NS_LOG_FUNCTION (this << utType << allocatedRbs << pathLossDb);
 
-  // 1. 确定当前终端的 EIRP 物理上限 (dBW 转为 dBm 方便计算：dBm = dBW + 30)
-  // 便携式按 3 dBW (33 dBm) 算，消费级按 20 dBW (50 dBm) 算
-  double maxEirpDbm = (utType == UT_PORTABLE) ? (m_minEirpDbw + 30.0) : (m_maxEirpDbw + 30.0);
+  if (allocatedRbs == 0) return 0.0; 
 
-  // 2. 计算目标 MCS 对应的期望 SNR (简单的线性映射估算，MCS越高，需要的SNR越高)
-  // 假设 MCS 0 需要 -2dB SNR，MCS 28 需要 22dB SNR
-  double targetSnr = -2.0 + (targetMcs * 0.85);
+  double pCmax = (utType == UT_PORTABLE) ? m_maxEirpPortable : m_maxEirpConsumer;
+  double bandwidthCompensation = 10.0 * std::log10 (static_cast<double>(allocatedRbs));
+  double pathLossCompensation = m_alpha * pathLossDb;
+  double targetPowerDbm = m_p0NominalPusch + bandwidthCompensation + pathLossCompensation;
 
-  // 3. 计算 SNR 差距 (如果 currentUplinkSnr 低于 targetSnr，说明功率不够)
-  double snrGap = targetSnr - currentUplinkSnr;
+  double actualTxPowerDbm = std::min (pCmax, targetPowerDbm);
 
-  // 4. 闭环功率调整：在原有基准功率上加上缺少的 SNR
-  // 假设当前时刻基准发射功率为 23 dBm
-  double currentTxPowerDbm = 23.0; 
-  double adjustedTxPowerDbm = currentTxPowerDbm + snrGap;
+  NS_LOG_INFO ("RRM Power Control | Allocated RBs=" << allocatedRbs 
+               << " | PathLoss=" << pathLossDb << " dB"
+               << " | P_CMAX=" << pCmax << " dBm"
+               << " ===> Final TX Power=" << actualTxPowerDbm << " dBm");
 
-  // 5. 严格限制在终端 EIRP 能力范围内
-  // 最小不能低于 0 dBm，最大不能超过该终端的物理上限
-  adjustedTxPowerDbm = std::clamp(adjustedTxPowerDbm, 0.0, maxEirpDbm);
-
-  NS_LOG_INFO ("Adjusted TX Power: " << adjustedTxPowerDbm << " dBm "
-               << "(Target SNR: " << targetSnr << "dB, Current SNR: " << currentUplinkSnr 
-               << "dB, Max EIRP: " << maxEirpDbm << " dBm)");
-
-  return adjustedTxPowerDbm;
+  return actualTxPowerDbm;
 }
 
 } // namespace ns3

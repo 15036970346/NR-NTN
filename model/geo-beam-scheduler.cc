@@ -7,6 +7,7 @@
 #include "ns3/boolean.h"
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 namespace ns3 {
 
@@ -37,10 +38,14 @@ GeoBeamScheduler::GeoBeamScheduler ()
     m_tcRntiCounter (0x8001),                  // 0x8001..0xFFF3 为 TC-RNTI 区间
     m_prachWindowDuration (MicroSeconds (500)),// PRACH 窗口 (gNB 侧去重)
     m_rarProcessingDelay (MilliSeconds (2)),   // RAR 处理时延
-    m_rarTxDelay (MilliSeconds (300)),         // GEO 单程 ~300 ms
+    m_rarTxDelay (MilliSeconds (300)),         // GEO 单程 ~300 ms (下行)
     m_msg3WindowDuration (MicroSeconds (500)), // Msg3 聚合窗口
     m_msg4ProcessingDelay (MilliSeconds (2)),  // Msg4 处理时延
-    m_msg4TxDelay (MilliSeconds (300))         // GEO 单程 ~300 ms
+    m_msg4TxDelay (MilliSeconds (300)),        // GEO 单程 ~300 ms (下行)
+    m_msgAWindowDuration (MicroSeconds (500)), // MsgA 聚合窗口
+    m_msgBProcessingDelay (MilliSeconds (2)),  // MsgB 处理时延
+    m_msgBTxDelay (MilliSeconds (300)),        // GEO 单程 ~300 ms (下行)
+    m_uplinkPropDelay (MilliSeconds (300))     // GEO 单程 ~300 ms (上行, UE→卫星→gNB)
 {
   NS_LOG_FUNCTION (this);
   m_resourceManager = CreateObject<ResourceManager> ();
@@ -90,7 +95,7 @@ void GeoBeamScheduler::AddUeContext (uint16_t rnti, UtType utType, TrafficType t
   if (m_ueContextMap.find(rnti) == m_ueContextMap.end()) {
       SatUeContext ctx;
       ctx.rnti = rnti;
-      ctx.latestCqi = 7.0;  
+      ctx.latestCqi = 7.0;
       ctx.bufferStatus = 0;
       ctx.averageThroughput = 0.001; 
       ctx.utType = utType;
@@ -141,7 +146,7 @@ HandoverUeContext GeoBeamScheduler::ExportUeContext (uint16_t rnti, uint32_t tar
     hoCtx.sourceBeamId = ctx.currentBeamId;
     hoCtx.targetBeamId = targetBeamId;
     hoCtx.latestCqi = ctx.latestCqi;
-    hoCtx.unsentBufferBytes = ctx.bufferStatus; // 截获尚未发送完的数据
+    hoCtx.unsentBufferBytes = ctx.bufferStatus;
     hoCtx.averageThroughput = ctx.averageThroughput;
     hoCtx.utType = ctx.utType;
     hoCtx.trafficType = ctx.trafficType;
@@ -164,7 +169,7 @@ void GeoBeamScheduler::ImportUeContext (const HandoverUeContext& hoCtx)
     ctx.rnti = hoCtx.rnti;
     ctx.currentBeamId = hoCtx.targetBeamId;
     ctx.latestCqi = hoCtx.latestCqi;
-    ctx.bufferStatus = hoCtx.unsentBufferBytes; // 将未发完的数据直接塞进目标波束的发送队列！
+    ctx.bufferStatus = hoCtx.unsentBufferBytes;
     ctx.averageThroughput = hoCtx.averageThroughput;
     ctx.utType = hoCtx.utType;
     ctx.trafficType = hoCtx.trafficType;
@@ -231,144 +236,156 @@ void GeoBeamScheduler::RunScheduler ()
     {
       uint32_t beamId = beamPair.first;
       const std::vector<uint16_t>& ueList = beamPair.second;
-      uint32_t availableRbs = 160 - m_prachReservedRbs;
+      uint32_t availableRbs = 25 - m_prachReservedRbs;
 
       NS_LOG_INFO ("=== Beam " << beamId << " Scheduling (WRR+IPF) ===");
-      NS_LOG_INFO ("Available RBs: " << availableRbs << ", Active UEs: " << ueList.size ());
-
-      std::vector<std::pair<uint16_t, double>> pfQueue;
-
-      for (uint16_t rnti : ueList)
-        {
-          SatUeContext& ctx = m_ueContextMap[rnti];
-          if (ctx.bufferStatus == 0) ctx.bufferStatus = 5000; 
-
-          if (ctx.bufferStatus > 0)
-            {
-              // =====================================================================
-              // IPF改进型比例公平算法 - 考虑位置因素
-              // =====================================================================
-              double bytesPerRb = std::max(1.0, ctx.latestCqi * 2.5); 
-              double instRate = bytesPerRb * availableRbs; 
-              
-              // 位置辅助因子：UE距离波束中心越近，信号质量越好，优先级越高
-              double locationFactor = 1.0;
-              double distanceToCenter = std::sqrt(ctx.position.x * ctx.position.x + 
-                                                  ctx.position.y * ctx.position.y);
-              if (distanceToCenter > 0) {
-                  locationFactor = 1.0 / (1.0 + 0.1 * distanceToCenter);
-              }
-              
-              // IPF度量 = (瞬时速率 × 位置因子) / (平均吞吐量 ^ 公平性权重)
-              double ipfMetric = (instRate * locationFactor) / 
-                                std::pow(ctx.averageThroughput, m_ipfFairnessWeight);
-              pfQueue.push_back({rnti, ipfMetric});
-            }
-            
-          double alpha = 0.1; 
-          ctx.averageThroughput = (1.0 - alpha) * ctx.averageThroughput;
-        }
-
-      // 按IPF度量降序排列
-      std::sort(pfQueue.begin(), pfQueue.end(),
-                [](const std::pair<uint16_t, double>& a, const std::pair<uint16_t, double>& b) {
-                    return a.second > b.second;
-                });
 
       // =====================================================================
-      // 两级调度策略: WRR(应急保障) + IPF(普通业务)
+      // 步骤 1 (对应文档 3.4): 根据 AdmitControl 准入结果，构建逻辑信道队列
       // =====================================================================
-      
-      // 第一阶段: 优先调度应急和语音业务 (WRR严格优先级)
-      NS_LOG_INFO ("[WRR Stage 1] Checking emergency/voice traffic...");
       std::vector<uint16_t> emergencyUes;
       std::vector<uint16_t> normalUes;
-      
+      double maxEmergencyDelay = 0.0;
+
       for (uint16_t rnti : ueList) {
           SatUeContext& ctx = m_ueContextMap[rnti];
+
           if (ctx.priority == ServicePriority::PRIORITY_EMERGENCY ||
               ctx.priority == ServicePriority::PRIORITY_VOICE) {
               emergencyUes.push_back (rnti);
+
+              Time delay = Simulator::Now () - ctx.lastScheduledTime;
+              if (delay.GetSeconds () > maxEmergencyDelay) {
+                  maxEmergencyDelay = delay.GetSeconds ();
+              }
           } else {
               normalUes.push_back (rnti);
           }
       }
-      
-      uint32_t wrrEmergencyBudget = availableRbs / 3; // 应急业务预留1/3资源
+
+      // =====================================================================
+      // 步骤 2 (对应文档 3.4): 第一级调度 - 基于优先级的加权轮询 (WRR) 动态提权
+      // =====================================================================
+      NS_LOG_INFO ("[WRR Stage 1] 正在处理高优先级/应急指挥业务...");
+
+      uint32_t wrrEmergencyBudget = availableRbs / 3;
+      double delayThreshold = 0.15;
+
+      if (maxEmergencyDelay > delayThreshold && !emergencyUes.empty()) {
+          wrrEmergencyBudget = static_cast<uint32_t>(availableRbs * 0.8);
+          NS_LOG_WARN ("[WRR 动态提权] 应急业务时延 (" << maxEmergencyDelay * 1000
+                       << " ms) 逼近阈值! 触发确定性保障机制, 强制预留 80% 资源!");
+      }
+
       uint32_t normalBudget = availableRbs - wrrEmergencyBudget;
 
-      // 调度应急/语音用户 (WRR)
       for (uint16_t rnti : emergencyUes) {
           if (wrrEmergencyBudget <= 0) break;
-          
+
           SatUeContext& ctx = m_ueContextMap[rnti];
           uint8_t targetMcs = GetMcsFromCqi (ctx.latestCqi);
-          uint32_t rrmAllowedRbs = m_resourceManager->AllocateSpectrum (ctx.utType, ctx.trafficType, ctx.latestCqi, false);
           double bytesPerRb = std::max (1.0, ctx.latestCqi * 2.5);
+
           uint32_t neededRbs = std::ceil (ctx.bufferStatus / bytesPerRb);
-          uint32_t allocatedRb = std::min ({neededRbs, wrrEmergencyBudget, rrmAllowedRbs});
-          
+          uint32_t schedulerProposedRbs = std::min (neededRbs, wrrEmergencyBudget);
+
+          uint32_t allocatedRb = m_resourceManager->AllocateSpectrum (ctx.utType, schedulerProposedRbs, false);
+
           wrrEmergencyBudget -= allocatedRb;
-          ctx.bufferStatus = (ctx.bufferStatus > allocatedRb * bytesPerRb) ? 
+          ctx.bufferStatus = (ctx.bufferStatus > allocatedRb * bytesPerRb) ?
                             ctx.bufferStatus - allocatedRb * bytesPerRb : 0;
-          ctx.averageThroughput += (0.1 * allocatedRb * bytesPerRb);
-          
+
+          ctx.averageThroughput = (1.0 - 0.1) * ctx.averageThroughput + 0.1 * (allocatedRb * bytesPerRb);
+          ctx.lastScheduledTime = Simulator::Now ();
+
           DciInfo dlDci;
           dlDci.isUplinkGrant = false;
           dlDci.rbAllocation = allocatedRb;
           dlDci.mcs = targetMcs;
           dlDci.delayToStart = m_defaultK2Delay;
           dlDci.duration = MilliSeconds (1);
-          
+
           SendDciToUe (rnti, dlDci);
-          
-          NS_LOG_INFO ("[WRR-Emergency] UE " << rnti << " RBs: " << allocatedRb 
-                       << " (Priority: " << (uint32_t)ctx.priority << ")");
       }
 
-      // 第二阶段: 调度普通用户 (IPF比例公平)
-      NS_LOG_INFO ("[IPF Stage 2] Scheduling normal traffic...");
+      // =====================================================================
+      // 步骤 3 (对应文档 3.4): 第二级调度 - 改进型比例公平算法 (IPF)
+      // =====================================================================
+      NS_LOG_INFO ("[IPF Stage 2] 正在针对消费级用户执行精细化 IPF 资源分配...");
+
+      std::vector<std::pair<uint16_t, double>> pfQueue;
+
+      for (uint16_t rnti : normalUes)
+        {
+          SatUeContext& ctx = m_ueContextMap[rnti];
+          if (ctx.bufferStatus == 0) ctx.bufferStatus = 5000;
+
+          if (ctx.bufferStatus > 0)
+            {
+              double bytesPerRb = std::max(1.0, ctx.latestCqi * 2.5);
+              double instRate = bytesPerRb * availableRbs;
+
+              double locationFactor = 1.0;
+              double distanceToCenter = std::sqrt(ctx.position.x * ctx.position.x +
+                                                  ctx.position.y * ctx.position.y);
+              if (distanceToCenter > 0) {
+                  locationFactor = 1.0 / (1.0 + 0.1 * distanceToCenter);
+              }
+
+              double R = instRate * locationFactor;
+              double alpha = 1.0;
+
+              Time timeSinceLastSched = Simulator::Now () - ctx.lastScheduledTime;
+              double k_delay = 1.5;
+              double delaySensitivityD = std::exp (timeSinceLastSched.GetSeconds () * k_delay);
+
+              double ipfMetric = (std::pow(R, alpha) * delaySensitivityD) /
+                                 std::pow(ctx.averageThroughput, m_ipfFairnessWeight);
+
+              pfQueue.push_back({rnti, ipfMetric});
+            }
+        }
+
+      std::sort(pfQueue.begin(), pfQueue.end(),
+                [](const std::pair<uint16_t, double>& a, const std::pair<uint16_t, double>& b) {
+                    return a.second > b.second;
+                });
+
       for (auto& item : pfQueue)
         {
-          if (normalBudget <= 0) break; 
+          if (normalBudget <= 0) break;
 
           uint16_t rnti = item.first;
           SatUeContext& ctx = m_ueContextMap[rnti];
-          
-          // 跳过已调度的应急用户
-          auto it = std::find (emergencyUes.begin (), emergencyUes.end (), rnti);
-          if (it != emergencyUes.end ()) continue;
 
           uint8_t targetMcs = GetMcsFromCqi (ctx.latestCqi);
-          uint32_t rrmAllowedRbs = m_resourceManager->AllocateSpectrum (ctx.utType, ctx.trafficType, ctx.latestCqi, false);
           double bytesPerRb = std::max (1.0, ctx.latestCqi * 2.5);
+
           uint32_t neededRbs = std::ceil (ctx.bufferStatus / bytesPerRb);
-          uint32_t allocatedRb = std::min ({neededRbs, normalBudget, rrmAllowedRbs}); 
+          uint32_t schedulerProposedRbs = std::min (neededRbs, normalBudget);
+
+          uint32_t allocatedRb = m_resourceManager->AllocateSpectrum (ctx.utType, schedulerProposedRbs, false);
 
           normalBudget -= allocatedRb;
           uint32_t allocatedBytes = allocatedRb * bytesPerRb;
-          
+
           if (ctx.bufferStatus > allocatedBytes) {
               ctx.bufferStatus -= allocatedBytes;
           } else {
               ctx.bufferStatus = 0;
           }
 
-          ctx.averageThroughput += (0.1 * allocatedBytes);
+          ctx.averageThroughput = (1.0 - 0.1) * ctx.averageThroughput + 0.1 * allocatedBytes;
           ctx.lastScheduledTime = Simulator::Now ();
 
           DciInfo dlDci;
           dlDci.isUplinkGrant = false;
           dlDci.rbAllocation = allocatedRb;
-          dlDci.mcs = targetMcs; 
-          dlDci.delayToStart = m_defaultK2Delay; 
+          dlDci.mcs = targetMcs;
+          dlDci.delayToStart = m_defaultK2Delay;
           dlDci.duration = MilliSeconds (1);
 
           SendDciToUe (rnti, dlDci);
-          
-          NS_LOG_INFO ("[IPF-Normal] Beam " << beamId << " UE " << rnti << " RBs: " << allocatedRb 
-                       << " (MCS: " << (uint16_t)targetMcs << " | IPF Metric: " << item.second
-                       << " | Remaining: " << normalBudget << ")");
         }
     }
 }
@@ -381,10 +398,9 @@ void GeoBeamScheduler::ReceiveMeasReport (const MeasReport& report)
       AddUeContext (report.ueId);
       AddUeInfo (report.ueId, report.bestBeamId);
   } else if (m_ueContextMap[report.ueId].currentBeamId != report.bestBeamId) {
-      // HandoverUe (report.ueId, report.bestBeamId);
       ExecuteHandover (report.ueId, report.bestBeamId);
   }
-  UpdateUeCsi (report.ueId, report.rsrp); 
+  UpdateUeCsi (report.ueId, report.rsrp);
 }
 
 void GeoBeamScheduler::SendDciToUe (uint16_t ueId, const DciInfo& dci)
@@ -458,18 +474,25 @@ void GeoBeamScheduler::ReceivePrachPreamble (const PrachPreamble& preamble)
 {
   NS_LOG_FUNCTION (this << preamble.preambleId);
 
-  NS_LOG_INFO ("[Msg1] PRACH 前导码收到! PreambleID=" << preamble.preambleId
+  NS_LOG_INFO ("[Msg1] PRACH 前导码发出! PreambleID=" << preamble.preambleId
                << " | Format=" << (uint32_t)preamble.format
                << " | Retx=" << preamble.isRetransmission
-               << " | Time=" << Simulator::Now ().GetSeconds () << "s");
+               << " | Time=" << Simulator::Now ().GetSeconds () << "s"
+               << " → 上行传播 " << m_uplinkPropDelay.GetMilliSeconds () << "ms");
 
-  // 将前导码加入当前 PRACH 窗口缓冲
+  // 延迟上行传播时间后再入缓冲 (UE → 卫星 → gNB)
+  Simulator::Schedule (m_uplinkPropDelay,
+                       &GeoBeamScheduler::DoBufferPreamble, this, preamble);
+}
+
+void GeoBeamScheduler::DoBufferPreamble (PrachPreamble preamble)
+{
   PreambleArrival arr;
   arr.preambleId  = preamble.preambleId;
   arr.arrivalTime = Simulator::Now ();
+  arr.raRnti      = preamble.raRnti;
   m_prachWindowBuf.push_back (arr);
 
-  // 若当前没有活动窗口, 调度一次窗口处理事件
   if (!m_prachWindowEvent.IsRunning ())
     {
       m_prachWindowEvent = Simulator::Schedule (m_prachWindowDuration,
@@ -482,26 +505,28 @@ void GeoBeamScheduler::ProcessPrachWindow ()
 {
   NS_LOG_FUNCTION (this);
 
-  // 根据 preambleId 统计窗口内的到达次数
-  std::map<uint32_t, uint32_t> preambleCnt;
+  // 按 (raRnti, preambleId) 二元组分组, 区分不同 PRACH occasion 的同一 preambleId
+  // key = (raRnti, preambleId)
+  std::map<std::pair<uint32_t,uint32_t>, uint32_t> preambleCnt;
   for (const auto& a : m_prachWindowBuf)
     {
-      preambleCnt[a.preambleId]++;
+      preambleCnt[{a.raRnti, a.preambleId}]++;
     }
 
   NS_LOG_INFO ("[PRACH] 窗口处理: 共 " << m_prachWindowBuf.size ()
-               << " 个前导码, 唯一 PreambleID 数 = " << preambleCnt.size ());
+               << " 个前导码, 唯一 (raRnti,PreambleID) 数 = " << preambleCnt.size ());
 
   // 重要: 即使多个 UE 选用了同一个 preambleId, 基站在 Msg1 阶段
   // 解出的还是同一条前导码 (能量叠加 / 去重), 依然会发一条 RAR。
   // 碰撞会推迟到 Msg3 阶段才被发现——这与实际 4 步 RA 的行为一致。
   for (const auto& kv : preambleCnt)
     {
-      uint32_t pid   = kv.first;
-      uint32_t count = kv.second;
+      uint32_t raRnti = kv.first.first;
+      uint32_t pid    = kv.first.second;
+      uint32_t count  = kv.second;
 
       RarMessage rar;
-      rar.raRnti            = 1 + (pid % 0x3FF);  // 简单派生
+      rar.raRnti            = raRnti;             // 保留 UE 的 RA-RNTI (区分 PRACH occasion)
       rar.preambleId        = pid;
       rar.tcRnti            = AllocateTcRnti ();
       rar.timingAdvance     = MilliSeconds (300); // GEO 单程
@@ -510,7 +535,8 @@ void GeoBeamScheduler::ProcessPrachWindow ()
       rar.msg3DelayToStart  = MicroSeconds (500); // 处理延迟
       rar.transmissionTime  = Simulator::Now () + m_rarProcessingDelay;
 
-      NS_LOG_INFO ("[Msg2] 分配 RAR: PreambleID=" << pid
+      NS_LOG_INFO ("[Msg2] 分配 RAR: RA-RNTI=" << raRnti
+                   << " PreambleID=" << pid
                    << " TC-RNTI=0x" << std::hex << rar.tcRnti << std::dec
                    << " (窗口内重叠数=" << count << ")");
 
@@ -543,12 +569,21 @@ void GeoBeamScheduler::ReceiveMsg3 (const RrcSetupRequest& req)
 {
   NS_LOG_FUNCTION (this << req.tcRnti << req.ueIdentity);
 
-  NS_LOG_INFO ("[Msg3] 收到 RRCSetupRequest: TC-RNTI=0x" << std::hex << req.tcRnti
+  NS_LOG_INFO ("[Msg3] RRCSetupRequest 发出: TC-RNTI=0x" << std::hex << req.tcRnti
                << " UE-Id=0x" << req.ueIdentity << std::dec
                << " PreambleIdUsed=" << req.preambleIdUsed
-               << " Cause=" << (uint32_t)req.establishmentCause);
+               << " → 上行传播 " << m_uplinkPropDelay.GetMilliSeconds () << "ms");
 
-  // 按 TC-RNTI 聚合: 若窗口内出现多份相同 TC-RNTI 的 Msg3, 即为竞争解决冲突
+  // 延迟上行传播时间后再入缓冲 (UE → 卫星 → gNB)
+  Simulator::Schedule (m_uplinkPropDelay,
+                       &GeoBeamScheduler::DoBufferMsg3, this, req);
+}
+
+void GeoBeamScheduler::DoBufferMsg3 (RrcSetupRequest req)
+{
+  NS_LOG_INFO ("[Msg3] gNB 收到 RRCSetupRequest: TC-RNTI=0x" << std::hex << req.tcRnti
+               << " UE-Id=0x" << req.ueIdentity << std::dec);
+
   m_msg3WindowBuf[req.tcRnti].push_back (req);
 
   if (!m_msg3WindowEvent.IsRunning ())
@@ -773,161 +808,145 @@ double GeoBeamScheduler::CalculateUeDistance (uint16_t rnti1, uint16_t rnti2)
   return std::sqrt (dx * dx + dy * dy + dz * dz);
 }
 
-// WRR调度算法实现
-void GeoBeamScheduler::RunWrrScheduler (std::vector<uint16_t>& ueList, uint32_t availableRbs)
+// ==================== 2 步随机接入实现 (基站侧) ====================
+
+void GeoBeamScheduler::ReceiveMsgA (const MsgA& msgA)
 {
-  NS_LOG_FUNCTION (this << availableRbs);
-  
-  // 按优先级分组
-  std::map<ServicePriority, std::vector<uint16_t>> priorityGroups;
-  
-  for (uint16_t rnti : ueList) {
-      auto it = m_ueContextMap.find (rnti);
-      if (it != m_ueContextMap.end ()) {
-          priorityGroups[it->second.priority].push_back (rnti);
-      }
-  }
-  
-  // 按优先级顺序服务 (先高优先级)
-  uint32_t remainingRbs = availableRbs;
-  
-  for (auto groupIt = priorityGroups.begin (); 
-       groupIt != priorityGroups.end () && remainingRbs > 0; 
-       ++groupIt) {
-      
-      ServicePriority priority = groupIt->first;
-      std::vector<uint16_t>& users = groupIt->second;
-      
-      // 计算该优先级的WRR配额
-      double totalWeight = 0.0;
-      for (uint16_t rnti : users) {
-          totalWeight += m_ueContextMap[rnti].wrrWeight;
-      }
-      
-      uint32_t priorityBudget = static_cast<uint32_t>(remainingRbs * 
-                    (totalWeight / (totalWeight + 10.0))); // 预留部分给低优先级
-      
-      NS_LOG_INFO ("[WRR] Priority " << (uint32_t)priority 
-                   << " users: " << users.size () << " budget: " << priorityBudget);
-      
-      // WRR轮询调度
-      for (uint16_t rnti : users) {
-          if (priorityBudget <= 0) break;
-          
-          SatUeContext& ctx = m_ueContextMap[rnti];
-          uint32_t rrmAllowed = m_resourceManager->AllocateSpectrum (
-                                   ctx.utType, ctx.trafficType, ctx.latestCqi, false);
-          
-          double bytesPerRb = std::max (1.0, ctx.latestCqi * 2.5);
-          uint32_t neededRbs = std::ceil (ctx.bufferStatus / bytesPerRb);
-          uint32_t allocatedRb = std::min ({neededRbs, priorityBudget, rrmAllowed});
-          
-          priorityBudget -= allocatedRb;
-          ctx.bufferStatus = (ctx.bufferStatus > allocatedRb * bytesPerRb) ?
-                            ctx.bufferStatus - allocatedRb * bytesPerRb : 0;
-          
-          DciInfo dci;
-          dci.isUplinkGrant = false;
-          dci.rbAllocation = allocatedRb;
-          dci.mcs = GetMcsFromCqi (ctx.latestCqi);
-          dci.delayToStart = m_defaultK2Delay;
-          dci.duration = MilliSeconds (1);
-          
-          SendDciToUe (rnti, dci);
-          
-          NS_LOG_INFO ("[WRR] UE " << rnti << " allocated " << allocatedRb << " RBs");
-      }
-      
-      remainingRbs -= (availableRbs - remainingRbs);
-  }
+  NS_LOG_FUNCTION (this << msgA.preambleId << msgA.ueIdentity);
+
+  NS_LOG_INFO ("[MsgA] MsgA 发出: PreambleID=" << msgA.preambleId
+               << " UE-Id=0x" << std::hex << msgA.ueIdentity << std::dec
+               << " Retx=" << msgA.isRetransmission
+               << " → 上行传播 " << m_uplinkPropDelay.GetMilliSeconds () << "ms");
+
+  // 延迟上行传播时间后再入缓冲 (UE → 卫星 → gNB)
+  Simulator::Schedule (m_uplinkPropDelay,
+                       &GeoBeamScheduler::DoBufferMsgA, this, msgA);
 }
 
-// IPF调度算法实现 (位置辅助改进型比例公平)
-void GeoBeamScheduler::RunIpfScheduler (std::vector<uint16_t>& ueList, uint32_t availableRbs)
+void GeoBeamScheduler::DoBufferMsgA (MsgA msgA)
 {
-  NS_LOG_FUNCTION (this << availableRbs);
-  
-  std::vector<std::pair<uint16_t, double>> ipfQueue;
-  
-  // 计算每个UE的IPF度量
-  for (uint16_t rnti : ueList) {
-      SatUeContext& ctx = m_ueContextMap[rnti];
-      
-      if (ctx.bufferStatus == 0) continue;
-      
-      // 瞬时速率
-      double bytesPerRb = std::max (1.0, ctx.latestCqi * 2.5);
-      double instRate = bytesPerRb;
-      
-      // 位置因子: 距离波束中心越近，信号越好
-      double distanceToCenter = std::sqrt (ctx.position.x * ctx.position.x + 
-                                           ctx.position.y * ctx.position.y);
-      double locationFactor = 1.0 / (1.0 + 0.05 * distanceToCenter);
-      
-      // 时间因子: 长期未调度的用户优先
-      Time timeSinceLastSched = Simulator::Now () - ctx.lastScheduledTime;
-      double timeFactor = 1.0 + timeSinceLastSched.GetSeconds () / 10.0;
-      
-      // IPF度量 = (瞬时速率 × 位置因子 × 时间因子) / 平均吞吐量
-      double ipfMetric = (instRate * locationFactor * timeFactor) / 
-                        std::pow (ctx.averageThroughput, m_ipfFairnessWeight);
-      
-      ipfQueue.push_back ({rnti, ipfMetric});
-  }
-  
-  // 按IPF度量降序排列
-  std::sort (ipfQueue.begin (), ipfQueue.end (),
-             [](const auto& a, const auto& b) { return a.second > b.second; });
-  
-  // 调度
-  uint32_t remainingRbs = availableRbs;
-  for (auto& item : ipfQueue) {
-      if (remainingRbs <= 0) break;
-      
-      uint16_t rnti = item.first;
-      SatUeContext& ctx = m_ueContextMap[rnti];
-      
-      uint32_t rrmAllowed = m_resourceManager->AllocateSpectrum (
-                               ctx.utType, ctx.trafficType, ctx.latestCqi, false);
-      
-      double bytesPerRb = std::max (1.0, ctx.latestCqi * 2.5);
-      uint32_t neededRbs = std::ceil (ctx.bufferStatus / bytesPerRb);
-      uint32_t allocatedRb = std::min ({neededRbs, remainingRbs, rrmAllowed});
-      
-      remainingRbs -= allocatedRb;
-      ctx.bufferStatus = (ctx.bufferStatus > allocatedRb * bytesPerRb) ?
-                        ctx.bufferStatus - allocatedRb * bytesPerRb : 0;
-      ctx.averageThroughput += (0.1 * allocatedRb * bytesPerRb);
-      ctx.lastScheduledTime = Simulator::Now ();
-      
-      DciInfo dci;
-      dci.isUplinkGrant = false;
-      dci.rbAllocation = allocatedRb;
-      dci.mcs = GetMcsFromCqi (ctx.latestCqi);
-      dci.delayToStart = m_defaultK2Delay;
-      dci.duration = MilliSeconds (1);
-      
-      SendDciToUe (rnti, dci);
-      
-      NS_LOG_INFO ("[IPF] UE " << rnti << " allocated " << allocatedRb << " RBs"
-                   << " (IPF Metric: " << item.second << ")");
-  }
+  NS_LOG_INFO ("[MsgA] gNB 收到 MsgA: PreambleID=" << msgA.preambleId
+               << " UE-Id=0x" << std::hex << msgA.ueIdentity << std::dec);
+
+  MsgAArrival arr;
+  arr.preambleId  = msgA.preambleId;
+  arr.ueIdentity  = msgA.ueIdentity;
+  arr.arrivalTime = Simulator::Now ();
+  arr.raRnti      = msgA.raRnti;
+  m_msgAWindowBuf.push_back (arr);
+
+  if (!m_msgAWindowEvent.IsRunning ())
+    {
+      m_msgAWindowEvent = Simulator::Schedule (m_msgAWindowDuration,
+                                                &GeoBeamScheduler::ProcessMsgAWindow,
+                                                this);
+    }
 }
 
-// 两级调度实现
-void GeoBeamScheduler::RunTwoLevelScheduler ()
+void GeoBeamScheduler::ProcessMsgAWindow ()
 {
   NS_LOG_FUNCTION (this);
-  
-  for (auto& beamPair : m_beamToUesMap) {
-      uint32_t beamId = beamPair.first;
-      
-      NS_LOG_INFO ("=== Two-Level Scheduling for Beam " << beamId << " ===");
-      
-      // 第一级: WRR保障应急业务
-      // 第二级: IPF调度普通业务
-      RunScheduler ();
-  }
+
+  // 按 (raRnti, preambleId) 分组, 区分不同 PRACH occasion
+  // key = (raRnti, preambleId), value = ueIdentity 列表
+  std::map<std::pair<uint32_t,uint32_t>, std::vector<uint64_t>> preambleToUeIds;
+  for (const auto& a : m_msgAWindowBuf)
+    {
+      preambleToUeIds[{a.raRnti, a.preambleId}].push_back (a.ueIdentity);
+    }
+
+  NS_LOG_INFO ("[MsgA] 窗口处理: 共 " << m_msgAWindowBuf.size ()
+               << " 条 MsgA, 唯一 (raRnti,PreambleID) 数 = " << preambleToUeIds.size ());
+
+  for (const auto& kv : preambleToUeIds)
+    {
+      uint32_t raRnti = kv.first.first;
+      uint32_t pid    = kv.first.second;
+      const auto& ueIds = kv.second;
+
+      // 统计唯一 ueIdentity 数量
+      std::set<uint64_t> uniqueUeIds (ueIds.begin (), ueIds.end ());
+
+      MsgB msgB;
+      msgB.preambleId       = pid;
+      msgB.raRnti           = raRnti;              // 保留 RA-RNTI (区分 PRACH occasion)
+      msgB.timingAdvance    = MilliSeconds (300);  // GEO 单程
+      msgB.transmissionTime = Simulator::Now () + m_msgBProcessingDelay;
+
+      if (uniqueUeIds.size () == 1)
+        {
+          // 无碰撞 → SUCCESS_RAR: 直接分配 C-RNTI
+          uint16_t cRnti = AllocateTcRnti ();  // 复用分配器
+          msgB.type              = MsgBType::SUCCESS_RAR;
+          msgB.cRnti             = cRnti;
+          msgB.echoedUeIdentity  = *uniqueUeIds.begin ();
+          msgB.tcRnti            = 0;
+          msgB.ulGrantRbs        = 0;
+          msgB.ulGrantMcs        = 0;
+
+          NS_LOG_INFO ("[MsgB] SUCCESS_RAR: PreambleID=" << pid
+                       << " C-RNTI=0x" << std::hex << cRnti
+                       << " UE-Id=0x" << msgB.echoedUeIdentity << std::dec);
+
+          // 为成功接入的 UE 建立 UE Context
+          if (m_ueContextMap.find (cRnti) == m_ueContextMap.end ())
+            {
+              AddUeContext (cRnti);
+              AddUeInfo (cRnti, m_myBeamId);
+            }
+        }
+      else
+        {
+          // 碰撞 → FALLBACK_RAR: 分配 TC-RNTI + UL Grant, 回退到 4 步
+          uint16_t tcRnti = AllocateTcRnti ();
+          msgB.type              = MsgBType::FALLBACK_RAR;
+          msgB.cRnti             = 0;
+          msgB.echoedUeIdentity  = 0;
+          msgB.tcRnti            = tcRnti;
+          msgB.ulGrantRbs        = 6;   // Msg3 使用 6 PRB
+          msgB.ulGrantMcs        = 4;   // 保守 MCS
+
+          NS_LOG_WARN ("[MsgB] FALLBACK_RAR (碰撞): PreambleID=" << pid
+                       << " 唯一 UE 数=" << uniqueUeIds.size ()
+                       << " TC-RNTI=0x" << std::hex << tcRnti << std::dec
+                       << " → 回退到 4 步 Msg3/Msg4");
+        }
+
+      Simulator::Schedule (m_msgBProcessingDelay + m_msgBTxDelay,
+                           &GeoBeamScheduler::DispatchMsgB, this, msgB);
+    }
+
+  m_msgAWindowBuf.clear ();
+}
+
+void GeoBeamScheduler::DispatchMsgB (MsgB msgB)
+{
+  NS_LOG_FUNCTION (this << msgB.preambleId << (uint32_t)msgB.type);
+  NS_LOG_INFO ("[MsgB] 广播 MsgB 到 " << m_msgBSubscribers.size ()
+               << " 个 UE (PreambleID=" << msgB.preambleId
+               << " Type=" << (msgB.type == MsgBType::SUCCESS_RAR ? "SUCCESS" : "FALLBACK") << ")");
+
+  for (auto& cb : m_msgBSubscribers)
+    {
+      if (!cb.IsNull ())
+        {
+          cb (msgB);
+        }
+    }
+}
+
+void GeoBeamScheduler::RegisterUeTwoStepRaCallbacks (Callback<void, const MsgB&> msgBCb)
+{
+  NS_LOG_FUNCTION (this);
+  m_msgBSubscribers.push_back (msgBCb);
+}
+
+void GeoBeamScheduler::SetTwoStepRaConfig (Time msgAWindow, Time msgBProcessingDelay, Time msgBTxDelay)
+{
+  m_msgAWindowDuration   = msgAWindow;
+  m_msgBProcessingDelay  = msgBProcessingDelay;
+  m_msgBTxDelay          = msgBTxDelay;
 }
 
 } // namespace ns3

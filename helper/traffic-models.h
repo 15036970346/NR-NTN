@@ -5,7 +5,7 @@
  * Implements: Full Buffer, FTP, HTTP, VoIP/RTP traffic models
  *
  * Key design goals:
- * - Saturation-oriented: designed to fill 160 PRB physical layer capacity
+ * - Saturation-oriented: designed to fill 25 PRB single-beam physical layer capacity
  * - BDP-aware TCP: TCP window sized for GEO RTT (600ms+ RTT)
  * - Closed-loop rate control: MAC queue state monitoring for adaptive transmission
  */
@@ -70,7 +70,7 @@ struct TrafficModelStats {
  *
  * Performance optimization:
  * - Closed-loop rate control: Monitor MAC queue state, auto-adjust发包频率
- * - Packet size mapping: 160 PRB capacity calculation, maximize single packet
+ * - Packet size mapping: 25 PRB capacity calculation, maximize single packet
  * - ROHC-aware: Consider compressed header overhead in payload calculation
  */
 class SatTrafficGenerator : public Object
@@ -119,6 +119,11 @@ public:
     void SetRohcOverheadBytes (uint32_t bytes);
 
     /**
+     * \brief Set application start/stop time used by subsequently installed flows.
+     */
+    void SetApplicationWindow (Time start, Time stop);
+
+    /**
      * \brief Enable/disable closed-loop rate control (MAC queue monitoring)
      * \param enable true to enable
      * \param lowWatermarkPercent Low watermark threshold (default 80%)
@@ -133,7 +138,7 @@ public:
      * Full Buffer characteristics:
      * - Buffer always in "full" state
      * - Once RLC requests data, immediately fill
-     * - Target: fill 160 PRB downlink capacity
+     * - Target: fill 25 PRB single-beam downlink capacity
      * - Target rate: 10Mbps+ (single user)
      */
     ApplicationContainer InstallFullBuffer (NodeContainer sourceNodes, Ipv4Address sinkAddress,
@@ -210,12 +215,18 @@ public:
      */
     void SetTxTraceCallback (Callback<void, Ptr<const Packet>, const Address&> cb);
 
-    // ========== Legacy Compatible Interfaces ==========
+    // ========== Compatibility Interfaces ==========
 
     ApplicationContainer GenerateVoiceTraffic (NodeContainer sourceNodes, Ipv4Address sinkAddress);
     ApplicationContainer GenerateConsumerDataTraffic (NodeContainer sourceNodes, Ipv4Address sinkAddress, bool isUplink);
     ApplicationContainer GeneratePortableDataTraffic (NodeContainer sourceNodes, Ipv4Address sinkAddress, bool isUplink);
     void AttachUserToBeam (uint16_t beamId, Ptr<Node> userNode, Ipv4Address destAddress, TrafficModelType type, bool isUplink);
+    /**
+     * \brief Install all required sinks for the supported TR 37.901 traffic models.
+     *
+     * Callers should install sinks on the actual receiving nodes before creating
+     * flows. Traffic model installers only create source-side applications.
+     */
     ApplicationContainer InstallSink (NodeContainer nodes);
 
 private:
@@ -225,7 +236,7 @@ private:
      * \brief Calculate max payload bytes per TTI for Full Buffer
      *
      * Based on:
-     * - 160 PRB x 12 subcarriers x 14 symbols x 6 bits (64-QAM) / TTI
+     * - 25 PRB x 12 subcarriers x 14 symbols x 6 bits (64-QAM) / TTI
      * - Minus ROHC compressed header overhead
      * - Minus TCP/IP headers (40 bytes)
      */
@@ -235,7 +246,7 @@ private:
      * \brief Calculate TCP BDP window size
      *
      * BDP = bandwidth x RTT
-     * GEO: 160 PRB ~ 28.8MHz, RTT=600ms -> BDP ~ 21.6Mbps = 2.7MB
+     * GEO: 单波束 25 PRB, RTT=630ms -> BDP ~ 15.9Mbits = 1.98MB
      * TCP window should be 2-3x BDP to fully utilize link
      */
     uint32_t CalculateTcpWindowBytes () const;
@@ -257,9 +268,11 @@ private:
     // Performance parameters
     uint64_t m_targetRateBps {10'000'000};    //!< Target rate 10Mbps
     Time m_geoRtt {MilliSeconds (630)};        //!< GEO RTT (600ms + 30ms processing)
-    uint32_t m_maxPrbPerTti {160};            //!< Max PRBs per TTI
+    uint32_t m_maxPrbPerTti {25};             //!< Max PRBs per TTI (single beam)
     uint32_t m_rohcOverheadBytes {2};         //!< ROHC compressed header (typical 2 bytes)
     uint16_t m_mtu {1500};                     //!< MTU
+    Time m_appStartTime {Seconds (1.0)};       //!< Absolute application start time
+    Time m_appStopTime {Seconds (100.0)};      //!< Absolute application stop time
 
     // Closed-loop rate control
     bool m_closedLoopControlEnabled {false};

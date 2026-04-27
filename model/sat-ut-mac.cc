@@ -21,7 +21,15 @@ TypeId SatUtMac::GetTypeId (void) {
     static TypeId tid = TypeId ("ns3::SatUtMac")
         .SetParent<Object> ()
         .SetGroupName ("GeoSat")
-        .AddConstructor<SatUtMac> ();
+        .AddConstructor<SatUtMac> ()
+        .AddTraceSource ("QueueLength",
+                         "MAC buffer queue length trace (rnti, bufferBytes)",
+                         MakeTraceSourceAccessor (&SatUtMac::m_queueLengthTrace),
+                         "ns3::TracedCallback::UintUint")
+        .AddTraceSource ("QueueDelay",
+                         "MAC buffer queue delay trace (rnti, delay_ns)",
+                         MakeTraceSourceAccessor (&SatUtMac::m_queueDelayTrace),
+                         "ns3::TracedCallback::UintInt64");
     return tid;
 }
 
@@ -39,14 +47,25 @@ SatUtMac::SatUtMac ()
       m_pendingUlGrantMcs (0),
       m_ueIdentity (0),
       m_currentPreambleId (0),
+      m_currentRaRnti (0),
       m_tcRnti (0),
       m_cRnti (0),
       m_raAttempt (0),
       m_maxRaAttempts (10),
+      m_numPreambles (63),
       // RA Response Timer 需 > 单程 RTT (GEO ~300 ms), 留裕量到 1 s
       m_raResponseWindow (MilliSeconds (1000)),
       // 竞争解决定时器: UE 发 Msg3 → gNB → UE 收 Msg4, 需覆盖 1 个 RTT + 处理
-      m_contentionResolutionTimeout (MilliSeconds (1500))
+      m_contentionResolutionTimeout (MilliSeconds (1500)),
+      m_totalMsg1Sent (0),
+      m_totalMsg4Received (0),
+      m_totalContentionTimeouts (0),
+      m_totalMsgBTimeouts (0),
+      m_utType (UT_CONSUMER),
+      m_rachType (RachType::FOUR_STEP),
+      // MsgB 响应窗口: UL prop(300) + processing(2) + DL prop(300) + margin
+      m_msgBResponseWindow (MilliSeconds (1500)),
+      m_bufferArrivalTime (Seconds (0))
 {
     NS_LOG_FUNCTION (this);
 
@@ -83,7 +102,7 @@ void SatUtMac::ProcessDciAndSchedule (DciInfo dci) {
         // 如果有待发送的PUCCH信息(PUSCH可以承载BSR)，先发送BSR
         if (m_currentBufferBytes > 0) {
             BsR_MAC_CE bsr;
-            bsr.rnti = 0;  // 稍后填充
+            bsr.rnti = 0;
             bsr.lcgId = 0;
             bsr.bufferSize = m_currentBufferBytes;
             SendBsr (bsr.lcgId, bsr.bufferSize);
@@ -146,8 +165,15 @@ void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs) {
         NS_LOG_ERROR ("PHY层指针为空，无法发送！");
     }
     
+    // 触发队列时延统计 (从入队到出队)
+    if (m_bufferArrivalTime > Seconds (0)) {
+        int64_t delayNs = (Simulator::Now () - m_bufferArrivalTime).GetNanoSeconds ();
+        m_queueDelayTrace (m_cRnti, delayNs);
+    }
+
     // 发送完成后清空缓冲区
     m_currentBufferBytes = 0;
+    m_queueLengthTrace (m_cRnti, 0);
     Simulator::Schedule (duration, &SatUtMac::SwitchState, this, MAC_CONNECTED);
 }
 
@@ -181,6 +207,7 @@ void SatUtMac::SendSchedulingRequest ()
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_0;
+    pucch.rnti = 0;
     pucch.srPending = true;
     pucch.transmissionTime = Simulator::Now ();
     
@@ -200,6 +227,7 @@ void SatUtMac::SendCqiReport (uint8_t cqi)
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_1;
+    pucch.rnti = 0;
     pucch.cqi = cqi;
     pucch.transmissionTime = Simulator::Now ();
     
@@ -218,6 +246,7 @@ void SatUtMac::SendHarqAck (bool ack, uint8_t bitmap)
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_2;
+    pucch.rnti = 0;
     pucch.harqAck = ack;
     pucch.harqBitMap = bitmap;
     pucch.transmissionTime = Simulator::Now ();
@@ -286,7 +315,7 @@ void SatUtMac::SendBsr (uint8_t lcgId, uint32_t bufferSize)
     BsR_MAC_CE bsr;
     bsr.lcgId = lcgId;
     bsr.bufferSize = bufferSize;
-    bsr.rnti = 0;  // RNTI稍后由调度器填充
+    bsr.rnti = 0;
     
     NS_LOG_INFO ("BSR MAC CE发送! LCG=" << (uint32_t)lcgId 
                  << ", BufferSize=" << bufferSize << " bytes");
@@ -314,9 +343,16 @@ void SatUtMac::SetPrachCallback (Callback<void, const PrachPreamble&> callback)
 void SatUtMac::NotifyDataBuffered (uint32_t bytes)
 {
     NS_LOG_FUNCTION (this << bytes);
-    
+
+    // 记录入队时间 (仅在缓冲区从空变非空时更新)
+    if (m_currentBufferBytes == 0) {
+        m_bufferArrivalTime = Simulator::Now ();
+    }
     m_currentBufferBytes += bytes;
-    
+
+    // 触发队列长度统计
+    m_queueLengthTrace (m_cRnti, m_currentBufferBytes);
+
     if (m_state == MAC_CONNECTED && m_srPending == false) {
         NS_LOG_INFO ("数据缓冲达到 " << m_currentBufferBytes << " bytes, 触发SR!");
         SendSchedulingRequest ();
@@ -352,14 +388,20 @@ void SatUtMac::DoRandomAccess (uint32_t preambleId, uint8_t format)
 
     m_isRaInitiated = true;
     m_raAttempt++;
+    m_totalMsg1Sent++;            // 统计: 每次发 Msg1 都计入
     m_tcRnti = 0;   // 清空上一次的 TC-RNTI
 
-    // 若调用者未指定 preambleId, 随机挑选 (1..63)
+    // 若调用者未指定 preambleId, 随机挑选 (1..m_numPreambles)
     if (preambleId == 0) {
         Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable> ();
-        preambleId = rng->GetInteger (1, 63);
+        preambleId = rng->GetInteger (1, m_numPreambles);
     }
     m_currentPreambleId = preambleId;
+
+    // 计算 RA-RNTI: 由 PRACH 发送时刻派生 (毫秒级精度)
+    // 同一 RO 内的 UE (100μs 窗口) 在同一毫秒内 → 相同 raRnti → 正确竞争
+    // 不同 RO (间隔 ≥1ms) → 不同 raRnti → 互不干扰
+    m_currentRaRnti = 1 + static_cast<uint32_t> (Simulator::Now ().GetMilliSeconds () % 0xFFF0);
 
     NS_LOG_INFO ("=== [RA #" << (uint32_t)m_raAttempt << "] UE-Id=0x"
                  << std::hex << m_ueIdentity << std::dec
@@ -373,6 +415,7 @@ void SatUtMac::DoRandomAccess (uint32_t preambleId, uint8_t format)
 
     // ------ Msg1: PRACH Preamble ------
     NS_LOG_INFO ("[Msg1] 发送 PRACH preamble PreambleID=" << preambleId
+                 << " RA-RNTI=" << m_currentRaRnti
                  << " Format=" << (uint32_t)format);
     PrachPreamble preamble;
     preamble.rnti             = 0;              // 尚未分配
@@ -380,6 +423,7 @@ void SatUtMac::DoRandomAccess (uint32_t preambleId, uint8_t format)
     preamble.format           = format;
     preamble.transmissionTime = Simulator::Now ();
     preamble.isRetransmission = (m_raAttempt > 1);
+    preamble.raRnti           = m_currentRaRnti;
     if (!m_prachCallback.IsNull ()) {
         m_prachCallback (preamble);
     } else {
@@ -398,8 +442,10 @@ void SatUtMac::ReceiveRar (const RarMessage& rar)
 {
     NS_LOG_FUNCTION (this << rar.preambleId << rar.tcRnti);
 
-    // 只处理与本 UE preambleId 匹配的 RAR; 其它直接忽略
-    if (!m_isRaInitiated || rar.preambleId != m_currentPreambleId) {
+    // 只处理与本 UE RA-RNTI + preambleId 均匹配的 RAR; 其它直接忽略
+    // RA-RNTI 区分不同 PRACH occasion, 防止跨 RO 的 RAR 误匹配
+    if (!m_isRaInitiated || rar.raRnti != m_currentRaRnti
+        || rar.preambleId != m_currentPreambleId) {
         return;
     }
 
@@ -501,11 +547,24 @@ void SatUtMac::ReceiveMsg4 (const RrcSetupMessage& msg4)
         return;
     }
 
-    // 竞争解决成功 → 进入 RRC_CONNECTED
+    // 竞争解决成功 → 检查信道质量后进入 RRC_CONNECTED
     if (m_contentionResolutionTimer.IsRunning ()) {
         Simulator::Cancel (m_contentionResolutionTimer);
     }
 
+    // 信道质量门限判定 (Msg4 识别 + CQI/RSRP 双重判定)
+    if (!CheckChannelQuality ()) {
+        NS_LOG_WARN ("[Msg4] 竞争解决成功但信道质量不足，接入失败 (RA_FAILED_POOR_CHANNEL)");
+        m_isRaInitiated = false;
+        m_raAttempt = 0;
+        SwitchState (MAC_IDLE);
+        if (!m_raCompleteCallback.IsNull ()) {
+            m_raCompleteCallback (RA_FAILED_POOR_CHANNEL);
+        }
+        return;
+    }
+
+    m_totalMsg4Received++;        // 统计: 收到有效 Msg4 且信道质量达标
     m_cRnti = msg4.cRnti;
     m_isRaInitiated = false;
     m_raAttempt = 0;
@@ -530,6 +589,7 @@ void SatUtMac::OnContentionResolutionTimeout ()
 {
     NS_LOG_FUNCTION (this);
     NS_LOG_WARN ("[RA] Contention Resolution Timer 超时 (未收到 Msg4, 很可能是 Msg3 发生碰撞)");
+    m_totalContentionTimeouts++;  // 统计: 碰撞导致 Msg4 超时
     AbortOrRetryRa ("Contention resolution timeout");
 }
 
@@ -547,6 +607,9 @@ void SatUtMac::AbortOrRetryRa (const std::string& reason)
     }
     if (m_msg3TxEvent.IsRunning ()) {
         Simulator::Cancel (m_msg3TxEvent);
+    }
+    if (m_msgBResponseTimer.IsRunning ()) {
+        Simulator::Cancel (m_msgBResponseTimer);
     }
 
     // 回到 IDLE, 否则若当前处于 MAC_TX (Msg3 之后) 将阻塞 DoRandomAccess 重试
@@ -573,8 +636,8 @@ void SatUtMac::AbortOrRetryRa (const std::string& reason)
                  << "ms, 下次 attempt=" << (uint32_t)(m_raAttempt + 1)
                  << " / " << (uint32_t)m_maxRaAttempts);
 
-    m_isRaInitiated = false;  // 将由 DoRandomAccess 重新置位
-    Simulator::Schedule (backoff, &SatUtMac::DoRandomAccess, this,
+    m_isRaInitiated = false;  // 将由 InitiateRandomAccess 重新置位
+    Simulator::Schedule (backoff, &SatUtMac::InitiateRandomAccess, this,
                          static_cast<uint32_t> (0),  // 重新随机选 preambleId
                          static_cast<uint8_t> (0));
 }
@@ -614,6 +677,16 @@ void SatUtMac::SetRaTimers (Time raResponseWindow, Time contentionResolutionTime
     m_maxRaAttempts = maxAttempts;
 }
 
+void SatUtMac::SetNumPreambles (uint32_t n)
+{
+    m_numPreambles = n;
+}
+
+uint32_t SatUtMac::GetNumPreambles () const
+{
+    return m_numPreambles;
+}
+
 void SatUtMac::SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback)
 {
     m_msg3Callback = callback;
@@ -624,4 +697,241 @@ void SatUtMac::SetRaCompleteCallback (Callback<void, RaResult> callback)
     m_raCompleteCallback = callback;
 }
 
+// ==================== 2 步随机接入实现 (MsgA→MsgB) ====================
+
+void SatUtMac::InitiateRandomAccess (uint32_t preambleId, uint8_t format)
+{
+    NS_LOG_FUNCTION (this << preambleId << (uint32_t)format);
+
+    if (m_rachType == RachType::TWO_STEP) {
+        DoTwoStepRandomAccess (preambleId, format);
+    } else {
+        DoRandomAccess (preambleId, format);
+    }
 }
+
+void SatUtMac::DoTwoStepRandomAccess (uint32_t preambleId, uint8_t format)
+{
+    NS_LOG_FUNCTION (this << preambleId << (uint32_t)format);
+
+    if (m_state == MAC_CONNECTED && m_cRnti != 0) {
+        NS_LOG_WARN ("UT UE-Id=0x" << std::hex << m_ueIdentity << std::dec
+                     << " 已处于 RRC_CONNECTED, 无需再发起 RA");
+        return;
+    }
+    if (m_state == MAC_TX || m_state == MAC_RX) {
+        NS_LOG_WARN ("UT MAC 正在收发, 无法发起随机接入!");
+        return;
+    }
+
+    // 取消任何残留的定时器
+    if (m_raResponseTimer.IsRunning ()) {
+        Simulator::Cancel (m_raResponseTimer);
+    }
+    if (m_contentionResolutionTimer.IsRunning ()) {
+        Simulator::Cancel (m_contentionResolutionTimer);
+    }
+    if (m_msgBResponseTimer.IsRunning ()) {
+        Simulator::Cancel (m_msgBResponseTimer);
+    }
+    if (m_msg3TxEvent.IsRunning ()) {
+        Simulator::Cancel (m_msg3TxEvent);
+    }
+
+    m_isRaInitiated = true;
+    m_raAttempt++;
+    m_totalMsg1Sent++;            // 统计: MsgA 也算一次 Msg1 发送
+    m_tcRnti = 0;
+
+    // 若调用者未指定 preambleId, 随机挑选 (1..m_numPreambles)
+    if (preambleId == 0) {
+        Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable> ();
+        preambleId = rng->GetInteger (1, m_numPreambles);
+    }
+    m_currentPreambleId = preambleId;
+
+    // 计算 RA-RNTI: 由 PRACH 发送时刻派生 (毫秒级精度, 与 4 步一致)
+    m_currentRaRnti = 1 + static_cast<uint32_t> (Simulator::Now ().GetMilliSeconds () % 0xFFF0);
+
+    NS_LOG_INFO ("=== [RA #" << (uint32_t)m_raAttempt << "] UE-Id=0x"
+                 << std::hex << m_ueIdentity << std::dec
+                 << " 发起 2 步随机接入 ===");
+
+    // 读取 PHY Timing Advance (若有)
+    Ptr<SatUtPhy> utPhy = DynamicCast<SatUtPhy> (m_phy);
+    if (utPhy) {
+        m_timingAdvance = utPhy->GetTimingAdvance ();
+    }
+
+    // ------ MsgA: PRACH preamble + RRC payload 打包发送 ------
+    MsgA msgA;
+    msgA.preambleId        = preambleId;
+    msgA.format            = format;
+    msgA.ueIdentity        = m_ueIdentity;
+    msgA.bufferStatus      = m_currentBufferBytes;
+    msgA.establishmentCause = 2;  // mo-Data
+    msgA.transmissionTime  = Simulator::Now ();
+    msgA.isRetransmission  = (m_raAttempt > 1);
+    msgA.raRnti            = m_currentRaRnti;
+
+    NS_LOG_INFO ("[MsgA] 发送 2 步 RA MsgA: PreambleID=" << preambleId
+                 << " UE-Id=0x" << std::hex << m_ueIdentity << std::dec
+                 << " Format=" << (uint32_t)format);
+
+    if (!m_msgACallback.IsNull ()) {
+        m_msgACallback (msgA);
+    } else {
+        NS_LOG_WARN ("[MsgA] MsgA callback 未设置, 无法上送 MsgA!");
+    }
+
+    // 启动 MsgB 响应定时器
+    NS_LOG_INFO ("[RA] 启动 MsgB Response Timer: "
+                 << m_msgBResponseWindow.GetMilliSeconds () << "ms");
+    m_msgBResponseTimer = Simulator::Schedule (m_msgBResponseWindow,
+                                                &SatUtMac::OnMsgBResponseTimeout,
+                                                this);
+    SwitchState (MAC_WAITING_MSGB);
+}
+
+void SatUtMac::ReceiveMsgB (const MsgB& msgB)
+{
+    NS_LOG_FUNCTION (this << msgB.preambleId << (uint32_t)msgB.type);
+
+    // 只处理与本 UE RA-RNTI + preambleId 均匹配的 MsgB
+    if (!m_isRaInitiated || msgB.raRnti != m_currentRaRnti
+        || msgB.preambleId != m_currentPreambleId) {
+        return;
+    }
+
+    // 取消 MsgB 响应定时器
+    if (m_msgBResponseTimer.IsRunning ()) {
+        Simulator::Cancel (m_msgBResponseTimer);
+    }
+
+    if (msgB.type == MsgBType::SUCCESS_RAR) {
+        // 验证回显的 ueIdentity
+        if (msgB.echoedUeIdentity != m_ueIdentity) {
+            NS_LOG_WARN ("[MsgB] SUCCESS_RAR 但 UE-Id 不匹配, 忽略");
+            // 重新启动 MsgB 定时器等待属于自己的 MsgB
+            m_msgBResponseTimer = Simulator::Schedule (m_msgBResponseWindow,
+                                                        &SatUtMac::OnMsgBResponseTimeout,
+                                                        this);
+            return;
+        }
+
+        NS_LOG_INFO ("[MsgB] SUCCESS_RAR: PreambleID=" << msgB.preambleId
+                     << " C-RNTI=0x" << std::hex << msgB.cRnti
+                     << " echoed UE-Id=0x" << msgB.echoedUeIdentity << std::dec
+                     << " TA=" << msgB.timingAdvance.GetMicroSeconds () << "μs");
+
+        // 信道质量门限判定 (MsgB-SUCCESS 识别 + CQI/RSRP 双重判定)
+        if (!CheckChannelQuality ()) {
+            NS_LOG_WARN ("[MsgB] SUCCESS_RAR 但信道质量不足，接入失败 (RA_FAILED_POOR_CHANNEL)");
+            m_isRaInitiated = false;
+            m_raAttempt = 0;
+            SwitchState (MAC_IDLE);
+            if (!m_raCompleteCallback.IsNull ()) {
+                m_raCompleteCallback (RA_FAILED_POOR_CHANNEL);
+            }
+            return;
+        }
+
+        // 直接完成接入
+        m_cRnti = msgB.cRnti;
+        m_timingAdvance = msgB.timingAdvance;
+        m_isRaInitiated = false;
+        m_raAttempt = 0;
+
+        m_totalMsg4Received++;        // 统计: MsgB SUCCESS_RAR 等价于收到有效 Msg4 且信道达标
+        NS_LOG_INFO ("=== [RA] 2 步随机接入成功! C-RNTI=0x" << std::hex << m_cRnti
+                     << " UE-Id=0x" << m_ueIdentity << std::dec << " ===");
+        SwitchState (MAC_CONNECTED);
+
+        if (!m_raCompleteCallback.IsNull ()) {
+            m_raCompleteCallback (RA_SUCCESS);
+        }
+    } else {
+        // FALLBACK_RAR: 回退到 4 步 Msg3/Msg4 路径
+        NS_LOG_INFO ("[MsgB] FALLBACK_RAR: PreambleID=" << msgB.preambleId
+                     << " TC-RNTI=0x" << std::hex << msgB.tcRnti << std::dec
+                     << " UL Grant=" << msgB.ulGrantRbs << " PRB"
+                     << " → 回退到 4 步 Msg3/Msg4");
+
+        m_tcRnti            = msgB.tcRnti;
+        m_timingAdvance     = msgB.timingAdvance;
+        m_pendingUlGrant    = msgB.ulGrantRbs;
+        m_pendingUlGrantMcs = msgB.ulGrantMcs;
+
+        // 复用 4 步的 SendMsg3 → ReceiveMsg4 路径
+        m_msg3TxEvent = Simulator::Schedule (MicroSeconds (500),
+                                              &SatUtMac::SendMsg3, this);
+    }
+}
+
+void SatUtMac::OnMsgBResponseTimeout ()
+{
+    NS_LOG_FUNCTION (this);
+    NS_LOG_WARN ("[RA] MsgB Response Timer 超时 (未收到 MsgB)");
+    m_totalMsgBTimeouts++;        // 统计: MsgB 超时 (信道丢失或严重碰撞)
+    m_totalContentionTimeouts++;  // 也算入碰撞分母
+    AbortOrRetryRa ("MsgB timeout");
+}
+
+void SatUtMac::SetRachType (RachType rachType)
+{
+    m_rachType = rachType;
+    NS_LOG_INFO ("RA 模式设置为: " << (rachType == RachType::TWO_STEP ? "2-STEP" : "4-STEP"));
+}
+
+RachType SatUtMac::GetRachType () const
+{
+    return m_rachType;
+}
+
+void SatUtMac::SetMsgACallback (Callback<void, const MsgA&> callback)
+{
+    m_msgACallback = callback;
+}
+
+void SatUtMac::SetUtType (UtType utType)
+{
+    m_utType = utType;
+}
+
+UtType SatUtMac::GetUtType () const
+{
+    return m_utType;
+}
+
+// ==================== 信道质量门限判定 ====================
+
+bool SatUtMac::CheckChannelQuality () const
+{
+    NS_LOG_FUNCTION (this);
+
+    Ptr<SatUtPhy> utPhy = DynamicCast<SatUtPhy> (m_phy);
+    if (!utPhy) {
+        // PHY 未绑定：无法获取测量值，放行（保持原有行为）
+        NS_LOG_WARN ("[CQ-Check] SatUtPhy 未绑定，跳过信道质量检查");
+        return true;
+    }
+
+    double rsrp   = utPhy->GetLastRsrp ();
+    double sinrDb = utPhy->GetLastCalculatedSinr ();
+
+    double snrThreshold = (m_utType == UT_PORTABLE)
+                            ? SNR_THRESHOLD_PORTABLE   // 便携终端: 20.8 dB
+                            : SNR_THRESHOLD_CONSUMER;  // 消费级手机: 1.8 dB
+
+    bool rsrpOk = (rsrp >= RSRP_THRESHOLD_DBM);
+    bool snrOk  = (sinrDb >= snrThreshold);
+
+    NS_LOG_INFO ("[CQ-Check] UtType=" << (m_utType == UT_PORTABLE ? "PORTABLE" : "CONSUMER")
+                 << " | RSRP=" << rsrp << " dBm (thr=" << RSRP_THRESHOLD_DBM << ")"
+                 << " | SNR=" << sinrDb << " dB (thr=" << snrThreshold << ")"
+                 << " | " << (rsrpOk && snrOk ? "PASS" : "FAIL"));
+
+    return rsrpOk && snrOk;
+}
+
+} // namespace ns3

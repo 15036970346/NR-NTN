@@ -26,10 +26,12 @@
 #include "ns3/position-allocator.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/ipv4-address-helper.h"
+#include "terminal-profile.h"
 #include <vector>
 #include <memory>
 #include <functional>
 #include <cmath>
+#include <algorithm>
 
 namespace ns3 {
 
@@ -50,7 +52,8 @@ SatUserHelper::GetTypeId (void)
 SatUserHelper::SatUserHelper ()
   : m_nrHelper (nullptr),
     m_satChannel (nullptr),
-    m_beamId (0)
+    m_beamId (0),
+    m_consumerShare (0.5)
 {
   NS_LOG_FUNCTION (this);
 }
@@ -81,12 +84,20 @@ SatUserHelper::SetNrHelper (Ptr<NrHelper> nrHelper)
   m_nrHelper = nrHelper;
 }
 
+void
+SatUserHelper::SetConsumerShare (double consumerShare)
+{
+  NS_LOG_FUNCTION (this << consumerShare);
+  m_consumerShare = std::max (0.0, std::min (1.0, consumerShare));
+}
+
 NodeContainer
 SatUserHelper::CreateUserNodes (uint32_t count)
 {
   NS_LOG_FUNCTION (this << count);
   NodeContainer ues;
   ues.Create (count);
+  AssignTerminalProfiles (ues, m_beamId);
   NS_LOG_INFO ("Created " << count << " UE nodes.");
   return ues;
 }
@@ -136,7 +147,8 @@ SatUserHelper::InstallStack (NodeContainer ues)
   CcBwpCreator ccBwpCreator;
   const uint8_t numCcPerBand = 1;
   
-  CcBwpCreator::SimpleOperationBandConf bandConf (2.0e9, 20e6, numCcPerBand, BandwidthPartInfo::UMa);
+  // 统一频谱口径：7个波束，每波束5MHz，总名义带宽35MHz
+  CcBwpCreator::SimpleOperationBandConf bandConf (2187.5e6, 35e6, numCcPerBand, BandwidthPartInfo::UMa);
   
   OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc (bandConf);
   
@@ -275,6 +287,7 @@ SatUserHelper::CreateUsersAroundBeam (const BeamInfo& beamInfo, uint32_t count)
     }
 
   ues.Create (count);
+  AssignTerminalProfiles (ues, beamInfo.beamId);
 
   // 创建随机圆盘位置分配器，在波束中心附近撒点
   Ptr<RandomDiscPositionAllocator> randomDisc = CreateObject<RandomDiscPositionAllocator> ();
@@ -310,6 +323,42 @@ SatUserHelper::CreateUsersAroundBeam (const BeamInfo& beamInfo, uint32_t count)
                           << beamInfo.centerPosition.y << ") with radius " << beamInfo.radius << "m");
 
   return ues;
+}
+
+void
+SatUserHelper::AssignTerminalProfiles (NodeContainer ues, uint16_t beamId)
+{
+  const uint32_t total = ues.GetN ();
+  const uint32_t consumerCount = static_cast<uint32_t> (std::round (total * m_consumerShare));
+  std::vector<uint32_t> indices;
+  indices.reserve (total);
+  for (uint32_t i = 0; i < total; ++i)
+    {
+      indices.push_back (i);
+    }
+
+  // Randomize terminal-type assignment so it is not coupled to node creation
+  // order within a beam or a single-batch UE creation call.
+  Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable> ();
+  for (uint32_t i = total; i > 1; --i)
+    {
+      uint32_t swapWith = rng->GetInteger (0, i - 1);
+      std::swap (indices[i - 1], indices[swapWith]);
+    }
+
+  for (uint32_t i = 0; i < total; ++i)
+    {
+      Ptr<Node> node = ues.Get (indices[i]);
+      Ptr<SatTerminalProfile> profile = node->GetObject<SatTerminalProfile> ();
+      if (!profile)
+        {
+          profile = CreateObject<SatTerminalProfile> ();
+          node->AggregateObject (profile);
+        }
+
+      profile->SetBeamId (beamId);
+      profile->SetTerminalType (i < consumerCount ? UT_CONSUMER : UT_PORTABLE);
+    }
 }
 
 } // namespace ns3

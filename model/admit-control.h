@@ -124,8 +124,8 @@ private:
     
     // 配置参数
     double m_emergencyReservationRatio;  // 应急业务预留比例 (默认20%)
-    uint32_t m_totalDlRbs;              // 下行总RB (160)
-    uint32_t m_totalUlRbs;              // 上行总RB (50)
+    uint32_t m_totalDlRbs;              // 单波束下行总RB基线 (25)
+    uint32_t m_totalUlRbs;              // 单波束上行总RB基线 (25)
     double m_admissionThreshold;        // 准入阈值 (资源利用率>90%拒绝)
     double m_handoverBenefitThreshold;   // 切换收益阈值
 };

@@ -110,6 +110,18 @@ void SatStatsCollector::OnNrRandomAccessSuccess (std::string context, uint64_t i
     }
 
   m_accessStats.totalAttempts++;
+
+  if (!IsChannelQualitySufficient (rnti)) {
+      m_accessStats.poorChannelCount++;
+      double successRate = (m_accessStats.totalAttempts > 0) ?
+                           (double)m_accessStats.successCount / m_accessStats.totalAttempts : 0.0;
+      NS_LOG_WARN ("[NR Access] IMSI=" << imsi << " RNTI=" << rnti
+                   << " CellId=" << cellId << " 信道质量不足，接入计为失败."
+                   << " PoorCh=" << m_accessStats.poorChannelCount);
+      m_accessSuccessTrace (rnti, successRate);
+      return;
+  }
+
   m_accessStats.successCount++;
 
   double successRate = (double)m_accessStats.successCount / m_accessStats.totalAttempts;
@@ -147,6 +159,18 @@ void SatStatsCollector::OnNrRandomAccessSuccessNoCtx (uint64_t imsi, uint16_t ce
     }
 
   m_accessStats.totalAttempts++;
+
+  if (!IsChannelQualitySufficient (rnti)) {
+      m_accessStats.poorChannelCount++;
+      double successRate = (m_accessStats.totalAttempts > 0) ?
+                           (double)m_accessStats.successCount / m_accessStats.totalAttempts : 0.0;
+      NS_LOG_WARN ("[NR Access] IMSI=" << imsi << " RNTI=" << rnti
+                   << " CellId=" << cellId << " 信道质量不足，接入计为失败."
+                   << " PoorCh=" << m_accessStats.poorChannelCount);
+      m_accessSuccessTrace (rnti, successRate);
+      return;
+  }
+
   m_accessStats.successCount++;
 
   double successRate = (double)m_accessStats.successCount / m_accessStats.totalAttempts;
@@ -380,11 +404,12 @@ AccessStatistics SatStatsCollector::GetAccessStatistics () const
 
 void SatStatsCollector::ResetAccessStats ()
 {
-  m_accessStats.totalAttempts = 0;
-  m_accessStats.successCount = 0;
-  m_accessStats.collisionCount = 0;
-  m_accessStats.timeoutCount = 0;
-  m_accessStats.successRate = 0.0;
+  m_accessStats.totalAttempts   = 0;
+  m_accessStats.successCount    = 0;
+  m_accessStats.collisionCount  = 0;
+  m_accessStats.timeoutCount    = 0;
+  m_accessStats.poorChannelCount = 0;
+  m_accessStats.successRate     = 0.0;
   m_ueAccessAttempts.clear ();
 }
 
@@ -1136,7 +1161,7 @@ void SatStatsCollector::ExportStatsToFiles ()
         file.seekp (0, std::ios::end);
         if (file.tellp () == 0)
           {
-            file << "ReuseMode,TotalUes,Attempts,Successes,SuccessRate" << std::endl;
+            file << "ReuseMode,TotalUes,Attempts,Successes,PoorChannel,SuccessRate" << std::endl;
           }
 
         double successRate = (m_accessStats.totalAttempts > 0) ?
@@ -1146,6 +1171,7 @@ void SatStatsCollector::ExportStatsToFiles ()
              << m_totalUes << ","
              << m_accessStats.totalAttempts << ","
              << m_accessStats.successCount << ","
+             << m_accessStats.poorChannelCount << ","
              << std::fixed << std::setprecision (6) << successRate
              << std::endl;
 
@@ -1263,6 +1289,66 @@ void SatStatsCollector::ExportStatsToFiles ()
   }
 
   NS_LOG_INFO ("[SatStatsCollector] Export complete!");
+}
+
+// ==================== 信道质量注册与判定 ====================
+
+void SatStatsCollector::RegisterUeType (uint16_t rnti, UtType utType)
+{
+  auto& ctx = m_ueChannelContext[rnti];
+  ctx.utType  = utType;
+  ctx.rsrp    = -120.0;
+  ctx.sinrDb  = -30.0;
+  ctx.valid   = false;
+  NS_LOG_DEBUG ("[CQ-Register] RNTI=" << rnti
+                << " UtType=" << (utType == UT_PORTABLE ? "PORTABLE" : "CONSUMER"));
+}
+
+void SatStatsCollector::RegisterUeTypeByImsi (uint64_t imsi, UtType utType)
+{
+  auto rntiIt = m_imsiToRnti.find (imsi);
+  if (rntiIt != m_imsiToRnti.end ()) {
+      RegisterUeType (rntiIt->second, utType);
+  } else {
+      // RNTI 尚未知晓，先以 imsi 低 16bit 作占位键，等 RA 成功时更新
+      uint16_t placeholder = static_cast<uint16_t> (imsi & 0xFFFF);
+      RegisterUeType (placeholder, utType);
+      NS_LOG_DEBUG ("[CQ-Register] IMSI=" << imsi << " RNTI 未知，占位键=" << placeholder);
+  }
+}
+
+void SatStatsCollector::UpdateUeChannelQuality (uint16_t rnti, double rsrp, double sinrDb)
+{
+  auto& ctx   = m_ueChannelContext[rnti];
+  ctx.rsrp    = rsrp;
+  ctx.sinrDb  = sinrDb;
+  ctx.valid   = true;
+  NS_LOG_DEBUG ("[CQ-Update] RNTI=" << rnti
+                << " RSRP=" << rsrp << " dBm  SINR=" << sinrDb << " dB");
+}
+
+bool SatStatsCollector::IsChannelQualitySufficient (uint16_t rnti) const
+{
+  auto it = m_ueChannelContext.find (rnti);
+  if (it == m_ueChannelContext.end () || !it->second.valid) {
+      // 没有注册信道上下文：默认放行（不影响未配置的 UE）
+      NS_LOG_DEBUG ("[CQ-Check] RNTI=" << rnti << " 无信道上下文，默认放行");
+      return true;
+  }
+
+  const UeChannelContext& ctx = it->second;
+  double snrThr = (ctx.utType == UT_PORTABLE) ? CQ_SNR_PORTABLE : CQ_SNR_CONSUMER;
+
+  bool rsrpOk = (ctx.rsrp   >= CQ_RSRP_THRESHOLD);
+  bool snrOk  = (ctx.sinrDb >= snrThr);
+
+  NS_LOG_INFO ("[CQ-Check] RNTI=" << rnti
+               << " UtType=" << (ctx.utType == UT_PORTABLE ? "PORTABLE" : "CONSUMER")
+               << " | RSRP=" << ctx.rsrp << " dBm (thr=" << CQ_RSRP_THRESHOLD << ")"
+               << " | SNR=" << ctx.sinrDb << " dB (thr=" << snrThr << ")"
+               << " | " << (rsrpOk && snrOk ? "PASS" : "FAIL"));
+
+  return rsrpOk && snrOk;
 }
 
 } // namespace ns3

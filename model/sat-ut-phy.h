@@ -8,6 +8,7 @@
 #include "ns3/object.h"
 #include "ns3/packet.h"
 #include "ns3/event-id.h"
+#include "ns3/traced-callback.h"
 #include "sat-mac-phy-sap.h"
 #include <string>
 #include <vector>
@@ -87,9 +88,18 @@ public:
     // 触发CQI报告
     void TriggerCqiReport ();
     
-    // 获取当前SINR
+    // 获取当前SINR (dB)
     double GetLastCalculatedSinr () const;
-    
+
+    // 获取最近一次测量的 RSRP (dBm)
+    double GetLastRsrp () const;
+
+    // 获取最近一次计算的 RSRQ (dB)
+    double GetLastRsrq () const;
+
+    // 计算 RSRQ (参考 3GPP, 公式: 10*log10(N*RSRP/RSSI))
+    double CalculateRsrq (double rsrpDbm, uint32_t beamId);
+
     // 设置CQI回调
     void SetCqiReportCallback (Callback<void, uint8_t> callback);
 
@@ -111,7 +121,8 @@ private:
     
     uint16_t m_rnti;
     uint32_t m_currentBeamId;
-    double m_lastCalculatedSinr;
+    double m_lastCalculatedSinr;   // 最近一次计算的 SINR (dB)
+    double m_lastRsrp;             // 最近一次测量的 RSRP (dBm)
     
     // 物理层参数
     double m_bandwidthHz;
@@ -130,6 +141,12 @@ private:
     MultipleAccessMode m_maMode;
     uint32_t m_essaNumSlots;
     std::map<uint32_t, uint32_t> m_slotAllocationMap;
+
+    // PHY 层统计 TracedCallbacks
+    double m_lastRsrq;             // 最近一次计算的 RSRQ (dB)
+    TracedCallback<uint16_t, double> m_rsrpTrace;   // (rnti, rsrp_dBm)
+    TracedCallback<uint16_t, double> m_sinrTrace;   // (rnti, sinr_dB)
+    TracedCallback<uint16_t, double> m_rsrqTrace;   // (rnti, rsrq_dB)
 };
 
 } // namespace ns3

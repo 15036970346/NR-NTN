@@ -19,14 +19,14 @@
 namespace ns3 {
 
 struct SatUeContext {
-  uint16_t rnti;               
-  uint32_t currentBeamId;      
-  double latestCqi;            
-  uint32_t bufferStatus;       
-  double averageThroughput;    
+  uint16_t rnti;
+  uint32_t currentBeamId;
+  double latestCqi;
+  uint32_t bufferStatus;
+  double averageThroughput;
   Vector position;             // UE位置 (用于IPF算法)
-  
-  UtType utType;           
+
+  UtType utType;
   TrafficType trafficType;
   ServicePriority priority;     // 业务优先级
   double wrrWeight;            // WRR权重
@@ -43,7 +43,6 @@ struct HandoverUeContext {
     double averageThroughput;
     UtType utType;
     TrafficType trafficType;
-    Vector position;
 };
 
 class GeoBeamScheduler : public NrMacScheduler
@@ -95,6 +94,14 @@ public:
   void SetRaConfig (Time prachWindow, Time rarProcessingDelay,
                     Time rarTxDelay, Time msg4ProcessingDelay, Time msg4TxDelay);
 
+  // ==================== 2 步随机接入接口 (基站侧) ====================
+  // MsgA: UE → gNB, 前导码 + RRC 建链请求打包
+  void ReceiveMsgA (const MsgA& msgA);
+  // UE 订阅 MsgB 下行广播回调
+  void RegisterUeTwoStepRaCallbacks (Callback<void, const MsgB&> msgBCb);
+  // 配置 2 步 RA 参数
+  void SetTwoStepRaConfig (Time msgAWindow, Time msgBProcessingDelay, Time msgBTxDelay);
+
   // 必须实现的 5G-LENA 接口
   virtual void DoCschedCellConfigReq (const NrMacCschedSapProvider::CschedCellConfigReqParameters& params) override;
   virtual void DoCschedUeConfigReq (const NrMacCschedSapProvider::CschedUeConfigReqParameters& params) override;
@@ -120,6 +127,10 @@ private:
   double CalculateWrrWeight (ServicePriority priority, UtType utType);
 
   // ---------- 随机接入辅助 ----------
+  // 上行到达后延迟入缓冲 (模拟上行传播)
+  void DoBufferPreamble (PrachPreamble preamble);
+  void DoBufferMsg3 (RrcSetupRequest req);
+  void DoBufferMsgA (MsgA msgA);
   // 收集窗口内到达的 preamble 并为每个唯一的 preambleId 生成 RAR
   void ProcessPrachWindow ();
   // 真正发送 RAR (广播至所有订阅的 UE)
@@ -130,16 +141,7 @@ private:
   void DispatchMsg4 (RrcSetupMessage msg4);
   // 分配一个 TC-RNTI (简单线性递增)
   uint16_t AllocateTcRnti ();
-  
-  // WRR调度算法
-  void RunWrrScheduler (std::vector<uint16_t>& ueList, uint32_t availableRbs);
-  
-  // IPF调度算法 (位置辅助改进型比例公平)
-  void RunIpfScheduler (std::vector<uint16_t>& ueList, uint32_t availableRbs);
-  
-  // 两级调度: WRR(应急) + IPF(普通)
-  void RunTwoLevelScheduler ();
-  
+
   // 计算UE间距离 (用于IPF)
   double CalculateUeDistance (uint16_t rnti1, uint16_t rnti2);
 
@@ -166,6 +168,7 @@ private:
   struct PreambleArrival {
     uint32_t preambleId;
     Time     arrivalTime;
+    uint32_t raRnti;       // UE 提供的 RA-RNTI, 区分不同 PRACH occasion
   };
   std::vector<PreambleArrival> m_prachWindowBuf;
   EventId  m_prachWindowEvent;             // 当前 PRACH 窗口处理事件
@@ -187,6 +190,31 @@ private:
   Time m_msg3WindowDuration;               // Msg3 聚合/去重窗口
   Time m_msg4ProcessingDelay;              // gNB 处理 Msg4 的本地时延
   Time m_msg4TxDelay;                      // Msg4 单程传播 (GEO ~300 ms)
+
+  // ---------- 2 步 RA 运行时状态 ----------
+  struct MsgAArrival {
+    uint32_t preambleId;
+    uint64_t ueIdentity;
+    Time     arrivalTime;
+    uint32_t raRnti;       // UE 提供的 RA-RNTI, 区分不同 PRACH occasion
+  };
+  std::vector<MsgAArrival> m_msgAWindowBuf;
+  EventId  m_msgAWindowEvent;
+
+  // MsgB 下行广播订阅者 (独立于 4 步的 m_rarSubscribers)
+  std::vector<Callback<void, const MsgB&>> m_msgBSubscribers;
+
+  // 2 步 RA 可配置时延
+  Time m_msgAWindowDuration;               // MsgA 聚合窗口 (500μs)
+  Time m_msgBProcessingDelay;              // gNB 处理 MsgB 的本地时延
+  Time m_msgBTxDelay;                      // MsgB 单程传播 (GEO ~300 ms)
+
+  // ---------- 上行传播时延 ----------
+  Time m_uplinkPropDelay;                  // UE → 卫星 → gNB 上行单程 (GEO ~300 ms)
+
+  // 2 步 RA 辅助函数
+  void ProcessMsgAWindow ();
+  void DispatchMsgB (MsgB msgB);
 };
 
 } // namespace ns3

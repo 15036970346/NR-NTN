@@ -15,6 +15,8 @@
 #include "ns3/nr-ue-net-device.h"
 #include "ns3/flow-monitor.h"
 #include "ns3/nr-bearer-stats-calculator.h"
+#include "sat-ut-phy.h"
+#include "resource-manager.h"
 #include <map>
 #include <vector>
 #include <string>
@@ -22,11 +24,20 @@
 namespace ns3 {
 
 struct AccessStatistics {
-    uint32_t totalAttempts;      // 总接入尝试次数
-    uint32_t successCount;       // 成功接入次数
-    uint32_t collisionCount;     // 碰撞失败次数
-    uint32_t timeoutCount;       // RAR超时次数
-    double successRate;          // 接入成功率
+    uint32_t totalAttempts;       // 总接入尝试次数
+    uint32_t successCount;        // 成功接入次数
+    uint32_t collisionCount;      // 碰撞失败次数
+    uint32_t timeoutCount;        // RAR超时次数
+    uint32_t poorChannelCount;    // 因信道质量不足拒绝次数
+    double successRate;           // 接入成功率
+};
+
+// 每 UE 的信道质量上下文 (用于 NR trace 路径的信道质量门限过滤)
+struct UeChannelContext {
+    UtType   utType;      // 终端类型
+    double   rsrp;        // 最近一次 RSRP (dBm)
+    double   sinrDb;      // 最近一次 SINR (dB)
+    bool     valid;       // 是否已有有效测量
 };
 
 struct HarqStatistics {
@@ -71,6 +82,13 @@ public:
     // ==================== 接入统计 ====================
     void RecordAccessAttempt (uint16_t rnti);
     void RecordAccessSuccess (uint16_t rnti);
+
+    // ==================== 信道质量注册 (NR trace 路径) ====================
+    // 在 UE 接入前/接入时注册终端类型 (供信道质量门限判定使用)
+    void RegisterUeType (uint16_t rnti, UtType utType);
+    void RegisterUeTypeByImsi (uint64_t imsi, UtType utType);
+    // 更新 UE 的信道质量测量值 (从 PHY 测量上报或定期刷新)
+    void UpdateUeChannelQuality (uint16_t rnti, double rsrp, double sinrDb);
     void RecordAccessCollision (uint16_t rnti);
     void RecordAccessTimeout (uint16_t rnti);
     AccessStatistics GetAccessStatistics () const;
@@ -258,6 +276,13 @@ private:
     void CheckAndUpdatePeakRate (uint16_t rnti);
     void AdvanceWindow (uint16_t rnti, const Time& now);
 
+    // 信道质量门限判定 (与 SatUtMac 使用相同基准)
+    // RSRP 门限: -94.5 dBm  SNR 门限: Consumer=1.8dB, Portable=20.8dB
+    static constexpr double CQ_RSRP_THRESHOLD     = -94.5;
+    static constexpr double CQ_SNR_CONSUMER       = 1.8;
+    static constexpr double CQ_SNR_PORTABLE       = 20.8;
+    bool IsChannelQualitySufficient (uint16_t rnti) const;
+
     // 仿真参数
     uint8_t m_reuseMode;
     bool m_disableHarq;
@@ -267,6 +292,9 @@ private:
     // 接入统计
     AccessStatistics m_accessStats;
     std::map<uint16_t, uint32_t> m_ueAccessAttempts;
+
+    // 每 UE 信道质量上下文
+    std::map<uint16_t, UeChannelContext> m_ueChannelContext;
     std::map<uint16_t, uint64_t> m_rntiToImsi;  // RNTI → IMSI 映射
     std::map<uint64_t, uint16_t> m_imsiToRnti;  // IMSI → RNTI 映射
     std::set<std::string> m_udpServerConnectedUes;  // 已通过UDP接入的UE地址集合（用于去重）

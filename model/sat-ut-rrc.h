@@ -1,15 +1,18 @@
 /*
- * 文件路径：contrib/geo-sat/model/sat-ut-rrc.h
- * 功能：用户终端 RRC 层测量控制模块
+ * contrib/geo-sat/model/sat-ut-rrc.h
+ * UE RRC layer: measurement control + state machine (IDLE/CONNECTED/INACTIVE)
+ * State machine modeled on LteUeRrc (src/lte/model/lte-ue-rrc.h:98-114)
  */
 #ifndef SAT_UT_RRC_H
 #define SAT_UT_RRC_H
 
 #include "ns3/object.h"
 #include "ns3/event-id.h"
+#include "ns3/nstime.h"
 #include "ns3/mobility-model.h"
 #include "ns3/callback.h"
-#include "ns3/sat-mac-common.h" // 依赖于你在该文件中扩展的 MeasReport 和 MeasConfig
+#include "ns3/traced-callback.h"
+#include "ns3/sat-mac-common.h"
 
 namespace ns3 {
 
@@ -19,38 +22,90 @@ public:
     SatUtRrc ();
     virtual ~SatUtRrc ();
 
-    // 1. 核心接口：接收来自底层（SatUtPhy）的物理层原始测量数据
+    // ==================== RRC State Machine ====================
+    // Modeled on LteUeRrc::State (src/lte/model/lte-ue-rrc.h:98-114)
+    enum State {
+        IDLE_START = 0,
+        IDLE_CELL_SEARCH,
+        IDLE_CAMPED_NORMALLY,
+        IDLE_RANDOM_ACCESS,
+        CONNECTED_NORMALLY,
+        CONNECTED_HANDOVER,
+        CONNECTED_PHY_PROBLEM,
+        RRC_INACTIVE,           // 5G NR RRC_INACTIVE state
+        NUM_STATES
+    };
+
+    // Get current state
+    State GetState () const;
+
+    // State transition (public for external triggers like RA completion)
+    void SwitchToState (State newState);
+
+    // ==================== Measurement Control ====================
+    // 1. Core: receive raw PHY measurements
     void ProcessRawMeasurement (uint32_t beamId, double rawRsrp);
 
-    // 2. 配置接口：设置测量参数 (由基站 SIB 广播或 RRC 重配下发)
+    // 2. Config: set measurement parameters (from SIB or RRC reconfig)
     void SetMeasConfig (MeasConfig config);
-    
-    // 3. 移动性接口：绑定终端的移动性模型，用于获取实时三维坐标
+
+    // 3. Mobility: bind mobility model for position reporting
     void SetMobilityModel (Ptr<MobilityModel> mobility);
 
-    // 4. 标识接口：设置当前终端的 RNTI/UE ID
+    // 4. Identity
     void SetUeId (uint16_t ueId);
 
-    // 5. 回调接口：当触发测量上报时，通过此回调将报告发给 MAC 层或上层发送模块
+    // 5. Report callback
     typedef Callback<void, MeasReport> ReportCallback;
     void SetReportCallback (ReportCallback cb);
 
-private:
-    // 内部逻辑：评估是否满足测量事件触发条件 (如 Event A2/A4)
-    void EvaluateMeasurementEvents ();
+    // ==================== Inactivity Timer ====================
+    // Set inactivity timer duration (T3xx series)
+    void SetInactivityTimer (Time duration);
+    // Reset inactivity timer (called on data activity)
+    void ResetInactivityTimer ();
 
-    // 内部逻辑：Time-to-Trigger 定时器超时后，真正生成并发送报告
+    // ==================== Paging ====================
+    // Receive paging message (transitions INACTIVE -> CONNECTED)
+    void ReceivePagingMessage ();
+    // Get access recovery delay (time from paging to CONNECTED)
+    Time GetLastAccessRecoveryDelay () const;
+
+    // ==================== State Transition Trace ====================
+    // (ueId, oldState, newState)
+    TracedCallback<uint16_t, State, State> m_stateTransitionTrace;
+
+    // Static helper: state name string
+    static std::string StateToString (State s);
+
+private:
+    // Measurement event evaluation
+    void EvaluateMeasurementEvents ();
     void TriggerMeasurementReport ();
 
-    Ptr<MobilityModel> m_mobility; // 指向终端的移动性模型
-    MeasConfig m_measConfig;       // 测量配置参数
-    ReportCallback m_reportCb;     // 上报回调函数
-    
-    uint16_t m_ueId;           // 终端ID
-    uint32_t m_currentBeamId;  // 当前正在测量的波束ID
-    double m_filteredRsrp;     // L3 滤波后的 RSRP 平滑值
-    bool m_isConditionMet;     // 标记是否已经满足门限条件
-    EventId m_tttEvent;        // Time-to-Trigger 定时器句柄
+    // Inactivity timer callback
+    void OnInactivityTimeout ();
+
+    Ptr<MobilityModel> m_mobility;
+    MeasConfig m_measConfig;
+    ReportCallback m_reportCb;
+
+    uint16_t m_ueId;
+    uint32_t m_currentBeamId;
+    double m_filteredRsrp;
+    bool m_isConditionMet;
+    EventId m_tttEvent;
+
+    // State machine
+    State m_state;
+
+    // Inactivity timer
+    Time m_inactivityDuration;
+    EventId m_inactivityTimer;
+
+    // Paging / recovery
+    Time m_pagingReceivedTime;
+    Time m_lastAccessRecoveryDelay;
 };
 
 } // namespace ns3

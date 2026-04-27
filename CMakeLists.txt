@@ -14,6 +14,7 @@ set(source_files
     model/sat-ut-phy.cc        # [新增] 你的终端物理层
     model/sat-ut-mac.cc        # [新增] 终端MAC层
     helper/user-helper.cc
+    helper/terminal-profile.cc
     helper/traffic-models.cc
     
     # --- 秦宇航部分 ---
@@ -48,6 +49,19 @@ set(source_files
     
     # --- [新增] 结果输出管理器 ---
     model/result-writer.cc         # 仿真结果输出
+
+    # --- [新增] SDAP 层 ---
+    model/sat-sdap.cc
+
+    # --- [新增] 分层统计收集器 ---
+    helper/sat-phy-stats-collector.cc
+    helper/sat-mac-stats-collector.cc
+    helper/sat-rlc-stats-collector.cc
+    helper/sat-pdcp-stats-collector.cc
+    helper/sat-sdap-stats-collector.cc
+    helper/sat-rrc-stats-collector.cc
+    helper/sat-e2e-stats-collector.cc
+    helper/sat-stats-connector.cc
 )
 
 # 3. 合并所有头文件 (.h)
@@ -58,6 +72,7 @@ set(header_files
     model/sat-ut-phy.h         # [新增] 你的终端物理层头文件
     model/sat-ut-mac.h         # [新增] 终端MAC层头文件
     helper/user-helper.h
+    helper/terminal-profile.h
     helper/traffic-models.h
     
     # --- 秦宇航部分 ---
@@ -93,6 +108,19 @@ set(header_files
     
     # --- [新增] 结果输出管理器 ---
     model/result-writer.h         # 仿真结果输出
+
+    # --- [新增] SDAP 层 ---
+    model/sat-sdap.h
+
+    # --- [新增] 分层统计收集器 ---
+    helper/sat-phy-stats-collector.h
+    helper/sat-mac-stats-collector.h
+    helper/sat-rlc-stats-collector.h
+    helper/sat-pdcp-stats-collector.h
+    helper/sat-sdap-stats-collector.h
+    helper/sat-rrc-stats-collector.h
+    helper/sat-e2e-stats-collector.h
+    helper/sat-stats-connector.h
 )
 # ... 后面的构建命令保持不变 ...
 
@@ -130,5 +158,17 @@ build_lib_example(
 build_lib_example(
     NAME ntn-system-sim
     SOURCE_FILES examples/ntn-system-sim.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+build_lib_example(
+    NAME ntn-ra-compare
+    SOURCE_FILES examples/ntn-ra-compare.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+build_lib_example(
+    NAME ntn-layer-stats-demo
+    SOURCE_FILES examples/ntn-layer-stats-demo.cc
     LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
 )

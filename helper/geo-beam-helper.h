@@ -60,8 +60,9 @@ public:
    * \brief 设置频率复用模式
    * \param mode 复用模式 (4: 4色复用, 7: 7色复用)
    * \details
-   * - 4色复用: 总带宽7.5MHz(40PRB), 7个波束分配到4个频点
-   * - 7色复用: 总带宽5MHz(25PRB), 7个波束使用7个独立频点
+   * - 统一口径: 7个波束，每波束5MHz，总名义带宽35MHz
+   * - 4色复用: 5MHz每色组，部分波束复用同一载频
+   * - 7色复用: 5MHz每波束，7个波束使用7个独立频点
    */
   void SetFrequencyReuseMode (uint8_t mode);
 
