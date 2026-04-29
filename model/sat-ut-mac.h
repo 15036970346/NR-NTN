@@ -110,7 +110,6 @@ public:
     // 设置本 UE 的唯一身份 (40-bit contention resolution ID)
     void SetUeIdentity (uint64_t ueIdentity);
     uint64_t GetUeIdentity () const;
-    void SetUtType (UtType utType);
     void SetRnti (uint16_t rnti);
     uint16_t GetActiveRnti () const;
 

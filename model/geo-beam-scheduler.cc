@@ -761,7 +761,7 @@ void GeoBeamScheduler::RunScheduler ()
                 std::max (1u, static_cast<uint32_t> (std::ceil (ctx.dlBufferStatus / bytesPerRb)));
               const uint32_t schedulerProposedRbs = std::min (neededRbs, queueBudget);
               const uint32_t allocatedRb =
-                m_resourceManager->AllocateSpectrum (beamId, schedulerProposedRbs, false);
+                m_resourceManager->AllocateSpectrum (ctx.utType, schedulerProposedRbs, false);
 
               if (allocatedRb == 0)
                 {
@@ -1299,7 +1299,7 @@ uint32_t GeoBeamScheduler::ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation,
     }
   const uint32_t remainingBeforeGrant = m_resourceManager->GetRemainingRbs (beamId, true);
   const uint32_t approvedRb =
-    m_resourceManager->AllocateSpectrum (beamId, requestedAfterPowerLimit, true);
+    m_resourceManager->AllocateSpectrum (ctx.utType, requestedAfterPowerLimit, true);
 
   if (approvedRb == 0)
     {

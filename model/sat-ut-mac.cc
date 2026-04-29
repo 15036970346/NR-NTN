@@ -47,7 +47,6 @@ SatUtMac::SatUtMac ()
       m_pendingUlGrantMcs (0),
       m_pendingUlGrantTxPowerDbm (23.0),
       m_ueIdentity (0),
-      m_utType (UT_PORTABLE),
       m_rnti (0),
       m_currentPreambleId (0),
       m_currentRaRnti (0),
@@ -744,11 +743,6 @@ bool SatUtMac::IsConnected () const
 void SatUtMac::SetUeIdentity (uint64_t ueIdentity)
 {
     m_ueIdentity = ueIdentity;
-}
-
-void SatUtMac::SetUtType (UtType utType)
-{
-    m_utType = utType;
 }
 
 uint64_t SatUtMac::GetUeIdentity () const
