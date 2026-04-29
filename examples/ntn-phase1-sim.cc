@@ -167,12 +167,14 @@ int main (int argc, char *argv[])
     // 测试3: 切换准入判断
     NS_LOG_INFO ("Test AdmitControl: Handover from Beam 1 to Beam 2");
     admitControl->RegisterUeToBeam (1, 1, ServicePriority::PRIORITY_DATA, UT_CONSUMER, TRAFFIC_DATA, Vector (100, 100, 0));
-    AdmitDecision decision3 = admitControl->CanHandoverUe (1, 2, ServicePriority::PRIORITY_DATA, 12);
+    AdmitDecision decision3 = admitControl->CanHandoverUe (1, 2, ServicePriority::PRIORITY_DATA,
+                                                             UT_CONSUMER, TRAFFIC_DATA, 12);
     NS_LOG_INFO ("  Decision: " << (uint32_t)decision3);
-    
+
     // 测试4: 获取推荐波束
     NS_LOG_INFO ("Test AdmitControl: Get Recommended Beams");
-    std::vector<uint32_t> recommendedBeams = admitControl->GetRecommendedBeams (1, ServicePriority::PRIORITY_EMERGENCY);
+    std::vector<uint32_t> recommendedBeams = admitControl->GetRecommendedBeams (1, ServicePriority::PRIORITY_EMERGENCY,
+                                                                                 UT_CONSUMER, TRAFFIC_DATA, 0);
     std::cout << "  Recommended beams: ";
     for (uint32_t beam : recommendedBeams) {
         std::cout << beam << " ";
@@ -386,7 +388,7 @@ int main (int argc, char *argv[])
     utMacA->SetRaTimers (MilliSeconds (1000), MilliSeconds (1500), 5);
     // 连接 UE → gNB 上行回调
     utMacA->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
-    utMacA->SetMsg3Callback  (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMacA->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
     // 将本 UE 订阅到 gNB 的下行 RAR/Msg4 广播
     scheduler->RegisterUeRaCallbacks (
         MakeCallback (&SatUtMac::ReceiveRar, utMacA),
@@ -411,8 +413,8 @@ int main (int argc, char *argv[])
 
     utMacB1->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
     utMacB2->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
-    utMacB1->SetMsg3Callback  (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
-    utMacB2->SetMsg3Callback  (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMacB1->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
+    utMacB2->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
 
     scheduler->RegisterUeRaCallbacks (
         MakeCallback (&SatUtMac::ReceiveRar, utMacB1),
@@ -449,7 +451,7 @@ int main (int argc, char *argv[])
     // MsgA 回调 → gNB 的 ReceiveMsgA
     utMacC->SetMsgACallback (MakeCallback (&GeoBeamScheduler::ReceiveMsgA, scheduler));
     // 同时也需要 Msg3 回调 (FALLBACK 时复用)
-    utMacC->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMacC->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
     // 订阅 MsgB 广播
     scheduler->RegisterUeTwoStepRaCallbacks (
         MakeCallback (&SatUtMac::ReceiveMsgB, utMacC));
@@ -481,8 +483,8 @@ int main (int argc, char *argv[])
     utMacD1->SetMsgACallback (MakeCallback (&GeoBeamScheduler::ReceiveMsgA, scheduler));
     utMacD2->SetMsgACallback (MakeCallback (&GeoBeamScheduler::ReceiveMsgA, scheduler));
     // Msg3 回调 (FALLBACK 复用)
-    utMacD1->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
-    utMacD2->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMacD1->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
+    utMacD2->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
 
     // 订阅 MsgB 广播
     scheduler->RegisterUeTwoStepRaCallbacks (

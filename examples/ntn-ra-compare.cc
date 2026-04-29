@@ -99,7 +99,7 @@ SetupUe (Ptr<SatUtMac> utMac,
 
     // 4 步回调 (所有 UE 都需要, 2 步 FALLBACK 会复用)
     utMac->SetPrachCallback (MakeCallback (&GeoBeamScheduler::ReceivePrachPreamble, scheduler));
-    utMac->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3, scheduler));
+    utMac->SetMsg3Callback (MakeCallback (&GeoBeamScheduler::ReceiveMsg3Packet, scheduler));
     scheduler->RegisterUeRaCallbacks (
         MakeCallback (&SatUtMac::ReceiveRar, utMac),
         MakeCallback (&SatUtMac::ReceiveMsg4, utMac));
