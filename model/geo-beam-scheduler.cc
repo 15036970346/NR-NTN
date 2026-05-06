@@ -1061,24 +1061,27 @@ void GeoBeamScheduler::ProcessPrachWindow ()
         (preambleUtType.find (pid) != preambleUtType.end ()) ?
         preambleUtType.at (pid) :
         static_cast<UtType> (m_msg3DefaultUtTypeValue);
+      // RA 使用专用控制资源池, 不阻塞于业务 UL 预算 (恢复 xys 行为, 让碰撞在 Msg3 阶段被检测).
+      // 仍保留 qyh 的功率/预算计算以记录信息, 但耗尽时降级为配置 grant 而非跳过 RAR.
       const uint32_t msg3PowerLimitedRbs =
         m_resourceManager->GetMaxPowerLimitedUlRbs (msg3UtType, m_referencePathLossDb);
-      const uint32_t msg3RequestedAfterPowerLimit =
+      uint32_t msg3RequestedAfterPowerLimit =
         std::min (m_msg3RequestedRbs, msg3PowerLimitedRbs);
       if (msg3RequestedAfterPowerLimit == 0)
         {
           NS_LOG_WARN ("[Msg2] PreambleID=" << pid
-                       << " 因终端功率上限受限，无法为 Msg3 分配任何非削顶 UL RB");
-          continue;
+                       << " 终端功率上限受限, 回退使用配置 grant=" << m_msg3RequestedRbs << " RB");
+          msg3RequestedAfterPowerLimit = m_msg3RequestedRbs;
         }
-      const uint32_t approvedMsg3Rbs =
+      uint32_t approvedMsg3Rbs =
         m_resourceManager->AllocateSpectrum (msg3UtType, msg3RequestedAfterPowerLimit, true);
       if (approvedMsg3Rbs == 0)
         {
           NS_LOG_WARN ("[Msg2] Beam " << m_myBeamId
-                       << " 上行预算耗尽，无法为 PreambleID=" << pid
-                       << " 生成 Msg3 授权");
-          continue;
+                       << " 业务 UL 预算耗尽 (PreambleID=" << pid
+                       << "), RA 走专用控制池, 仍发 RAR (grant=" << msg3RequestedAfterPowerLimit
+                       << " RB, 不再扣业务预算)");
+          approvedMsg3Rbs = msg3RequestedAfterPowerLimit;
         }
 
       const double msg3TxPowerDbm =
