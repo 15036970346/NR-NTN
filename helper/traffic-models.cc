@@ -966,6 +966,17 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
       return;
     }
 
+  auto configureEmbeddedObjects = [variables] (uint32_t max, double targetMean) {
+    // ThreeGppHttpVariables in this ns-3 tree uses a truncated Pareto model for
+    // embedded objects, not the older Poisson-based toggle. Keep the intended
+    // average load by approximating the requested mean with the Pareto shape.
+    const uint32_t scale = 2;
+    const double shape = 1.0 + (static_cast<double> (scale) / targetMean);
+    variables->SetNumOfEmbeddedObjectsScale (scale);
+    variables->SetNumOfEmbeddedObjectsShape (shape);
+    variables->SetNumOfEmbeddedObjectsMax (max);
+  };
+
   if (uploadProfile)
     {
       if (lightweightProfile)
@@ -976,9 +987,7 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
           variables->SetMainObjectSizeStdDev (6144);
           variables->SetEmbeddedObjectSizeMean (2048);
           variables->SetEmbeddedObjectSizeStdDev (6144);
-          variables->SetUsePoissonEmbeddedObjects (true);
-          variables->SetNumOfEmbeddedObjectsPoissonMean (2.0);
-          variables->SetNumOfEmbeddedObjectsMax (8);
+          configureEmbeddedObjects (8, 2.0);
           variables->SetReadingTimeMean (Seconds (7));
           variables->SetParsingTimeMean (Seconds (0.15));
           return;
@@ -990,9 +999,7 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
       variables->SetMainObjectSizeStdDev (24576);
       variables->SetEmbeddedObjectSizeMean (12288);
       variables->SetEmbeddedObjectSizeStdDev (32768);
-      variables->SetUsePoissonEmbeddedObjects (true);
-      variables->SetNumOfEmbeddedObjectsPoissonMean (6.0);
-      variables->SetNumOfEmbeddedObjectsMax (24);
+      configureEmbeddedObjects (24, 6.0);
       variables->SetReadingTimeMean (Seconds (10));
       variables->SetParsingTimeMean (Seconds (0.2));
       return;
@@ -1005,9 +1012,7 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
       variables->SetMainObjectSizeStdDev (8192);
       variables->SetEmbeddedObjectSizeMean (4096);
       variables->SetEmbeddedObjectSizeStdDev (12288);
-      variables->SetUsePoissonEmbeddedObjects (true);
-      variables->SetNumOfEmbeddedObjectsPoissonMean (4.0);
-      variables->SetNumOfEmbeddedObjectsMax (16);
+      configureEmbeddedObjects (16, 4.0);
       variables->SetReadingTimeMean (Seconds (5));
       variables->SetParsingTimeMean (Seconds (0.1));
       return;
@@ -1018,9 +1023,7 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
   variables->SetMainObjectSizeStdDev (32768);
   variables->SetEmbeddedObjectSizeMean (16384);
   variables->SetEmbeddedObjectSizeStdDev (49152);
-  variables->SetUsePoissonEmbeddedObjects (true);
-  variables->SetNumOfEmbeddedObjectsPoissonMean (10.0);
-  variables->SetNumOfEmbeddedObjectsMax (64);
+  configureEmbeddedObjects (64, 10.0);
   variables->SetReadingTimeMean (Seconds (8));
   variables->SetParsingTimeMean (Seconds (0.2));
 }
