@@ -156,7 +156,7 @@ SatUserHelper::InstallStack (NodeContainer ues)
   const uint8_t numCcPerBand = 1;
   
   // 统一频谱口径：7个波束，每波束5MHz，总名义带宽35MHz
-  CcBwpCreator::SimpleOperationBandConf bandConf (2187.5e6, 35e6, numCcPerBand, BandwidthPartInfo::UMa);
+  CcBwpCreator::SimpleOperationBandConf bandConf (2.0e9, 35e6, numCcPerBand, BandwidthPartInfo::UMa);
   
   OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc (bandConf);
   

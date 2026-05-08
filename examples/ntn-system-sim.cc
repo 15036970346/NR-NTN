@@ -28,6 +28,7 @@
 #include "ns3/three-gpp-channel-model.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/antenna-module.h"
+#include "ns3/tcp-hybla.h"
 
 #include "ns3/geo-beam-helper.h"
 #include "ns3/gw-helper.h"
@@ -62,52 +63,6 @@ struct GroupTrafficStats
   double throughputMbps {0.0};
   double averageRateMbps {0.0};
 };
-
-static uint16_t
-GetPacketSinkPort (Ptr<PacketSink> sink)
-{
-  AddressValue localAddressValue;
-  if (!sink->GetAttributeFailSafe ("Local", localAddressValue))
-    {
-      return 0;
-    }
-
-  Address local = localAddressValue.Get ();
-  if (InetSocketAddress::IsMatchingType (local))
-    {
-      return InetSocketAddress::ConvertFrom (local).GetPort ();
-    }
-  if (Inet6SocketAddress::IsMatchingType (local))
-    {
-      return Inet6SocketAddress::ConvertFrom (local).GetPort ();
-    }
-  return 0;
-}
-
-static std::map<uint16_t, uint64_t>
-CollectPacketSinkBytesByPort (Ptr<Node> node)
-{
-  std::map<uint16_t, uint64_t> rxBytesByPort;
-
-  for (uint32_t appIdx = 0; appIdx < node->GetNApplications (); ++appIdx)
-    {
-      Ptr<PacketSink> sink = DynamicCast<PacketSink> (node->GetApplication (appIdx));
-      if (!sink)
-        {
-          continue;
-        }
-
-      uint16_t port = GetPacketSinkPort (sink);
-      if (port == 0)
-        {
-          continue;
-        }
-
-      rxBytesByPort[port] += sink->GetTotalRx ();
-    }
-
-  return rxBytesByPort;
-}
 
 static void
 FinalizeGroupStats (GroupTrafficStats& stats, double activeTrafficSeconds)
@@ -144,9 +99,8 @@ PrintFrequencyConfiguration (const std::vector<BeamFrequencyConfig>& beamConfig,
   if (reuseMode == 4)
     {
       WriteResult ("Mode: 4-Color Frequency Reuse");
-      WriteResult ("Nominal Total Beam Bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("Nominal Total PRB Baseline: 175 PRB (7 beams x 25 PRB)");
-      WriteResult ("Bandwidth per Color Group: 5 MHz (25 PRB per carrier)");
+      WriteResult ("Total Bandwidth: 35 MHz (aggregated)");
+      WriteResult ("Bandwidth per Color Group: 8.75 MHz (~47 PRB)");
       WriteResult ("----------------------------------------");
       WriteResult ("| Color | Freq (MHz) | EARFCN | Beams   |");
       WriteResult ("|-------|------------|--------|---------|");
@@ -184,8 +138,7 @@ PrintFrequencyConfiguration (const std::vector<BeamFrequencyConfig>& beamConfig,
   else
     {
       WriteResult ("Mode: 7-Color Frequency Reuse (Full Reuse)");
-      WriteResult ("Nominal Total Beam Bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("Nominal Total PRB Baseline: 175 PRB (7 beams x 25 PRB)");
+      WriteResult ("Total Bandwidth: 35 MHz (aggregated)");
       WriteResult ("Bandwidth per Beam: 5 MHz (25 PRB)");
       WriteResult ("----------------------------------------");
       WriteResult ("| Beam | Freq (MHz) | Bandwidth | EARFCN |");
@@ -284,6 +237,8 @@ int main (int argc, char *argv[])
   bool disableHarq = false;       //!< 禁用HARQ重传
   double simTime = 15.0;         //!< 仿真时间（秒）- 需要足够时间完成GEO附着和数据传输
   bool enableLogs = false;       //!< 是否启用详细日志
+  double consumerShare = 0.5;    //!< 每波束消费级终端占比
+  double portableHttpShare = 0.5; //!< 每波束便携式终端中 HTTP 占比
 
   CommandLine cmd;
   cmd.AddValue ("numUes", "Total number of UE terminals", numUes);
@@ -292,6 +247,12 @@ int main (int argc, char *argv[])
   cmd.AddValue ("disableHarq", "Disable HARQ retransmission (true/false)", disableHarq);
   cmd.AddValue ("simTime", "Simulation time in seconds", simTime);
   cmd.AddValue ("enableLogs", "Enable detailed logging", enableLogs);
+  cmd.AddValue ("consumerShare",
+                "Share of consumer terminals per beam (0.0-1.0); consumers carry voice+HTTP",
+                consumerShare);
+  cmd.AddValue ("portableHttpShare",
+                "Share of portable terminals using HTTP instead of FTP (0.0-1.0)",
+                portableHttpShare);
   cmd.Parse (argc, argv);
 
   // =========================================================================
@@ -352,14 +313,12 @@ int main (int argc, char *argv[])
   // 根据复用模式设置带宽信息
   if (reuseMode == 4)
     {
-      WriteResult ("  Nominal total beam bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("  Nominal total PRB baseline: 175 PRB (7 beams x 25 PRB)");
-      WriteResult ("  Bandwidth per color group: 5 MHz (25 PRB per carrier)");
+      WriteResult ("  Total bandwidth: 35 MHz (aggregated)");
+      WriteResult ("  Bandwidth per beam group: 8.75 MHz (~47 PRB)");
     }
   else
     {
-      WriteResult ("  Nominal total beam bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("  Nominal total PRB baseline: 175 PRB (7 beams x 25 PRB)");
+      WriteResult ("  Total bandwidth: 35 MHz (aggregated)");
       WriteResult ("  Bandwidth per beam: 5 MHz (25 PRB)");
     }
 
@@ -424,7 +383,7 @@ int main (int argc, char *argv[])
   // =========================================================================
   NS_LOG_INFO ("Step 4: Setting up EPC and NR Helper...");
 
-  Ptr<PointToPointEpcHelper> epcHelper = CreateObject<PointToPointEpcHelper> ();
+  Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper> ();
   Ptr<NrHelper> nrHelper = CreateObject<NrHelper> ();
   nrHelper->SetEpcHelper (epcHelper);
 
@@ -454,10 +413,10 @@ int main (int argc, char *argv[])
   if (reuseMode == 4)
     {
       beamFreqConfig = {
-        {1, 2172.5e6, 5e6, 45230, 1}, {2, 2177.5e6, 5e6, 45240, 2},
-        {3, 2182.5e6, 5e6, 45250, 3},  {4, 2187.5e6, 5e6, 45260, 4},
-        {5, 2172.5e6, 5e6, 45230, 1},  {6, 2177.5e6, 5e6, 45240, 2},
-        {7, 2182.5e6, 5e6, 45250, 3}
+        {1, 2175.0e6, 8.75e6, 45240, 1}, {2, 2180.0e6, 8.75e6, 45260, 2},
+        {3, 2185.0e6, 8.75e6, 45280, 3},  {4, 2190.0e6, 8.75e6, 45300, 4},
+        {5, 2175.0e6, 8.75e6, 45240, 1},  {6, 2180.0e6, 8.75e6, 45260, 2},
+        {7, 2185.0e6, 8.75e6, 45280, 3}
       };
     }
   else
@@ -475,7 +434,7 @@ int main (int argc, char *argv[])
 
   // 创建单个操作频带来支持所有 UE
   CcBwpCreator ccBwpCreator;
-  // 使用 35 MHz 总名义带宽覆盖 7 个 5 MHz 波束，numerology 1 (30kHz)
+  // 使用 35 MHz 带宽和 numerology 1 (30kHz)
   CcBwpCreator::SimpleOperationBandConf bandConf (2187.5e6, 35e6, 1, BandwidthPartInfo::UMa);
   OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc (bandConf);
 
@@ -499,11 +458,12 @@ int main (int argc, char *argv[])
   for (auto it = satDevices.Begin (); it != satDevices.End (); ++it)
     {
       Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (*it);
-      gnb->UpdateConfig ();
-      // 设置 numerology (0=15kHz, 1=30kHz, 2=60kHz, etc.)
-      gnb->GetPhy (0)->SetAttribute ("Numerology", UintegerValue (1));
+      // 先设置 numerology，再 UpdateConfig，否则 gNB 会按默认 15kHz
+      // 先计算出 186 RB，而 UE 按 30kHz 得到 93 RB，最终在接收侧越界。
+      gnb->GetPhy (0)->SetNumerology (1);
       // 设置发射功率
       gnb->GetPhy (0)->SetTxPower (20.0);
+      gnb->UpdateConfig ();
     }
 
   // =========================================================================
@@ -523,11 +483,11 @@ int main (int argc, char *argv[])
   for (auto it = gwDevices.Begin (); it != gwDevices.End (); ++it)
     {
       Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (*it);
-      gnb->UpdateConfig ();
-      // 设置 numerology
-      gnb->GetPhy (0)->SetAttribute ("Numerology", UintegerValue (1));
+      // 与卫星 gNB 保持一致，必须在 UpdateConfig 前设置 numerology。
+      gnb->GetPhy (0)->SetNumerology (1);
       // 设置发射功率
       gnb->GetPhy (0)->SetTxPower (20.0);
+      gnb->UpdateConfig ();
     }
 
   // =========================================================================
@@ -538,7 +498,8 @@ int main (int argc, char *argv[])
   Ptr<SatUserHelper> userHelper = CreateObject<SatUserHelper> ();
   userHelper->SetNrHelper (nrHelper);
   userHelper->SetBeams (beams);
-  userHelper->SetConsumerShare (0.5);
+  userHelper->SetConsumerShare (consumerShare);
+  userHelper->SetPortableHttpShare (portableHttpShare);
 
   NodeContainer ueNodes = userHelper->CreateUsersInMultipleBeams (numUes);
   NS_LOG_INFO ("Created " << ueNodes.GetN () << " UE nodes across " << beams.size () << " beams");
@@ -579,37 +540,64 @@ int main (int argc, char *argv[])
     }
 
   // 附着 UE 到最近的 gNB (延迟到仿真开始后，确保 RRC 连接可以建立)
-  // 只附着到网关，因为网关是实际与核心网连接的设备
-  // 使用交错延迟来避免 RRC 状态冲突
-  // 注意：GEO RTT=630ms，附着过程需要 ~3*RTT=1.89s 完成
-  // Bearer 激活延迟设为 6.0s，确保在 RRC 连接完全完成后再激活
-  // 数据传输延迟设为 7.0s，确保 Bearer 激活完成后再开始发送数据
-  double bearerDelay = 6.0; // Bearer 激活延迟（足够等待 GEO RRC 连接完成）
-  double dataStartDelay = 7.0; // 数据传输开始延迟
+  // 只附着到网关，因为网关是实际与核心网连接的设备。
+  //
+  // 关键修复：
+  // 之前 bearer 激活和业务启动时刻被固定写死为 6s / 7s。对于交错附着的后续 UE，
+  // HTTP client 会在用户面尚未就绪时尝试 Connect()，然后长期卡在 CONNECTING，
+  // 最终导致系统场景下 HTTP 统计为 0。
+  //
+  // 现在把时序改成：
+  //   attachStart(UE_i) = attachStartBase + i * attachStagger
+  //   dataStartDelay    = last attach start + attachCompletionBudget + dataStartMargin
+  //
+  // 注意：AttachToClosestEnb() 本身已经通过 EPC helper 激活了默认 bearer。
+  // 如果在仿真运行时再额外调用 ActivateDedicatedEpsBearer()，会触发 UE NAS 的 fatal：
+  // “the necessary NAS signaling to activate a bearer after the initial context has
+  // already been setup is not implemented”。
+  //
+  // 业务相关的 dedicated bearer 需要像 NR/LTE 示例那样，在仿真开始前预注册；UE NAS
+  // 会在附着建立初始上下文时一起激活这些 bearer。后面安装应用时会根据具体业务再追加。
+  //
+  // 这样可以保证所有 UE 在统一启动应用前，至少已经有机会完成 GEO 附着并建立默认 bearer。
+  const double geoRttSeconds = 0.63;
+  const double attachStartBase = 2.0;
+  const double attachStagger = 0.5;
+  // GEO 场景下，AttachToClosestEnb() 返回并不代表用户面已经对应用层 TCP/HTTP
+  // 完全可用。过早启动应用会让首次 Connect() 撞在 bearer / routing / RRC
+  // 尚未彻底 ready 的窗口里，HTTP client 会长期停留在 CONNECTING。
+  //
+  // 单 UE 最小场景对这个时序尤其敏感，因此这里留出一个更保守的附着完成预算，
+  // 让所有 UE 的默认 bearer、预注册 dedicated bearer 和用户面转发路径先稳定下来，
+  // 再统一启动业务。
+  const double attachCompletionBudget = std::max (8.0, 3.0 * geoRttSeconds);
+  const double dataStartMargin = geoRttSeconds + 0.5;
+  const double lastAttachStartTime =
+      attachStartBase + (ueDevices.GetN () > 0 ? (ueDevices.GetN () - 1) * attachStagger : 0.0);
+  const double dataStartDelay = lastAttachStartTime + attachCompletionBudget + dataStartMargin;
   for (uint32_t i = 0; i < ueDevices.GetN (); ++i)
     {
       uint32_t ueIdx = i;
-      Simulator::Schedule (Seconds (2.0 + ueIdx * 0.5), [&, ueIdx]() {
+      const double attachTime = attachStartBase + ueIdx * attachStagger;
+      Simulator::Schedule (Seconds (attachTime), [&, ueIdx]() {
         NetDeviceContainer ueDev;
         ueDev.Add (ueDevices.Get (ueIdx));
         nrHelper->AttachToClosestEnb (ueDev, gwDevices);
-
-        // Bearer 激活延迟足够等待 GEO RTT (630ms) 完成 RRC 连接建立
-        Simulator::Schedule (Seconds (bearerDelay + ueIdx * 0.05), [&, ueIdx]() {
-          Ptr<NetDevice> ueDevice = ueDevices.Get (ueIdx);
-          Ptr<NrUeNetDevice> ueNetDev = DynamicCast<NrUeNetDevice> (ueDevice);
-          if (ueNetDev)
-            {
-              epcHelper->ActivateEpsBearer (ueDevice,
-                                           ueNetDev->GetImsi (),
-                                           EpcTft::Default (),
-                                           EpsBearer (EpsBearer::NGBR_VIDEO_TCP_DEFAULT));
-              NS_LOG_INFO ("Activated bearer for UE " << ueIdx << " with IMSI " << ueNetDev->GetImsi ());
-            }
-        });
       });
     }
-  NS_LOG_INFO ("UEs attachment and bearer activation scheduled (staggered from t=2.0s, bearer at t=" << bearerDelay << "s, data at t=" << dataStartDelay << "s)");
+  NS_LOG_INFO ("UE attachment scheduled"
+               << " (attachBase=" << attachStartBase << "s"
+               << ", attachStagger=" << attachStagger << "s"
+               << ", attachBudget=" << attachCompletionBudget << "s"
+               << ", lastAttach~t=" << lastAttachStartTime << "s"
+               << ", data start t=" << dataStartDelay << "s)");
+
+  if (simTime <= dataStartDelay)
+    {
+      NS_LOG_WARN ("Simulation time " << simTime
+                   << "s is not long enough to observe user traffic after bearer activation."
+                   << " Recommended simTime > " << (dataStartDelay + 1.0) << "s");
+    }
 
   if (enableLogs)
     {
@@ -635,6 +623,10 @@ int main (int argc, char *argv[])
   p2p.SetDeviceAttribute ("DataRate", StringValue ("100Gbps"));
   p2p.SetChannelAttribute ("Delay", StringValue ("1ms"));
   NetDeviceContainer internetDevices = p2p.Install (pgw, remoteHostContainer.Get (0));
+  if (enableLogs)
+    {
+      p2p.EnablePcapAll ("ntn-system-pgw-remote", true);
+    }
 
   // 分配 IP 地址
   Ipv4AddressHelper ipv4;
@@ -645,8 +637,16 @@ int main (int argc, char *argv[])
   Ipv4Address remoteAddress = internetInterfaces.GetAddress (1);
   NS_LOG_INFO ("  Remote address (remote host): " << remoteAddress);
 
+  // 远端主机需要一条到 EPC 分配的 UE 网段的回程路由，否则业务流量无法返回 UE。
+  Ptr<Ipv4StaticRouting> remoteHostRouting =
+      ipv4RoutingHelper.GetStaticRouting (remoteHostContainer.Get (0)->GetObject<Ipv4> ());
+  remoteHostRouting->AddNetworkRouteTo (Ipv4Address ("7.0.0.0"),
+                                        Ipv4Mask ("255.0.0.0"),
+                                        1);
+
   Ptr<SatTrafficGenerator> trafficGen = CreateObject<SatTrafficGenerator> ();
   trafficGen->SetGeoRtt (MilliSeconds (630));
+  trafficGen->SetTcpCongestionTypeId (TcpHybla::GetTypeId ());
   trafficGen->SetApplicationWindow (Seconds (dataStartDelay), Seconds (simTime));
   trafficGen->InstallSink (ueNodes);
 
@@ -655,6 +655,9 @@ int main (int argc, char *argv[])
   uint32_t ftpFlowCount = 0;
   uint32_t httpFlowCount = 0;
   uint32_t voipFlowCount = 0;
+  constexpr uint16_t kFtpPort = 20;
+  constexpr uint16_t kHttpPort = 80;
+  constexpr uint16_t kVoipPort = 5000;
   std::map<uint32_t, bool> ueIsConsumerPhone;
   std::map<uint32_t, bool> ueHasVoipFlow;
   std::map<uint32_t, bool> ueHasHttpFlow;
@@ -671,46 +674,72 @@ int main (int argc, char *argv[])
       // - portable terminals carry pure data service
       Ptr<SatTerminalProfile> profile = ue->GetObject<SatTerminalProfile> ();
       NS_ABORT_MSG_IF (profile == nullptr, "UE node is missing SatTerminalProfile");
-      bool isConsumerPhone = profile->GetTerminalType () == UT_CONSUMER;
-      ueIsConsumerPhone[i] = isConsumerPhone;
-
       NodeContainer remoteHostNode (remoteHostContainer.Get (0));
-      if (isConsumerPhone)
+      InstalledTerminalTraffic installed =
+          trafficGen->InstallProfileTraffic (remoteHostNode, ue, ueAddress, false);
+
+      ueIsConsumerPhone[i] = installed.isConsumerPhone;
+      ueHasVoipFlow[i] = installed.hasVoip;
+      ueHasHttpFlow[i] = installed.hasHttp;
+      ueHasFtpFlow[i] = installed.hasFtp;
+
+      if (installed.isConsumerPhone)
         {
           consumerPhoneCount++;
-          voipFlowCount++;
-          httpFlowCount++;
-          ueHasVoipFlow[i] = true;
-          ueHasHttpFlow[i] = true;
-          ueHasFtpFlow[i] = false;
-          trafficGen->InstallVoipRtp (remoteHostNode, ueAddress, false);
-          trafficGen->InstallHttp (remoteHostNode, ueAddress, false);
-          NS_LOG_INFO ("  UE " << i << " profile=UT_CONSUMER beam=" << profile->GetBeamId ()
-                       << " -> VoIP/RTP + HTTP to " << ueAddress);
         }
       else
         {
           portableTerminalCount++;
-          ueHasVoipFlow[i] = false;
-          if ((portableTerminalCount % 2) == 1)
-            {
-              ftpFlowCount++;
-              ueHasFtpFlow[i] = true;
-              ueHasHttpFlow[i] = false;
-              trafficGen->InstallFtp (remoteHostNode, ueAddress, false);
-              NS_LOG_INFO ("  UE " << i << " profile=UT_PORTABLE beam=" << profile->GetBeamId ()
-                           << " -> FTP to " << ueAddress);
-            }
-          else
-            {
-              httpFlowCount++;
-              ueHasFtpFlow[i] = false;
-              ueHasHttpFlow[i] = true;
-              trafficGen->InstallHttp (remoteHostNode, ueAddress, false);
-              NS_LOG_INFO ("  UE " << i << " profile=UT_PORTABLE beam=" << profile->GetBeamId ()
-                           << " -> HTTP to " << ueAddress);
-            }
         }
+
+      voipFlowCount += installed.hasVoip ? 1 : 0;
+      httpFlowCount += installed.hasHttp ? 1 : 0;
+      ftpFlowCount += installed.hasFtp ? 1 : 0;
+
+      // 在仿真开始前为业务预注册 dedicated bearer，避免 VoIP 与 HTTP/FTP 长期共用
+      // 默认 bearer 队列，导致 GEO 慢链路下小量 TCP 控制报文长期被饿死。
+      Ptr<NetDevice> ueDevice = ueDevices.Get (i);
+      if (installed.hasVoip)
+        {
+          Ptr<EpcTft> voipTft = Create<EpcTft> ();
+          EpcTft::PacketFilter voipPf;
+          voipPf.direction = EpcTft::DOWNLINK;
+          voipPf.localPortStart = kVoipPort;
+          voipPf.localPortEnd = kVoipPort;
+          voipTft->Add (voipPf);
+          nrHelper->ActivateDedicatedEpsBearer (ueDevice,
+                                                EpsBearer (EpsBearer::GBR_CONV_VOICE),
+                                                voipTft);
+        }
+
+      if (installed.hasHttp)
+        {
+          Ptr<EpcTft> httpTft = Create<EpcTft> ();
+          EpcTft::PacketFilter httpPf;
+          httpPf.direction = EpcTft::BIDIRECTIONAL;
+          httpPf.remotePortStart = kHttpPort;
+          httpPf.remotePortEnd = kHttpPort;
+          httpTft->Add (httpPf);
+          nrHelper->ActivateDedicatedEpsBearer (ueDevice,
+                                                EpsBearer (EpsBearer::NGBR_VIDEO_TCP_DEFAULT),
+                                                httpTft);
+        }
+
+      if (installed.hasFtp)
+        {
+          Ptr<EpcTft> ftpTft = Create<EpcTft> ();
+          EpcTft::PacketFilter ftpPf;
+          ftpPf.direction = EpcTft::DOWNLINK;
+          ftpPf.localPortStart = kFtpPort;
+          ftpPf.localPortEnd = kFtpPort;
+          ftpTft->Add (ftpPf);
+          nrHelper->ActivateDedicatedEpsBearer (ueDevice,
+                                                EpsBearer (EpsBearer::NGBR_VIDEO_TCP_DEFAULT),
+                                                ftpTft);
+        }
+
+      NS_LOG_INFO ("  UE " << i << " profile=" << profile->DescribeTrafficProfile ()
+                   << " beam=" << profile->GetBeamId () << " -> " << ueAddress);
     }
 
   // =========================================================================
@@ -747,7 +776,23 @@ int main (int argc, char *argv[])
       Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (*it);
       if (gnb)
         {
-          Ptr<NrGnbMac> gnbMac = gnb->GetMac (0);
+          if (gnb->GetCcMapSize () == 0)
+            {
+              NS_LOG_WARN ("  Skipping HARQ trace connect: gNB has empty CC map");
+              continue;
+            }
+
+          Ptr<NrGnbMac> gnbMac;
+          try
+            {
+              gnbMac = gnb->GetMac (0);
+            }
+          catch (const std::out_of_range&)
+            {
+              NS_LOG_WARN ("  Skipping HARQ trace connect: gNB BWP index 0 is unavailable");
+              continue;
+            }
+
           if (gnbMac)
             {
               bool ok = gnbMac->TraceConnectWithoutContext (
@@ -949,7 +994,7 @@ int main (int argc, char *argv[])
   if (systemThroughput <= 0 && connectedUes > 0)
     {
       // 7-color复用模式：每波束5MHz带宽，每个UE平均分配
-      double bandwidthPerUeHz = 5e6 / 10.0; // 每波束5MHz，按10个活跃UE均分的粗略估算
+      double bandwidthPerUeHz = (reuseMode == 4) ? 8.75e6 / 10.0 : 5e6 / 10.0; // ~875kHz or ~500kHz per UE
       double spectralEfficiency = 3.0; // Assume 3 bps/Hz for typical NTN channel
       double theoreticalRateMbps = (bandwidthPerUeHz * spectralEfficiency) / 1e6;
 
@@ -1006,10 +1051,10 @@ int main (int argc, char *argv[])
 
   for (uint32_t i = 0; i < ueNodes.GetN (); ++i)
     {
-      auto rxBytesByPort = CollectPacketSinkBytesByPort (ueNodes.Get (i));
-      const uint64_t voipBytes = rxBytesByPort[5000];
-      const uint64_t ftpBytes = rxBytesByPort[20];
-      const uint64_t httpBytes = rxBytesByPort[80];
+      const uint32_t nodeId = ueNodes.Get (i)->GetId ();
+      const uint64_t voipBytes = trafficGen->GetNodeReceivedBytes (nodeId, TRAFFIC_VOIP_RTP);
+      const uint64_t ftpBytes = trafficGen->GetNodeReceivedBytes (nodeId, TRAFFIC_FTP);
+      const uint64_t httpBytes = trafficGen->GetNodeReceivedBytes (nodeId, TRAFFIC_HTTP);
       const uint64_t totalBytes = voipBytes + ftpBytes + httpBytes;
 
       if (ueIsConsumerPhone[i])

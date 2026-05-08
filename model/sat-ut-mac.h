@@ -120,7 +120,8 @@ public:
     void SetNumPreambles (uint32_t n);
     uint32_t GetNumPreambles () const;
 
-    // 设置 Msg3 发送回调 (上送到 GeoBeamScheduler::ReceiveMsg3Packet)
+    // 设置 Msg3 发送回调 (兼容请求对象与 MAC PDU 两种路径)
+    void SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback);
     void SetMsg3Callback (Callback<void, Ptr<Packet>> callback);
 
     // 随机接入完成 (成功/失败) 回调, 便于测试统计
@@ -201,7 +202,8 @@ private:
     EventId m_contentionResolutionTimer;       // 竞争解决定时器 (等 Msg4)
     EventId m_msg3TxEvent;                     // Msg3 延迟发送事件
 
-    Callback<void, Ptr<Packet>>            m_msg3Callback;
+    Callback<void, const RrcSetupRequest&>  m_msg3RequestCallback;
+    Callback<void, Ptr<Packet>>             m_msg3Callback;
     Callback<void, RaResult>                m_raCompleteCallback;
 
     // ---------- 接入过程统计计数器 ----------

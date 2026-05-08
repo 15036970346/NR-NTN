@@ -586,14 +586,24 @@ void SatUtMac::DeliverPendingMsg3 ()
         return;
       }
 
+    bool delivered = false;
     if (!m_msg3Callback.IsNull () && m_pendingMsg3Packet != nullptr)
       {
-        NS_LOG_INFO ("[Msg3] PUSCH 已到达 gNB, 开始递交 RRCSetupRequest: TC-RNTI=0x"
+        NS_LOG_INFO ("[Msg3] PUSCH 已到达 gNB, 开始递交 RRCSetupRequest (Packet): TC-RNTI=0x"
                      << std::hex << m_pendingMsg3Request.tcRnti
                      << " UE-Id=0x" << m_pendingMsg3Request.ueIdentity << std::dec);
         m_msg3Callback (m_pendingMsg3Packet->Copy ());
+        delivered = true;
       }
-    else
+    if (!m_msg3RequestCallback.IsNull ())
+      {
+        NS_LOG_INFO ("[Msg3] PUSCH 已到达 gNB, 开始递交 RRCSetupRequest (Request): TC-RNTI=0x"
+                     << std::hex << m_pendingMsg3Request.tcRnti
+                     << " UE-Id=0x" << m_pendingMsg3Request.ueIdentity << std::dec);
+        m_msg3RequestCallback (m_pendingMsg3Request);
+        delivered = true;
+      }
+    if (!delivered)
       {
         NS_LOG_WARN ("[Msg3] msg3 callback 未设置, 无法向 gNB 递交 Msg3!");
       }
@@ -779,6 +789,11 @@ void SatUtMac::SetNumPreambles (uint32_t n)
 uint32_t SatUtMac::GetNumPreambles () const
 {
     return m_numPreambles;
+}
+
+void SatUtMac::SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback)
+{
+    m_msg3RequestCallback = callback;
 }
 
 void SatUtMac::SetMsg3Callback (Callback<void, Ptr<Packet>> callback)

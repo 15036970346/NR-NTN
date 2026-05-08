@@ -331,6 +331,7 @@ struct MsgB {
     uint16_t tcRnti;              // 临时 C-RNTI (仅 FALLBACK_RAR 有效)
     uint32_t ulGrantRbs;          // Msg3 的 UL Grant PRB 数 (仅 FALLBACK_RAR 有效)
     uint8_t  ulGrantMcs;          // Msg3 的 MCS (仅 FALLBACK_RAR 有效)
+    double   ulGrantTxPowerDbm;   // Msg3 的目标发射功率 (仅 FALLBACK_RAR 有效)
     // 公共字段
     Time     timingAdvance;       // 定时提前量 (GEO ~300 ms)
     Time     transmissionTime;    // 发送时间戳

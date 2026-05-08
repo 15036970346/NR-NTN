@@ -172,3 +172,15 @@ build_lib_example(
     SOURCE_FILES examples/ntn-layer-stats-demo.cc
     LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
 )
+
+build_lib_example(
+    NAME resource-manager-validation
+    SOURCE_FILES examples/resource-manager-validation.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+build_lib_example(
+    NAME traffic-model-validation
+    SOURCE_FILES examples/traffic-model-validation.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)

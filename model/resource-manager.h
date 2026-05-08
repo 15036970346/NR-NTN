@@ -1,6 +1,6 @@
 /*
  * 文件路径：contrib/geo-sat/model/resource-manager.h
- * 功能：卫星无线资源管理模块 (RRM) - 统一到 35MHz / 175 PRB / 单波束25 PRB 口径
+ * 功能：卫星无线资源管理模块 (RRM) - 遵循《NR NTN 3.23》S频段 35MHz 专版
  */
 #ifndef RESOURCE_MANAGER_H
 #define RESOURCE_MANAGER_H
@@ -12,7 +12,7 @@ namespace ns3 {
 
 // 终端类型枚举 (便携式 / 消费级)
 enum UtType {
-    UT_PORTABLE,  // 便携式终端 (33 dBW / 63 dBm EIRP，上行受限 50 PRB)
+    UT_PORTABLE,  // 便携式终端 (33 dBW / 63 dBm EIRP)
     UT_CONSUMER   // 消费级手机 (20 dBW / 50 dBm EIRP)
 };
 
@@ -38,13 +38,13 @@ public:
 
   // =================================================================
   // 功能 1：AllocateSpectrum (物理边界审查)
-  // 统一口径：单波束调度容量按 25 PRB 建模
-  // qyh 扩展：beam 级预算跟踪 (35MHz / 7色时每波束25 PRB)
+  // 当前项目配置：35MHz 带宽下，总RB=175；7色复用时每波束 DL/UL 预算均为25 RB。
+  // 资源管理的最小粒度是 beam；每个调度轮次都需要先重置对应 beam 的预算。
   // =================================================================
-  uint32_t AllocateSpectrum (UtType utType, uint32_t requestedRbs, bool isUplink);
   void ResetBeamAllocation (uint32_t beamId, bool isUplink);
   void ResetAllBeamAllocations (void);
   uint32_t GetRemainingRbs (uint32_t beamId, bool isUplink) const;
+  uint32_t AllocateSpectrum (uint32_t beamId, uint32_t requestedRbs, bool isUplink);
   uint32_t GetMaxPowerLimitedUlRbs (UtType utType, double pathLossDb) const;
 
   // =================================================================

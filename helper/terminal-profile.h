@@ -13,7 +13,6 @@ enum SatDataServiceType {
   SAT_DATA_FTP
 };
 
-
 /**
  * \brief Lightweight per-UE profile attached directly to each node.
  *

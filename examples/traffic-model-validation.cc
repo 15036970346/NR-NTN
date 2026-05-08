@@ -9,6 +9,7 @@
 #include "ns3/uinteger.h"
 
 #include "ns3/traffic-models.h"
+#include "ns3/terminal-profile.h"
 
 #include <iostream>
 
@@ -111,6 +112,48 @@ main (int argc, char* argv[])
     ExpectTrue (ctx, gLastQueueFeedback == 92.5, "Queue utilization callback keeps original value");
   }
 
+  {
+    BasicTopology topo = CreateBasicTopology (10);
+    topo.tg = CreateObject<SatTrafficGenerator> ();
+    topo.tg->SetApplicationWindow (Seconds (1.0), Seconds (3.0));
+    topo.tg->InstallSink (topo.nodes);
+
+    Ptr<SatTerminalProfile> profile = CreateObject<SatTerminalProfile> ();
+    profile->SetTerminalType (UT_CONSUMER);
+    profile->SetVoiceEnabled (true);
+    profile->SetDataServiceType (SAT_DATA_HTTP);
+    topo.nodes.Get (1)->AggregateObject (profile);
+
+    InstalledTerminalTraffic installed =
+        topo.tg->InstallProfileTraffic (NodeContainer (topo.nodes.Get (0)),
+                                        topo.nodes.Get (1),
+                                        topo.interfaces.GetAddress (1),
+                                        false);
+
+    Simulator::Stop (Seconds (4.0));
+    Simulator::Run ();
+
+    ExpectTrue (ctx, installed.isConsumerPhone, "Consumer profile is detected correctly");
+    ExpectTrue (ctx, installed.hasVoip && installed.hasHttp && !installed.hasFtp,
+                "Consumer profile installs VoIP + HTTP only");
+    ExpectTrue (ctx,
+                topo.tg->GetNodeReceivedBytes (topo.nodes.Get (1)->GetId (), TRAFFIC_VOIP_RTP) > 0,
+                "Consumer UE receives downlink VoIP bytes");
+    ExpectTrue (ctx,
+                topo.tg->GetNodeReceivedBytes (topo.nodes.Get (0)->GetId (), TRAFFIC_VOIP_RTP) > 0,
+                "Consumer profile also produces uplink VoIP bytes");
+    const TrafficModelStats profileVoipStats = topo.tg->GetStats (TRAFFIC_VOIP_RTP);
+    ExpectTrue (ctx,
+                profileVoipStats.totalPacketsGenerated >= 70 &&
+                    profileVoipStats.totalPacketsGenerated < 150,
+                "Consumer profile installs bidirectional VoIP with turn-taking and VAD/DTX suppression");
+    ExpectTrue (ctx,
+                topo.tg->GetNodeReceivedBytes (topo.nodes.Get (1)->GetId (), TRAFFIC_HTTP) > 0,
+                "Consumer UE receives HTTP bytes under the mixed profile");
+
+    Simulator::Destroy ();
+  }
+
   if (mode == "voip")
     {
       BasicTopology topo = CreateBasicTopology (0);
@@ -124,16 +167,29 @@ main (int argc, char* argv[])
       Simulator::Stop (Seconds (4.0));
       Simulator::Run ();
 
-      const uint32_t nodeId = topo.nodes.Get (1)->GetId ();
-      const uint64_t rxBytes = topo.tg->GetNodeReceivedBytes (nodeId, TRAFFIC_VOIP_RTP);
+      const uint32_t calleeNodeId = topo.nodes.Get (1)->GetId ();
+      const uint32_t callerNodeId = topo.nodes.Get (0)->GetId ();
+      const uint64_t rxBytesDown = topo.tg->GetNodeReceivedBytes (calleeNodeId, TRAFFIC_VOIP_RTP);
+      const uint64_t rxBytesUp = topo.tg->GetNodeReceivedBytes (callerNodeId, TRAFFIC_VOIP_RTP);
       const TrafficModelStats typeStats = topo.tg->GetStats (TRAFFIC_VOIP_RTP);
-      ExpectTrue (ctx, rxBytes > 0, "VoIP sink receives bytes");
+      ExpectTrue (ctx, rxBytesDown > 0, "VoIP sink receives bytes");
       ExpectTrue (ctx,
-                  typeStats.usefulBytesDelivered == rxBytes,
-                  "VoIP per-type delivered stats equal received bytes");
+                  rxBytesUp > 0,
+                  "VoIP caller also receives reverse-direction bytes");
       ExpectTrue (ctx,
-                  topo.tg->GetStats ().usefulBytesDelivered >= rxBytes,
+                  typeStats.usefulBytesDelivered == (rxBytesDown + rxBytesUp),
+                  "VoIP per-type delivered stats equal bidirectional received bytes");
+      ExpectTrue (ctx,
+                  topo.tg->GetStats ().usefulBytesDelivered >= (rxBytesDown + rxBytesUp),
                   "VoIP contributes to aggregate delivered stats");
+      ExpectTrue (ctx,
+                  typeStats.totalPacketsGenerated >= 70 &&
+                      typeStats.totalPacketsGenerated < 150,
+                  "VoIP session alternates active speech and suppresses packets during silence");
+      ExpectTrue (ctx,
+                  typeStats.avgGenerateIntervalUs > 10000.0 &&
+                      typeStats.avgGenerateIntervalUs < 80000.0,
+                  "VoIP bidirectional session keeps a turn-taking speech-like aggregate packet cadence");
     }
   else if (mode == "ftp")
     {
@@ -185,32 +241,70 @@ main (int argc, char* argv[])
     }
   else if (mode == "http")
     {
-      BasicTopology topo = CreateBasicTopology (2);
-      topo.tg = CreateObject<SatTrafficGenerator> ();
-      topo.tg->SetApplicationWindow (Seconds (1.0), Seconds (5.0));
-      topo.tg->InstallSink (topo.nodes);
-      topo.tg->InstallHttpDownload (NodeContainer (topo.nodes.Get (1)),
-                                    topo.interfaces.GetAddress (0));
+      {
+        BasicTopology topo = CreateBasicTopology (2);
+        topo.tg = CreateObject<SatTrafficGenerator> ();
+        topo.tg->SetApplicationWindow (Seconds (1.0), Seconds (5.0));
+        topo.tg->InstallSink (topo.nodes);
+        topo.tg->InstallHttpDownload (NodeContainer (topo.nodes.Get (1)),
+                                      topo.interfaces.GetAddress (0));
 
-      Simulator::Stop (Seconds (6.0));
-      Simulator::Run ();
+        Simulator::Stop (Seconds (6.0));
+        Simulator::Run ();
 
-      const uint32_t nodeId = topo.nodes.Get (0)->GetId ();
-      const uint64_t rxBytes = topo.tg->GetNodeReceivedBytes (nodeId, TRAFFIC_HTTP);
-      const TrafficModelStats typeStats = topo.tg->GetStats (TRAFFIC_HTTP);
-      Ptr<TcpL4Protocol> clientTcp = topo.nodes.Get (0)->GetObject<TcpL4Protocol> ();
-      TypeIdValue clientTcpType;
-      clientTcp->GetAttribute ("SocketType", clientTcpType);
-      ExpectTrue (ctx, rxBytes > 0, "HTTP client receives bytes");
-      ExpectTrue (ctx,
-                  typeStats.usefulBytesDelivered == rxBytes,
-                  "HTTP per-type delivered stats equal received bytes");
-      ExpectTrue (ctx,
-                  typeStats.totalBytesGenerated >= rxBytes,
-                  "HTTP generated bytes cover delivered bytes");
-      ExpectTrue (ctx,
-                  clientTcpType.Get () == TcpHybla::GetTypeId (),
-                  "HTTP client uses GEO-oriented TCP Hybla");
+        const uint32_t nodeId = topo.nodes.Get (0)->GetId ();
+        const uint64_t rxBytes = topo.tg->GetNodeReceivedBytes (nodeId, TRAFFIC_HTTP);
+        const TrafficModelStats typeStats = topo.tg->GetStats (TRAFFIC_HTTP);
+        Ptr<TcpL4Protocol> clientTcp = topo.nodes.Get (0)->GetObject<TcpL4Protocol> ();
+        TypeIdValue clientTcpType;
+        clientTcp->GetAttribute ("SocketType", clientTcpType);
+        ExpectTrue (ctx, rxBytes > 0, "HTTP download client receives bytes");
+        ExpectTrue (ctx,
+                    typeStats.usefulBytesDelivered == rxBytes,
+                    "HTTP download per-type delivered stats equal received bytes");
+        ExpectTrue (ctx,
+                    typeStats.totalBytesGenerated >= rxBytes,
+                    "HTTP download generated bytes cover delivered bytes");
+        ExpectTrue (ctx,
+                    clientTcpType.Get () == TcpHybla::GetTypeId (),
+                    "HTTP download client uses GEO-oriented TCP Hybla");
+
+        Simulator::Destroy ();
+      }
+
+      {
+        BasicTopology topo = CreateBasicTopology (3);
+        topo.tg = CreateObject<SatTrafficGenerator> ();
+        topo.tg->SetApplicationWindow (Seconds (1.0), Seconds (5.0));
+        topo.tg->InstallSink (topo.nodes);
+        topo.tg->InstallHttp (NodeContainer (topo.nodes.Get (0)),
+                              topo.interfaces.GetAddress (1),
+                              true);
+
+        Simulator::Stop (Seconds (6.0));
+        Simulator::Run ();
+
+        const uint32_t remoteClientNodeId = topo.nodes.Get (0)->GetId ();
+        const uint32_t ueServerNodeId = topo.nodes.Get (1)->GetId ();
+        const uint64_t rxBytes = topo.tg->GetNodeReceivedBytes (remoteClientNodeId, TRAFFIC_HTTP);
+        const TrafficModelStats typeStats = topo.tg->GetStats (TRAFFIC_HTTP);
+        Ptr<TcpL4Protocol> clientTcp = topo.nodes.Get (0)->GetObject<TcpL4Protocol> ();
+        TypeIdValue clientTcpType;
+        clientTcp->GetAttribute ("SocketType", clientTcpType);
+        ExpectTrue (ctx, rxBytes > 0, "HTTP upload requester receives uploaded object bytes");
+        ExpectTrue (ctx,
+                    topo.tg->GetNodeReceivedBytes (ueServerNodeId, TRAFFIC_HTTP) == 0,
+                    "HTTP upload useful payload is not mis-attributed to the UE server");
+        ExpectTrue (ctx,
+                    typeStats.usefulBytesDelivered == rxBytes,
+                    "HTTP upload per-type delivered stats equal remote received bytes");
+        ExpectTrue (ctx,
+                    typeStats.totalBytesGenerated >= rxBytes,
+                    "HTTP upload generated bytes cover delivered bytes");
+        ExpectTrue (ctx,
+                    clientTcpType.Get () == TcpHybla::GetTypeId (),
+                    "HTTP upload requester also uses GEO-oriented TCP Hybla");
+      }
     }
   else
     {

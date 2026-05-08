@@ -52,7 +52,8 @@ struct UeContextInfo {
     UtType utType {UT_CONSUMER};
     TrafficType trafficType {TRAFFIC_DATA};
     Vector position {0.0, 0.0, 0.0};
-    double latestCqi {7.0};
+    double latestDlCqi {7.0};
+    double latestUlCqi {7.0};
     uint32_t requiredRbs {1};
     Time connectedTime {Seconds (0)};
 };
@@ -85,7 +86,7 @@ public:
     void UnregisterUeFromBeam (uint16_t rnti, uint32_t beamId);
     
     // 更新UE上下文
-    void UpdateUeContext (uint16_t rnti, double latestCqi, uint32_t requiredRbs);
+    void UpdateUeContext (uint16_t rnti, double latestDlCqi, double latestUlCqi, uint32_t requiredRbs);
 
     // ==================== 波束协调接口 ====================
     
@@ -157,12 +158,11 @@ private:
     std::map<uint16_t, UeContextInfo> m_ueContextMap;
     
     // 配置参数
-    double m_emergencyReservationRatio;  // 应急业务预留比例 (默认20%, xys ratio模式)
-    uint32_t m_emergencyReservedRbs;     // 应急控制默认刚性预留 (默认1 PRB, qyh bucket模式)
+    uint32_t m_emergencyReservedRbs;     // 应急控制默认刚性预留 (默认1 PRB)
     uint32_t m_emergencyBurstCapRbs;     // 应急突发模式上限 (默认3 PRB)
     uint32_t m_voiceReservedRbs;         // 语音业务默认刚性预留 (默认2 PRB)
-    uint32_t m_totalDlRbs;              // 每波束下行可用RB基线 (25)
-    uint32_t m_totalUlRbs;              // 每波束上行可用RB基线 (25)
+    uint32_t m_totalDlRbs;              // 7色复用下每波束下行可用RB (25)
+    uint32_t m_totalUlRbs;              // 7色复用下每波束上行可用RB (25)
     uint32_t m_dlReservedRbs;           // 下行侧为PRACH/控制信道保留的RB
     double m_admissionThreshold;        // 准入阈值 (资源利用率>90%拒绝)
     double m_handoverBenefitThreshold;   // 切换收益阈值

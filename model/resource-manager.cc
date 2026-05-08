@@ -1,6 +1,6 @@
 /*
  * 文件路径：contrib/geo-sat/model/resource-manager.cc
- * 功能：卫星无线资源管理模块实现 (统一 35MHz / 175 PRB / 单波束25 PRB 口径)
+ * 功能：卫星无线资源管理模块实现 
  */
 #include "resource-manager.h"
 #include "ns3/log.h"
@@ -32,7 +32,7 @@ TypeId ResourceManager::GetTypeId (void)
                    MakeUintegerChecker<uint32_t> (1, 275))
     .AddAttribute ("P0NominalPusch",
                    "Target received power P_0 at the satellite gNB (dBm).",
-                   DoubleValue (-90.0),
+                   DoubleValue (-110.0),
                    MakeDoubleAccessor (&ResourceManager::m_p0NominalPusch),
                    MakeDoubleChecker<double> ())
     .AddAttribute ("PathLossCompensationAlpha",
@@ -43,7 +43,7 @@ TypeId ResourceManager::GetTypeId (void)
   return tid;
 }
 
-ResourceManager::ResourceManager ()
+ResourceManager::ResourceManager () 
   : m_dlBeamBudgetRbs (25),
     m_ulBeamBudgetRbs (25),
     m_maxEirpPortable (63.0),   // 对应 33 dBW 的便携式终端发射物理极限
@@ -55,7 +55,7 @@ ResourceManager::ResourceManager ()
 ResourceManager::~ResourceManager () { NS_LOG_FUNCTION (this); }
 
 // =================================================================
-// 物理边界审查 (依据《NR NTN 3.23》核心指标) + beam 预算跟踪
+// 物理边界审查
 // =================================================================
 BeamAllocationUsage&
 ResourceManager::GetOrCreateBeamUsage (uint32_t beamId)
@@ -101,20 +101,36 @@ ResourceManager::GetRemainingRbs (uint32_t beamId, bool isUplink) const
   return (used < budget) ? (budget - used) : 0;
 }
 
-uint32_t ResourceManager::AllocateSpectrum (UtType utType, uint32_t requestedRbs, bool isUplink)
+uint32_t
+ResourceManager::AllocateSpectrum (uint32_t beamId, uint32_t requestedRbs, bool isUplink)
 {
-  NS_LOG_FUNCTION (this << utType << requestedRbs << isUplink);
+  NS_LOG_FUNCTION (this << beamId << requestedRbs << isUplink);
 
-  const uint32_t beamPrbLimit = 25;
+  BeamAllocationUsage& usage = GetOrCreateBeamUsage (beamId);
+  const uint32_t remainingRbs = GetRemainingRbs (beamId, isUplink);
+  const uint32_t approvedRbs = std::min (requestedRbs, remainingRbs);
 
-  // 核心逻辑：用户需求与物理天花板取最小值
-  uint32_t approvedRbs = std::min(requestedRbs, beamPrbLimit);
-
-  NS_LOG_INFO ("RRM Spectrum Review: Requested=" << requestedRbs
-               << " | Direction=" << (isUplink ? "UL" : "DL")
-               << " | Hardware Ceiling=" << beamPrbLimit
-               << " ===> Approved=" << approvedRbs << " RBs");
-
+  if (isUplink) 
+    {
+      usage.ulUsedRbs += approvedRbs;
+      NS_LOG_INFO ("RRM Spectrum Review: Requested=" << requestedRbs
+                    << " | Direction=UL"
+                    << " | Beam=" << beamId
+                    << " | RemainingBefore=" << remainingRbs
+                    << " | UsedAfter=" << usage.ulUsedRbs
+                    << " ===> Approved=" << approvedRbs << " RBs");
+    } 
+  else 
+    {
+      usage.dlUsedRbs += approvedRbs;
+      NS_LOG_INFO ("RRM Spectrum Review: Requested=" << requestedRbs
+                    << " | Direction=DL"
+                    << " | Beam=" << beamId
+                    << " | RemainingBefore=" << remainingRbs
+                    << " | UsedAfter=" << usage.dlUsedRbs
+                    << " ===> Approved=" << approvedRbs << " RBs");
+    }
+               
   return approvedRbs;
 }
 
@@ -149,7 +165,7 @@ double ResourceManager::AdjustUtTxPower (UtType utType, uint32_t allocatedRbs, d
 {
   NS_LOG_FUNCTION (this << utType << allocatedRbs << pathLossDb);
 
-  if (allocatedRbs == 0) return 0.0;
+  if (allocatedRbs == 0) return 0.0; 
 
   double pCmax = (utType == UT_PORTABLE) ? m_maxEirpPortable : m_maxEirpConsumer;
   double bandwidthCompensation = 10.0 * std::log10 (static_cast<double>(allocatedRbs));
@@ -158,7 +174,7 @@ double ResourceManager::AdjustUtTxPower (UtType utType, uint32_t allocatedRbs, d
 
   double actualTxPowerDbm = std::min (pCmax, targetPowerDbm);
 
-  NS_LOG_INFO ("RRM Power Control | Allocated RBs=" << allocatedRbs
+  NS_LOG_INFO ("RRM Power Control | Allocated RBs=" << allocatedRbs 
                << " | PathLoss=" << pathLossDb << " dB"
                << " | P_CMAX=" << pCmax << " dBm"
                << " ===> Final TX Power=" << actualTxPowerDbm << " dBm");

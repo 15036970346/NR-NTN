@@ -22,7 +22,8 @@ namespace ns3 {
 struct SatUeContext {
   uint16_t rnti;
   uint32_t currentBeamId;
-  double latestCqi;
+  double latestDlCqi;
+  double latestUlCqi;
   double latestRsrp;
   uint32_t dlBufferStatus;
   uint32_t ulBufferStatus;
@@ -46,7 +47,8 @@ struct HandoverUeContext {
     uint16_t rnti;
     uint32_t sourceBeamId;
     uint32_t targetBeamId;
-    double latestCqi;
+    double latestDlCqi;
+    double latestUlCqi;
     double latestRsrp;
     uint32_t unsentDlBufferBytes;
     uint32_t unsentUlBufferBytes;
@@ -81,6 +83,8 @@ public:
   void ExecuteHandover (uint16_t rnti, uint32_t targetBeamId);
 
   void UpdateUeCsi (uint16_t rnti, double cqi);
+  void UpdateUeDlCqi (uint16_t rnti, double cqi);
+  void UpdateUeUlCqi (uint16_t rnti, double cqi);
   void UpdateUeDlBufferStatus (uint16_t rnti, uint32_t bufferBytes);
   void UpdateUeUlBufferStatus (uint16_t rnti, uint32_t bufferBytes);
   void UpdateUePosition (uint16_t rnti, Vector position);
@@ -160,6 +164,7 @@ private:
   void RunUlSchedulerForBeam (uint32_t beamId);
   uint32_t GetEffectiveUlDemandBytes (const SatUeContext& ctx) const;
   void RefreshPendingUlGrantEstimate (SatUeContext& ctx) const;
+  double GetSchedulingCqi (const SatUeContext& ctx, bool isUplink) const;
 
   // ---------- 随机接入辅助 ----------
   // 上行到达后延迟入缓冲 (模拟上行传播)
