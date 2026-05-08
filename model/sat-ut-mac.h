@@ -8,8 +8,8 @@
 #include "ns3/traced-callback.h"
 #include "sat-mac-common.h"
 #include "resource-manager.h"
-#include "sat-phy.h"        // 引入物理层
-#include "sat-ut-phy.h"     // 引入终端物理层(含MultipleAccessMode枚举)
+#include "sat-phy.h" // 引入物理层
+#include "sat-ut-phy.h" // 引入终端物理层(含MultipleAccessMode枚举)
 
 namespace ns3 {
 
@@ -110,13 +110,13 @@ public:
     // 设置本 UE 的唯一身份 (40-bit contention resolution ID)
     void SetUeIdentity (uint64_t ueIdentity);
     uint64_t GetUeIdentity () const;
+    void SetUtType (UtType utType);
+    UtType GetUtType () const;
     void SetRnti (uint16_t rnti);
     uint16_t GetActiveRnti () const;
 
     // 配置 RA 定时器和最大重传次数
     void SetRaTimers (Time raResponseWindow, Time contentionResolutionTimer, uint8_t maxAttempts);
-
-    // 设置 preamble 池大小 (默认 63; 双信道可设 128)
     void SetNumPreambles (uint32_t n);
     uint32_t GetNumPreambles () const;
 
@@ -131,10 +131,6 @@ public:
         RA_FAILED_POOR_CHANNEL       // 信道质量不满足门限
     };
     void SetRaCompleteCallback (Callback<void, RaResult> callback);
-
-    // 设置终端类型 (用于信道质量门限选取)
-    void SetUtType (UtType utType);
-    UtType GetUtType () const;
 
     // ==================== 2 步随机接入 (MsgA→MsgB) ====================
     // 统一入口: 根据 m_rachType 分派到 4 步或 2 步
@@ -202,9 +198,12 @@ private:
     EventId m_contentionResolutionTimer;       // 竞争解决定时器 (等 Msg4)
     EventId m_msg3TxEvent;                     // Msg3 延迟发送事件
 
-    Callback<void, const RrcSetupRequest&>  m_msg3RequestCallback;
-    Callback<void, Ptr<Packet>>             m_msg3Callback;
+    Callback<void, Ptr<Packet>>            m_msg3Callback;
+    Callback<void, const RrcSetupRequest&> m_msg3RequestCallback;
     Callback<void, RaResult>                m_raCompleteCallback;
+    bool m_hasPendingMsg3;
+    RrcSetupRequest m_pendingMsg3Request;
+    Ptr<Packet> m_pendingMsg3Packet;
 
     // ---------- 接入过程统计计数器 ----------
     uint32_t m_totalMsg1Sent;             // 累计发送 Msg1/MsgA 次数
@@ -217,10 +216,9 @@ private:
     TracedCallback<uint16_t, int64_t>  m_queueDelayTrace;   // (rnti, delay_ns)
 
     // ---------- 信道质量门限 ----------
-    static constexpr double RSRP_THRESHOLD_DBM    = -94.5;
+    static constexpr double RSRP_THRESHOLD_DBM = -94.5;
     static constexpr double SNR_THRESHOLD_CONSUMER = 1.8;
     static constexpr double SNR_THRESHOLD_PORTABLE = 20.8;
-
     bool CheckChannelQuality () const;
 
     // ---------- 2 步随机接入状态 ----------
@@ -231,11 +229,6 @@ private:
 
     // ---------- MAC 层队列时延追踪 ----------
     Time m_bufferArrivalTime;  // 最早未发送数据的入队时间
-
-    // ---------- Msg3 Packet 缓存 (qyh) ----------
-    bool m_hasPendingMsg3;
-    RrcSetupRequest m_pendingMsg3Request;
-    Ptr<Packet> m_pendingMsg3Packet;
 };
 
 } // namespace ns3

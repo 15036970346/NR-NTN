@@ -976,6 +976,8 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
           variables->SetMainObjectSizeStdDev (6144);
           variables->SetEmbeddedObjectSizeMean (2048);
           variables->SetEmbeddedObjectSizeStdDev (6144);
+          variables->SetUsePoissonEmbeddedObjects (true);
+          variables->SetNumOfEmbeddedObjectsPoissonMean (2.0);
           variables->SetNumOfEmbeddedObjectsMax (8);
           variables->SetReadingTimeMean (Seconds (7));
           variables->SetParsingTimeMean (Seconds (0.15));
@@ -988,6 +990,8 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
       variables->SetMainObjectSizeStdDev (24576);
       variables->SetEmbeddedObjectSizeMean (12288);
       variables->SetEmbeddedObjectSizeStdDev (32768);
+      variables->SetUsePoissonEmbeddedObjects (true);
+      variables->SetNumOfEmbeddedObjectsPoissonMean (6.0);
       variables->SetNumOfEmbeddedObjectsMax (24);
       variables->SetReadingTimeMean (Seconds (10));
       variables->SetParsingTimeMean (Seconds (0.2));
@@ -1001,6 +1005,8 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
       variables->SetMainObjectSizeStdDev (8192);
       variables->SetEmbeddedObjectSizeMean (4096);
       variables->SetEmbeddedObjectSizeStdDev (12288);
+      variables->SetUsePoissonEmbeddedObjects (true);
+      variables->SetNumOfEmbeddedObjectsPoissonMean (4.0);
       variables->SetNumOfEmbeddedObjectsMax (16);
       variables->SetReadingTimeMean (Seconds (5));
       variables->SetParsingTimeMean (Seconds (0.1));
@@ -1012,6 +1018,8 @@ SatTrafficGenerator::ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variable
   variables->SetMainObjectSizeStdDev (32768);
   variables->SetEmbeddedObjectSizeMean (16384);
   variables->SetEmbeddedObjectSizeStdDev (49152);
+  variables->SetUsePoissonEmbeddedObjects (true);
+  variables->SetNumOfEmbeddedObjectsPoissonMean (10.0);
   variables->SetNumOfEmbeddedObjectsMax (64);
   variables->SetReadingTimeMean (Seconds (8));
   variables->SetParsingTimeMean (Seconds (0.2));

@@ -60,7 +60,6 @@ SatUtPhy::SatUtPhy ()
       m_rnti (1),
       m_currentBeamId (1),
       m_lastCalculatedSinr (0.0),
-      m_lastRsrp (-120.0),
       m_bandwidthHz (35e6),
       m_noiseFigure (5.0),
       m_antennaGainDbi (0.0),
