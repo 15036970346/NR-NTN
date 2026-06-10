@@ -289,4 +289,40 @@ SatChannel::GetThreeGppTable (Ptr<const ChannelCondition> channelCondition,
   return table3gpp;
 }
 
+// ===========================================================================
+// qyh 增量: FsplDb / BeamGainDbi / ParabolicGainDbi
+// ===========================================================================
+
+double
+SatChannel::FsplDb (double distance3D, double frequencyHz) const
+{
+  return CalcFspl (distance3D, frequencyHz);
+}
+
+double
+SatChannel::ParabolicGainDbi (double thetaRad, double theta3dbRad,
+                              double maxGainDbi, double sideLobeDbi)
+{
+  if (theta3dbRad <= 0.0) return maxGainDbi;
+  double gain = maxGainDbi - 12.0 * std::pow (thetaRad / theta3dbRad, 2.0);
+  return std::max (gain, sideLobeDbi);
+}
+
+double
+SatChannel::BeamGainDbi (const Vector& satPos, const Vector& uePos,
+                         const Vector& beamCenter, double theta3dbRad) const
+{
+  Vector satToBeam (beamCenter.x - satPos.x, beamCenter.y - satPos.y, beamCenter.z - satPos.z);
+  Vector satToUe   (uePos.x - satPos.x,       uePos.y - satPos.y,       uePos.z - satPos.z);
+  double dotp = satToBeam.x * satToUe.x + satToBeam.y * satToUe.y + satToBeam.z * satToUe.z;
+  double nb = std::sqrt (satToBeam.x * satToBeam.x + satToBeam.y * satToBeam.y
+                         + satToBeam.z * satToBeam.z);
+  double nu = std::sqrt (satToUe.x * satToUe.x + satToUe.y * satToUe.y
+                         + satToUe.z * satToUe.z);
+  double cosTheta = (nb > 0 && nu > 0)
+                    ? std::max (-1.0, std::min (1.0, dotp / (nb * nu))) : 1.0;
+  double theta = std::acos (cosTheta);
+  return ParabolicGainDbi (theta, theta3dbRad, 45.0, -5.0);
+}
+
 } // namespace ns3

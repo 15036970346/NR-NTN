@@ -13,8 +13,8 @@
 #include "ns3/sat-ut-phy.h"
 #include "ns3/sat-ut-mac.h"
 #include "ns3/sat-ut-rrc.h"
-#include "ns3/sat-pdcp.h"
-#include "ns3/sat-sdap.h"
+#include "ns3/ntn-pdcp.h"
+#include "ns3/ntn-sdap.h"
 #include "ns3/sat-mac-common.h"
 #include "ns3/geo-beam-scheduler.h"
 #include "ns3/resource-manager.h"
@@ -109,8 +109,8 @@ main (int argc, char* argv[])
     std::vector<Ptr<SatUtPhy>> uePhys (numUes);
     std::vector<Ptr<SatUtMac>> ueMacs (numUes);
     std::vector<Ptr<SatUtRrc>> ueRrcs (numUes);
-    std::vector<Ptr<SatPdcp>>  uePdcps (numUes);
-    std::vector<Ptr<SatSdap>>  ueSdaps (numUes);
+    std::vector<Ptr<NtnPdcp>>  uePdcps (numUes);
+    std::vector<Ptr<NtnSdap>>  ueSdaps (numUes);
 
     for (uint32_t i = 0; i < numUes; ++i)
     {
@@ -146,7 +146,7 @@ main (int argc, char* argv[])
         g_ueRrcMap[rnti] = ueRrcs[i];
 
         // --- PDCP ---
-        uePdcps[i] = CreateObject<SatPdcp> ();
+        uePdcps[i] = CreateObject<NtnPdcp> ();
         uePdcps[i]->SetRnti (rnti);
         uePdcps[i]->SetLcId (3);
         Ptr<RohcCompressor> rohc = CreateObject<RohcCompressor> ();
@@ -160,7 +160,7 @@ main (int argc, char* argv[])
             "RohcCompression", MakeCallback (&SatPdcpStatsCollector::OnRohcCompression, pdcpStats));
 
         // --- SDAP ---
-        ueSdaps[i] = CreateObject<SatSdap> ();
+        ueSdaps[i] = CreateObject<NtnSdap> ();
         ueSdaps[i]->SetRnti (rnti);
         ueSdaps[i]->MapQfiToDrb (1, 3);  // Voice QFI=1 -> LCID=3
         ueSdaps[i]->MapQfiToDrb (5, 4);  // Data  QFI=5 -> LCID=4

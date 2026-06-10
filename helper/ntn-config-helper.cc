@@ -7,7 +7,7 @@
 #include "ntn-config-helper.h"
 #include "ns3/log.h"
 #include "../model/rohc-compressor.h"
-#include "../model/sat-pdcp.h"
+#include "../model/ntn-pdcp.h"
 #include "../model/harq-manager.h"
 
 namespace ns3 {
@@ -79,19 +79,19 @@ NtnConfigHelper::CreateRohcCompressor (uint16_t cid)
   return rohc;
 }
 
-Ptr<SatPdcp>
+Ptr<NtnPdcp>
 NtnConfigHelper::CreatePdcpWithRohc (uint16_t rnti, uint8_t lcId)
 {
   NS_LOG_FUNCTION (rnti << (uint32_t)lcId);
   
-  Ptr<SatPdcp> pdcp = CreateObject<SatPdcp> ();
+  Ptr<NtnPdcp> pdcp = CreateObject<NtnPdcp> ();
   pdcp->SetRnti (rnti);
   pdcp->SetLcId (lcId);
   
   Ptr<RohcCompressor> rohc = CreateRohcCompressor (rnti);
   pdcp->SetRohcCompressor (rohc);
   
-  NS_LOG_INFO ("Created SatPdcp with ROHC: RNTI=" << rnti 
+  NS_LOG_INFO ("Created NtnPdcp with ROHC: RNTI=" << rnti 
                << ", LCID=" << (uint32_t)lcId
                << ", ROHC=" << (rohc->IsEnabled() ? "Enabled" : "Disabled"));
   
@@ -133,9 +133,10 @@ NtnConfigHelper::ConfigureAll ()
 }
 
 void
-NtnConfigHelper::ConfigureHarqManager (Ptr<HarqManager> harqManager, bool enableHarq)
+NtnConfigHelper::ConfigureHarqManager (Ptr<HarqManager> harqManager, bool enableHarq,
+                                       uint8_t processCount)
 {
-  NS_LOG_FUNCTION (enableHarq);
+  NS_LOG_FUNCTION (enableHarq << static_cast<uint32_t> (processCount));
 
   if (harqManager == nullptr)
     {
@@ -143,11 +144,14 @@ NtnConfigHelper::ConfigureHarqManager (Ptr<HarqManager> harqManager, bool enable
       return;
     }
 
+  harqManager->SetProcessCount (processCount);
   harqManager->SetHarqEnabled (enableHarq);
 
   if (enableHarq)
     {
       NS_LOG_INFO ("[NTN-Config] HARQ Enabled - NACK will trigger IR retransmission");
+      NS_LOG_INFO ("[NTN-Config]   - HARQ processes per UE: "
+                   << static_cast<uint32_t> (harqManager->GetProcessCount ()));
       NS_LOG_INFO ("[NTN-Config]   - Max retransmissions: 4");
       NS_LOG_INFO ("[NTN-Config]   - IR RV sequence: 0 -> 2 -> 3 -> 1");
       NS_LOG_INFO ("[NTN-Config]   - Expected gain: ~3 dB");

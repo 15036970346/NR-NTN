@@ -16,7 +16,6 @@
 #include "ns3/ptr.h"
 #include "ns3/packet.h"
 #include "ns3/net-device.h"
-#include "ns3/callback.h"
 // [Fix] 必须包含这个文件，否则编译器找不到基类的定义
 #include "ns3/spectrum-signal-parameters.h"
 
@@ -31,8 +30,10 @@ struct SatSignalParameters : public SpectrumSignalParameters
   SatSignalParameters ();
   SatSignalParameters (const SatSignalParameters& p);
   virtual ~SatSignalParameters ();
-  
-  virtual Ptr<SpectrumSignalParameters> Copy ();
+
+  // 必须与基类 SpectrumSignalParameters::Copy() const 同签名才能真正 override,
+  // 否则 SpectrumChannel 复制信号时会退化成基类, packet 字段会丢失。
+  Ptr<SpectrumSignalParameters> Copy () const override;
 
   Ptr<Packet> packet;
 };
@@ -54,7 +55,6 @@ public:
   Ptr<Object> GetPhyRx () const;
   void SetPhyTx (Ptr<Object> tx);
   void SetPhyRx (Ptr<Object> rx);
-  void SetRxPacketCallback (Callback<void, Ptr<Packet>> callback);
 
   Ptr<SpectrumChannel> GetTxChannel () const;
 
@@ -79,6 +79,16 @@ public:
   void SetTemperature (double tempKelvin);
   void SetPeer (Ptr<SatPhy> peer);
 
+  /// 显式设置 Rx SpectrumModel (SpectrumChannel 投递包前用此识别)
+  void SetRxSpectrumModel (Ptr<const SpectrumModel> model);
+
+  /// 上层接收回调: 收到本端 Rx 时 (在 Rx trace 之后) 触发, 用于把 packet 交给 MAC 等上层。
+  /// 注意: 卫星上的 SatGeoUserPhy/SatGeoFeederPhy 完全 override Receive 做透明转发,
+  /// 不会调到这个回调; 这是给端点 PHY (NtnGwPhy / 给 UE 用的 SatPhy) 用的。
+  void SetRxCallback (Callback<void, Ptr<Packet>> cb);
+  /// qyh 接口别名 (SetRxCallback 的同义): 兼容 qyh demo
+  void SetRxPacketCallback (Callback<void, Ptr<Packet>> cb) { SetRxCallback (cb); }
+
 protected:
   virtual void DoDispose (void) override;
 
@@ -100,7 +110,8 @@ protected:
 
   Ptr<Object> m_phyTxObj;
   Ptr<Object> m_phyRxObj;
-  Callback<void, Ptr<Packet>> m_rxPacketCallback;
+  Ptr<const SpectrumModel> m_rxSpectrumModel;
+  Callback<void, Ptr<Packet>> m_rxCallback;
 
   TracedCallback<Ptr<const Packet>> m_txTrace;
   TracedCallback<Ptr<const Packet>> m_rxTrace;

@@ -13,6 +13,7 @@
 #include "ns3/callback.h"
 #include "ns3/traced-callback.h"
 #include "ns3/sat-mac-common.h"
+#include <map>
 
 namespace ns3 {
 
@@ -45,9 +46,11 @@ public:
     // ==================== Measurement Control ====================
     // 1. Core: receive raw PHY measurements
     void ProcessRawMeasurement (uint32_t beamId, double rawRsrp);
+    void ProcessRawMeasurement (const ServiceObjectId& object, double rawRsrp);
 
     // 2. Config: set measurement parameters (from SIB or RRC reconfig)
     void SetMeasConfig (MeasConfig config);
+    MeasConfig GetMeasConfig () const;
 
     // 3. Mobility: bind mobility model for position reporting
     void SetMobilityModel (Ptr<MobilityModel> mobility);
@@ -58,6 +61,19 @@ public:
     // 5. Report callback
     typedef Callback<void, MeasReport> ReportCallback;
     void SetReportCallback (ReportCallback cb);
+
+    // 6. Service object state
+    void SetServingObject (const ServiceObjectId& servingObject);
+    ServiceObjectId GetServingObject () const;
+    void SetGroundAvailability (bool available);
+    void SetSatelliteAvailability (bool available);
+    bool IsGroundAvailable () const;
+    bool IsSatelliteAvailable () const;
+    Time GetServingDwellTime () const;
+    bool HasSatisfiedMinDwellTime () const;
+    ServiceObjectId GetBestNeighborObject () const;
+    double GetServingFilteredMetric () const;
+    double GetBestNeighborFilteredMetric () const;
 
     // ==================== Inactivity Timer ====================
     // Set inactivity timer duration (T3xx series)
@@ -82,6 +98,10 @@ private:
     // Measurement event evaluation
     void EvaluateMeasurementEvents ();
     void TriggerMeasurementReport ();
+    void UpdateNeighborMeasurement (const ServiceObjectId& object, double rawRsrp);
+    ServiceObjectId FindBestNeighborObject () const;
+    double GetFilteredMetric (const ServiceObjectId& object) const;
+    bool IsObjectAvailable (const ServiceObjectId& object) const;
 
     // Inactivity timer callback
     void OnInactivityTimeout ();
@@ -95,6 +115,24 @@ private:
     double m_filteredRsrp;
     bool m_isConditionMet;
     EventId m_tttEvent;
+
+    ServiceObjectId m_servingObject;
+    ServiceObjectId m_tttCandidateObject;
+    ServiceObjectId m_lastReportedNeighborObject;
+
+    // Handover-in-progress guard: once a measurement report is sent, suppress
+    // further reports until the RRC reconfiguration is applied (SetServingObject)
+    // or a guard timeout (modeled on T304) elapses. Prevents duplicate handovers
+    // during the report->reconfiguration propagation window.
+    bool m_handoverPending {false};
+    EventId m_handoverGuardEvent;
+    Time m_handoverGuardTimeout {MilliSeconds (1500)};
+    std::map<ServiceObjectId, NeighborMeasurement> m_neighborMeasurements;
+    Time m_servingSince;
+    Time m_tttStartTime;
+    bool m_groundAvailable;
+    bool m_satelliteAvailable;
+    double m_lastA3Delta;
 
     // State machine
     State m_state;

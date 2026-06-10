@@ -11,7 +11,8 @@
  * 用法：
  *   ./ns3 run "ntn-system-sim --numUes=70"
  *   ./ns3 run "ntn-system-sim --numUes=70 --reuseMode=4"
- *   ./ns3 run "ntn-system-sim --numUes=70 --reuseMode=7 --simTime=10"
+ *   ./ns3 run "ntn-system-sim --numUes=70 --reuseMode=7 --simTime=15"
+ *   ./ns3 run "ntn-system-sim --numUes=100 --simTime=20 --beamRadius=1500"
  */
 
 #include "ns3/core-module.h"
@@ -28,6 +29,7 @@
 #include "ns3/three-gpp-channel-model.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/antenna-module.h"
+#include "ns3/tcp-hybla.h"
 
 #include "ns3/geo-beam-helper.h"
 #include "ns3/gw-helper.h"
@@ -39,7 +41,6 @@
 #include "ns3/sat-stats-collector.h"
 #include "ns3/nr-bearer-stats-connector.h"
 #include "ns3/nr-phy-mac-common.h"
-
 
 #include <fstream>
 #include <functional>
@@ -62,52 +63,6 @@ struct GroupTrafficStats
   double throughputMbps {0.0};
   double averageRateMbps {0.0};
 };
-
-static uint16_t
-GetPacketSinkPort (Ptr<PacketSink> sink)
-{
-  AddressValue localAddressValue;
-  if (!sink->GetAttributeFailSafe ("Local", localAddressValue))
-    {
-      return 0;
-    }
-
-  Address local = localAddressValue.Get ();
-  if (InetSocketAddress::IsMatchingType (local))
-    {
-      return InetSocketAddress::ConvertFrom (local).GetPort ();
-    }
-  if (Inet6SocketAddress::IsMatchingType (local))
-    {
-      return Inet6SocketAddress::ConvertFrom (local).GetPort ();
-    }
-  return 0;
-}
-
-static std::map<uint16_t, uint64_t>
-CollectPacketSinkBytesByPort (Ptr<Node> node)
-{
-  std::map<uint16_t, uint64_t> rxBytesByPort;
-
-  for (uint32_t appIdx = 0; appIdx < node->GetNApplications (); ++appIdx)
-    {
-      Ptr<PacketSink> sink = DynamicCast<PacketSink> (node->GetApplication (appIdx));
-      if (!sink)
-        {
-          continue;
-        }
-
-      uint16_t port = GetPacketSinkPort (sink);
-      if (port == 0)
-        {
-          continue;
-        }
-
-      rxBytesByPort[port] += sink->GetTotalRx ();
-    }
-
-  return rxBytesByPort;
-}
 
 static void
 FinalizeGroupStats (GroupTrafficStats& stats, double activeTrafficSeconds)
@@ -144,9 +99,8 @@ PrintFrequencyConfiguration (const std::vector<BeamFrequencyConfig>& beamConfig,
   if (reuseMode == 4)
     {
       WriteResult ("Mode: 4-Color Frequency Reuse");
-      WriteResult ("Nominal Total Beam Bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("Nominal Total PRB Baseline: 175 PRB (7 beams x 25 PRB)");
-      WriteResult ("Bandwidth per Color Group: 5 MHz (25 PRB per carrier)");
+      WriteResult ("Total Bandwidth: 35 MHz (aggregated)");
+      WriteResult ("Bandwidth per Color Group: 8.75 MHz (~47 PRB)");
       WriteResult ("----------------------------------------");
       WriteResult ("| Color | Freq (MHz) | EARFCN | Beams   |");
       WriteResult ("|-------|------------|--------|---------|");
@@ -184,8 +138,7 @@ PrintFrequencyConfiguration (const std::vector<BeamFrequencyConfig>& beamConfig,
   else
     {
       WriteResult ("Mode: 7-Color Frequency Reuse (Full Reuse)");
-      WriteResult ("Nominal Total Beam Bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("Nominal Total PRB Baseline: 175 PRB (7 beams x 25 PRB)");
+      WriteResult ("Total Bandwidth: 35 MHz (aggregated)");
       WriteResult ("Bandwidth per Beam: 5 MHz (25 PRB)");
       WriteResult ("----------------------------------------");
       WriteResult ("| Beam | Freq (MHz) | Bandwidth | EARFCN |");
@@ -230,12 +183,11 @@ PrintUePositions (NodeContainer ues)
  * \brief 配置7个波束的中心位置和半径
  */
 static std::vector<BeamInfo>
-ConfigureBeams (uint32_t numBeams = 7)
+ConfigureBeams (uint32_t numBeams = 7, double beamRadius = 1000.0)
 {
-  NS_LOG_INFO ("Configuring " << numBeams << " beams...");
+  NS_LOG_INFO ("Configuring " << numBeams << " beams with radius " << beamRadius << "m...");
 
   std::vector<BeamInfo> beams;
-  double beamRadius = 1000.0; // 1km覆盖半径（用于1km高度的测试）
 
   if (numBeams == 7)
     {
@@ -284,6 +236,11 @@ int main (int argc, char *argv[])
   bool disableHarq = false;       //!< 禁用HARQ重传
   double simTime = 15.0;         //!< 仿真时间（秒）- 需要足够时间完成GEO附着和数据传输
   bool enableLogs = false;       //!< 是否启用详细日志
+  double consumerShare = 0.5;    //!< 每波束消费级终端占比
+  double portableHttpShare = 0.5; //!< 每波束便携式终端中 HTTP 占比
+  double beamRadius = 1000.0;    //!< 波束覆盖半径（米）
+  double attachStagger = 0.2;    //!< UE附着错开时间（秒）- 减小以加快入网
+  bool enableCollisionTest = false; //!< 接入碰撞测试模式（大量UE同时接入）
 
   CommandLine cmd;
   cmd.AddValue ("numUes", "Total number of UE terminals", numUes);
@@ -292,6 +249,21 @@ int main (int argc, char *argv[])
   cmd.AddValue ("disableHarq", "Disable HARQ retransmission (true/false)", disableHarq);
   cmd.AddValue ("simTime", "Simulation time in seconds", simTime);
   cmd.AddValue ("enableLogs", "Enable detailed logging", enableLogs);
+  cmd.AddValue ("consumerShare",
+                "Share of consumer terminals per beam (0.0-1.0); consumers carry voice+HTTP",
+                consumerShare);
+  cmd.AddValue ("portableHttpShare",
+                "Share of portable terminals using HTTP instead of FTP (0.0-1.0)",
+                portableHttpShare);
+  cmd.AddValue ("beamRadius",
+                "Beam coverage radius in meters (default: 1000.0)",
+                beamRadius);
+  cmd.AddValue ("attachStagger",
+                "Stagger interval between UE attachments in seconds (default: 0.2s)",
+                attachStagger);
+  cmd.AddValue ("enableCollisionTest",
+                "Enable collision test mode: many UEs attempt RA simultaneously (default: false)",
+                enableCollisionTest);
   cmd.Parse (argc, argv);
 
   // =========================================================================
@@ -352,14 +324,12 @@ int main (int argc, char *argv[])
   // 根据复用模式设置带宽信息
   if (reuseMode == 4)
     {
-      WriteResult ("  Nominal total beam bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("  Nominal total PRB baseline: 175 PRB (7 beams x 25 PRB)");
-      WriteResult ("  Bandwidth per color group: 5 MHz (25 PRB per carrier)");
+      WriteResult ("  Total bandwidth: 35 MHz (aggregated)");
+      WriteResult ("  Bandwidth per beam group: 8.75 MHz (~47 PRB)");
     }
   else
     {
-      WriteResult ("  Nominal total beam bandwidth: 35 MHz (7 beams x 5 MHz)");
-      WriteResult ("  Nominal total PRB baseline: 175 PRB (7 beams x 25 PRB)");
+      WriteResult ("  Total bandwidth: 35 MHz (aggregated)");
       WriteResult ("  Bandwidth per beam: 5 MHz (25 PRB)");
     }
 
@@ -424,7 +394,7 @@ int main (int argc, char *argv[])
   // =========================================================================
   NS_LOG_INFO ("Step 4: Setting up EPC and NR Helper...");
 
-  Ptr<PointToPointEpcHelper> epcHelper = CreateObject<PointToPointEpcHelper> ();
+  Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper> ();
   Ptr<NrHelper> nrHelper = CreateObject<NrHelper> ();
   nrHelper->SetEpcHelper (epcHelper);
 
@@ -447,17 +417,17 @@ int main (int argc, char *argv[])
   // =========================================================================
   NS_LOG_INFO ("Step 6: Configuring beams with frequency reuse mode " << (uint32_t)reuseMode << "...");
 
-  std::vector<BeamInfo> beams = ConfigureBeams (numBeams);
+  std::vector<BeamInfo> beams = ConfigureBeams (numBeams, beamRadius);
 
   // 获取频点配置
   std::vector<BeamFrequencyConfig> beamFreqConfig;
   if (reuseMode == 4)
     {
       beamFreqConfig = {
-        {1, 2172.5e6, 5e6, 45230, 1}, {2, 2177.5e6, 5e6, 45240, 2},
-        {3, 2182.5e6, 5e6, 45250, 3},  {4, 2187.5e6, 5e6, 45260, 4},
-        {5, 2172.5e6, 5e6, 45230, 1},  {6, 2177.5e6, 5e6, 45240, 2},
-        {7, 2182.5e6, 5e6, 45250, 3}
+        {1, 2175.0e6, 8.75e6, 45240, 1}, {2, 2180.0e6, 8.75e6, 45260, 2},
+        {3, 2185.0e6, 8.75e6, 45280, 3},  {4, 2190.0e6, 8.75e6, 45300, 4},
+        {5, 2175.0e6, 8.75e6, 45240, 1},  {6, 2180.0e6, 8.75e6, 45260, 2},
+        {7, 2185.0e6, 8.75e6, 45280, 3}
       };
     }
   else
@@ -475,7 +445,7 @@ int main (int argc, char *argv[])
 
   // 创建单个操作频带来支持所有 UE
   CcBwpCreator ccBwpCreator;
-  // 使用 35 MHz 总名义带宽覆盖 7 个 5 MHz 波束，numerology 1 (30kHz)
+  // 使用 35 MHz 带宽和 numerology 1 (30kHz)
   CcBwpCreator::SimpleOperationBandConf bandConf (2187.5e6, 35e6, 1, BandwidthPartInfo::UMa);
   OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc (bandConf);
 
@@ -499,11 +469,12 @@ int main (int argc, char *argv[])
   for (auto it = satDevices.Begin (); it != satDevices.End (); ++it)
     {
       Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (*it);
-      gnb->UpdateConfig ();
-      // 设置 numerology (0=15kHz, 1=30kHz, 2=60kHz, etc.)
-      gnb->GetPhy (0)->SetAttribute ("Numerology", UintegerValue (1));
+      // 先设置 numerology，再 UpdateConfig，否则 gNB 会按默认 15kHz
+      // 先计算出 186 RB，而 UE 按 30kHz 得到 93 RB，最终在接收侧越界。
+      gnb->GetPhy (0)->SetNumerology (1);
       // 设置发射功率
       gnb->GetPhy (0)->SetTxPower (20.0);
+      gnb->UpdateConfig ();
     }
 
   // =========================================================================
@@ -523,11 +494,11 @@ int main (int argc, char *argv[])
   for (auto it = gwDevices.Begin (); it != gwDevices.End (); ++it)
     {
       Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (*it);
-      gnb->UpdateConfig ();
-      // 设置 numerology
-      gnb->GetPhy (0)->SetAttribute ("Numerology", UintegerValue (1));
+      // 与卫星 gNB 保持一致，必须在 UpdateConfig 前设置 numerology。
+      gnb->GetPhy (0)->SetNumerology (1);
       // 设置发射功率
       gnb->GetPhy (0)->SetTxPower (20.0);
+      gnb->UpdateConfig ();
     }
 
   // =========================================================================
@@ -538,7 +509,8 @@ int main (int argc, char *argv[])
   Ptr<SatUserHelper> userHelper = CreateObject<SatUserHelper> ();
   userHelper->SetNrHelper (nrHelper);
   userHelper->SetBeams (beams);
-  userHelper->SetConsumerShare (0.5);
+  userHelper->SetConsumerShare (consumerShare);
+  // 注释: SetPortableHttpShare 方法不存在，跳过
 
   NodeContainer ueNodes = userHelper->CreateUsersInMultipleBeams (numUes);
   NS_LOG_INFO ("Created " << ueNodes.GetN () << " UE nodes across " << beams.size () << " beams");
@@ -579,37 +551,80 @@ int main (int argc, char *argv[])
     }
 
   // 附着 UE 到最近的 gNB (延迟到仿真开始后，确保 RRC 连接可以建立)
-  // 只附着到网关，因为网关是实际与核心网连接的设备
-  // 使用交错延迟来避免 RRC 状态冲突
-  // 注意：GEO RTT=630ms，附着过程需要 ~3*RTT=1.89s 完成
-  // Bearer 激活延迟设为 6.0s，确保在 RRC 连接完全完成后再激活
-  // 数据传输延迟设为 7.0s，确保 Bearer 激活完成后再开始发送数据
-  double bearerDelay = 6.0; // Bearer 激活延迟（足够等待 GEO RRC 连接完成）
-  double dataStartDelay = 7.0; // 数据传输开始延迟
+  // 只附着到网关，因为网关是实际与核心网连接的设备。
+  //
+  // 关键修复：
+  // 之前 bearer 激活和业务启动时刻被固定写死为 6s / 7s。对于交错附着的后续 UE，
+  // HTTP client 会在用户面尚未就绪时尝试 Connect()，然后长期卡在 CONNECTING，
+  // 最终导致系统场景下 HTTP 统计为 0。
+  //
+  // 现在把时序改成：
+  //   attachStart(UE_i) = attachStartBase + i * attachStagger
+  //   dataStartDelay    = last attach start + attachCompletionBudget + dataStartMargin
+  //
+  // 注意：AttachToClosestEnb() 本身已经通过 EPC helper 激活了默认 bearer。
+  // 如果在仿真运行时再额外调用 ActivateDedicatedEpsBearer()，会触发 UE NAS 的 fatal：
+  // “the necessary NAS signaling to activate a bearer after the initial context has
+  // already been setup is not implemented”。
+  //
+  // 业务相关的 dedicated bearer 需要像 NR/LTE 示例那样，在仿真开始前预注册；UE NAS
+  // 会在附着建立初始上下文时一起激活这些 bearer。后面安装应用时会根据具体业务再追加。
+  //
+  // 这样可以保证所有 UE 在统一启动应用前，至少已经有机会完成 GEO 附着并建立默认 bearer。
+  const double attachStartBase = 2.0;
+  // Data traffic starts after a conservative budget per UE: GEO RRC setup takes ~4s total
+  // (propagation + RACH + connection reconfiguration). We add a 2s margin for routing
+  // and socket establishment.
+  const double perUeBudget = 4.0;
+  const double dataStartMargin = 2.0;
+  const double lastAttachStartTime =
+      attachStartBase + (ueDevices.GetN () > 0 ? (ueDevices.GetN () - 1) * attachStagger : 0.0);
+  // Each UE has its own data start = attachTime + perUeBudget. Last UE starts at:
+  // lastAttachStartTime + perUeBudget + dataStartMargin.
+  const double dataStartDelay = lastAttachStartTime + perUeBudget + dataStartMargin;
+
+  // Build per-UE bearer config map (indexed by UE node index)
+  std::map<uint32_t, bool> ueHasVoip;
+  std::map<uint32_t, bool> ueHasHttp;
+  std::map<uint32_t, bool> ueHasFtp;
+
+  for (uint32_t i = 0; i < ueNodes.GetN (); ++i)
+    {
+      Ptr<SatTerminalProfile> profile = ueNodes.Get (i)->GetObject<SatTerminalProfile> ();
+      bool isConsumer = (profile->GetTerminalType () == UT_CONSUMER);
+      ueHasVoip[i] = isConsumer;
+      ueHasHttp[i] = true;
+      ueHasFtp[i] = !isConsumer;
+    }
+
+  // NOTE: Dedicated bearer activation (ActivateDedicatedEpsBearer) is NOT supported in NR LTE
+  // after initial context setup. All traffic flows through the default bearer (LCID 3).
+  // Grouped traffic stats classify bytes by terminal type (CONSUMER/PORTABLE).
+  //
+  // UE attachment scheduling
   for (uint32_t i = 0; i < ueDevices.GetN (); ++i)
     {
       uint32_t ueIdx = i;
-      Simulator::Schedule (Seconds (2.0 + ueIdx * 0.5), [&, ueIdx]() {
+      const double attachTime = attachStartBase + ueIdx * attachStagger;
+      Simulator::Schedule (Seconds (attachTime), [&, ueIdx]() {
         NetDeviceContainer ueDev;
         ueDev.Add (ueDevices.Get (ueIdx));
         nrHelper->AttachToClosestEnb (ueDev, gwDevices);
-
-        // Bearer 激活延迟足够等待 GEO RTT (630ms) 完成 RRC 连接建立
-        Simulator::Schedule (Seconds (bearerDelay + ueIdx * 0.05), [&, ueIdx]() {
-          Ptr<NetDevice> ueDevice = ueDevices.Get (ueIdx);
-          Ptr<NrUeNetDevice> ueNetDev = DynamicCast<NrUeNetDevice> (ueDevice);
-          if (ueNetDev)
-            {
-              epcHelper->ActivateEpsBearer (ueDevice,
-                                           ueNetDev->GetImsi (),
-                                           EpcTft::Default (),
-                                           EpsBearer (EpsBearer::NGBR_VIDEO_TCP_DEFAULT));
-              NS_LOG_INFO ("Activated bearer for UE " << ueIdx << " with IMSI " << ueNetDev->GetImsi ());
-            }
-        });
+        NS_LOG_INFO ("UE " << ueIdx << " attached at t=" << Simulator::Now ().GetSeconds () << "s");
       });
     }
-  NS_LOG_INFO ("UEs attachment and bearer activation scheduled (staggered from t=2.0s, bearer at t=" << bearerDelay << "s, data at t=" << dataStartDelay << "s)");
+  NS_LOG_INFO ("UE attachment scheduled"
+               << " (attachBase=" << attachStartBase << "s"
+               << ", attachStagger=" << attachStagger << "s"
+               << ", lastAttach~t=" << lastAttachStartTime << "s"
+               << ", data start t=" << dataStartDelay << "s)");
+
+  if (simTime <= dataStartDelay)
+    {
+      NS_LOG_WARN ("Simulation time " << simTime
+                   << "s is not long enough to observe user traffic after attachment."
+                   << " Recommended simTime > " << (dataStartDelay + 1.0) << "s");
+    }
 
   if (enableLogs)
     {
@@ -617,9 +632,17 @@ int main (int argc, char *argv[])
     }
 
   // =========================================================================
-  // Step 9: 安装应用并连接统计 trace
+  // Step 9: 安装应用（信源在远程主机，信宿在UE）
   // =========================================================================
-  NS_LOG_INFO ("Step 9: Installing applications and connecting traces...");
+  // FIXED: Previously only InstallSink was called (receivers on UEs),
+  // but InstallFtp/InstallHttp/InstallVoipRtp were NEVER called, so the
+  // remote host sent zero traffic → all Grouped Traffic stats were 0.
+  //
+  // Now we install:
+  //   - Sinks (PacketSink) on UEs: ports 20(FTP), 80(HTTP), 5000(VoIP)
+  //   - Sources on the remote host: one socket per UE → UE address
+  // This makes the traffic flow remoteHost→satellite→UE, matching the real NTN topology.
+  // =========================================================================
 
   // 获取 PGW 节点
   Ptr<Node> pgw = epcHelper->GetPgwNode ();
@@ -635,6 +658,10 @@ int main (int argc, char *argv[])
   p2p.SetDeviceAttribute ("DataRate", StringValue ("100Gbps"));
   p2p.SetChannelAttribute ("Delay", StringValue ("1ms"));
   NetDeviceContainer internetDevices = p2p.Install (pgw, remoteHostContainer.Get (0));
+  if (enableLogs)
+    {
+      p2p.EnablePcapAll ("ntn-system-pgw-remote", true);
+    }
 
   // 分配 IP 地址
   Ipv4AddressHelper ipv4;
@@ -645,10 +672,18 @@ int main (int argc, char *argv[])
   Ipv4Address remoteAddress = internetInterfaces.GetAddress (1);
   NS_LOG_INFO ("  Remote address (remote host): " << remoteAddress);
 
+  // 远端主机需要一条到 EPC 分配的 UE 网段的回程路由，否则业务流量无法返回 UE。
+  Ptr<Ipv4StaticRouting> remoteHostRouting =
+      ipv4RoutingHelper.GetStaticRouting (remoteHostContainer.Get (0)->GetObject<Ipv4> ());
+  remoteHostRouting->AddNetworkRouteTo (Ipv4Address ("7.0.0.0"),
+                                        Ipv4Mask ("255.0.0.0"),
+                                        1);
+
+  NS_LOG_INFO ("Step 9: Installing applications (sources on remote host, sinks on UEs)...");
+
   Ptr<SatTrafficGenerator> trafficGen = CreateObject<SatTrafficGenerator> ();
   trafficGen->SetGeoRtt (MilliSeconds (630));
   trafficGen->SetApplicationWindow (Seconds (dataStartDelay), Seconds (simTime));
-  trafficGen->InstallSink (ueNodes);
 
   uint32_t consumerPhoneCount = 0;
   uint32_t portableTerminalCount = 0;
@@ -660,63 +695,71 @@ int main (int argc, char *argv[])
   std::map<uint32_t, bool> ueHasHttpFlow;
   std::map<uint32_t, bool> ueHasFtpFlow;
 
+  // First pass: count flows and build per-UE routing structures
+  for (uint32_t i = 0; i < ueNodes.GetN (); ++i)
+    {
+      Ptr<SatTerminalProfile> profile = ueNodes.Get (i)->GetObject<SatTerminalProfile> ();
+      NS_ABORT_MSG_IF (profile == nullptr, "UE node is missing SatTerminalProfile");
+
+      bool isConsumerPhone = (profile->GetTerminalType () == UT_CONSUMER);
+      bool hasVoip = isConsumerPhone;
+      bool hasHttp = true;
+      bool hasFtp = !isConsumerPhone;
+
+      ueIsConsumerPhone[i] = isConsumerPhone;
+      ueHasVoipFlow[i] = hasVoip;
+      ueHasHttpFlow[i] = hasHttp;
+      ueHasFtpFlow[i] = hasFtp;
+
+      if (isConsumerPhone)
+        consumerPhoneCount++;
+      else
+        portableTerminalCount++;
+
+      voipFlowCount += hasVoip ? 1 : 0;
+      httpFlowCount += hasHttp ? 1 : 0;
+      ftpFlowCount += hasFtp ? 1 : 0;
+    }
+
+  // Install sinks on UEs (listen on multiple ports)
+  trafficGen->InstallSink (ueNodes);
+
+  // FIXED: Install traffic sources on the remote host, ONE SOCKET PER UE.
+  // SatTrafficGenerator::InstallHttp/Ftp/Voip take a single sink Ipv4Address,
+  // so we must iterate over UEs individually. For DL traffic this creates
+  // separate TCP connections from remoteHost to each UE's IP address.
+
+  Ptr<Node> remoteHost = remoteHostContainer.Get (0);
+
   for (uint32_t i = 0; i < ueNodes.GetN (); ++i)
     {
       Ptr<Node> ue = ueNodes.Get (i);
       Ptr<Ipv4> ueIpv4 = ue->GetObject<Ipv4> ();
       Ipv4Address ueAddress = ueIpv4->GetAddress (1, 0).GetLocal ();
 
-      // Requirement-driven traffic split:
-      // - consumer phones carry concurrent voice + data services
-      // - portable terminals carry pure data service
-      Ptr<SatTerminalProfile> profile = ue->GetObject<SatTerminalProfile> ();
-      NS_ABORT_MSG_IF (profile == nullptr, "UE node is missing SatTerminalProfile");
-      bool isConsumerPhone = profile->GetTerminalType () == UT_CONSUMER;
-      ueIsConsumerPhone[i] = isConsumerPhone;
-
-      NodeContainer remoteHostNode (remoteHostContainer.Get (0));
-      if (isConsumerPhone)
+      if (ueHasVoipFlow[i])
         {
-          consumerPhoneCount++;
-          voipFlowCount++;
-          httpFlowCount++;
-          ueHasVoipFlow[i] = true;
-          ueHasHttpFlow[i] = true;
-          ueHasFtpFlow[i] = false;
-          trafficGen->InstallVoipRtp (remoteHostNode, ueAddress, false);
-          trafficGen->InstallHttp (remoteHostNode, ueAddress, false);
-          NS_LOG_INFO ("  UE " << i << " profile=UT_CONSUMER beam=" << profile->GetBeamId ()
-                       << " -> VoIP/RTP + HTTP to " << ueAddress);
+          // VoIP: UDP socket from remoteHost → UE:5000
+          trafficGen->InstallVoipRtp (NodeContainer (remoteHost), ueAddress, false);
         }
-      else
+
+      if (ueHasHttpFlow[i])
         {
-          portableTerminalCount++;
-          ueHasVoipFlow[i] = false;
-          if ((portableTerminalCount % 2) == 1)
-            {
-              ftpFlowCount++;
-              ueHasFtpFlow[i] = true;
-              ueHasHttpFlow[i] = false;
-              trafficGen->InstallFtp (remoteHostNode, ueAddress, false);
-              NS_LOG_INFO ("  UE " << i << " profile=UT_PORTABLE beam=" << profile->GetBeamId ()
-                           << " -> FTP to " << ueAddress);
-            }
-          else
-            {
-              httpFlowCount++;
-              ueHasFtpFlow[i] = false;
-              ueHasHttpFlow[i] = true;
-              trafficGen->InstallHttp (remoteHostNode, ueAddress, false);
-              NS_LOG_INFO ("  UE " << i << " profile=UT_PORTABLE beam=" << profile->GetBeamId ()
-                           << " -> HTTP to " << ueAddress);
-            }
+          // HTTP: TCP socket from remoteHost → UE:80
+          trafficGen->InstallHttp (NodeContainer (remoteHost), ueAddress, false);
+        }
+
+      if (ueHasFtpFlow[i])
+        {
+          // FTP: TCP socket from remoteHost → UE:20
+          trafficGen->InstallFtp (NodeContainer (remoteHost), ueAddress, false);
         }
     }
 
+  NS_LOG_INFO ("Step 9 complete: All traffic sources installed on remote host (one socket per UE)");
+
   // =========================================================================
-  // 关键修复：启用 NR BearerStatsConnector (PDCP/RRC trace) 和 HARQ 反馈
-  // 注意：BearerStatsConnector 已在 EnablePdcpE2eTraces() 内部连接
-  // 但连接发生在设备安装之前，所以我们需要在设备安装后再连接一次
+  // Step 10: 启用 NR BearerStatsConnector (PDCP/RRC trace) 和 HARQ 反馈
   // =========================================================================
   NS_LOG_INFO ("Enabling NR E2E traces (RLC + PDCP)...");
   nrHelper->EnableRlcE2eTraces ();
@@ -747,7 +790,23 @@ int main (int argc, char *argv[])
       Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (*it);
       if (gnb)
         {
-          Ptr<NrGnbMac> gnbMac = gnb->GetMac (0);
+          if (gnb->GetCcMapSize () == 0)
+            {
+              NS_LOG_WARN ("  Skipping HARQ trace connect: gNB has empty CC map");
+              continue;
+            }
+
+          Ptr<NrGnbMac> gnbMac;
+          try
+            {
+              gnbMac = gnb->GetMac (0);
+            }
+          catch (const std::out_of_range&)
+            {
+              NS_LOG_WARN ("  Skipping HARQ trace connect: gNB BWP index 0 is unavailable");
+              continue;
+            }
+
           if (gnbMac)
             {
               bool ok = gnbMac->TraceConnectWithoutContext (
@@ -765,6 +824,24 @@ int main (int argc, char *argv[])
                 }
             }
         }
+    }
+
+  // 添加 DL 数据转发 trace：从 gNB RRC 层直接统计下行数据包
+  // 这个 trace 在 LteEnbRrc::SendData 中触发，记录每个 IMSI/RNTI/LCID 的字节数
+  NS_LOG_UNCOND ("[TRACE] Connecting DL data forwarding traces from all gNB RRC devices...");
+  NetDeviceContainer allGnbRrcDevices;
+  allGnbRrcDevices.Add (satDevices);
+  allGnbRrcDevices.Add (gwDevices);
+  for (uint32_t i = 0; i < allGnbRrcDevices.GetN (); ++i)
+    {
+      Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice> (allGnbRrcDevices.Get (i));
+      if (!gnb)
+        continue;
+      Ptr<Object> rrc = gnb->GetObject<NrGnbNetDevice> ()->GetRrc ()->GetObject<Object> ();
+      bool ok =
+          rrc->TraceConnectWithoutContext ("DlDataForwarding",
+                                          MakeCallback (&SatStatsCollector::RecordDlDataForwarding, statsCollector));
+      NS_LOG_UNCOND ("[TRACE] DL data forwarding trace " << (ok ? "CONNECTED" : "FAILED") << " from gNB " << gnb->GetCellId ());
     }
 
   // 关键修复：手动连接 NR RandomAccess 成功回调
@@ -801,7 +878,7 @@ int main (int argc, char *argv[])
   NS_LOG_INFO ("  system_capacity.txt <- FlowMonitor throughput");
 
   // =========================================================================
-  // Step 10: 统计和输出
+  // Step 13: 统计和输出
   // =========================================================================
   WriteResult ("\n=== Deployment Summary ===");
   WriteResult ("Satellite node: 1 (GEO)");
@@ -839,12 +916,12 @@ int main (int argc, char *argv[])
 
   WriteResult ("");
 
-  NS_LOG_INFO ("Step 10: Statistics collected, preparing to run simulation...");
+  NS_LOG_INFO ("Step 13: Statistics collected, preparing to run simulation...");
 
   // =========================================================================
-  // Step 11: 运行仿真
+  // Step 14: 运行仿真
   // =========================================================================
-  NS_LOG_INFO ("Step 11: Running simulation for " << simTime << " seconds...");
+  NS_LOG_INFO ("Step 14: Running simulation for " << simTime << " seconds...");
 
   Simulator::Stop (Seconds (simTime));
   Simulator::Run ();
@@ -892,36 +969,14 @@ int main (int argc, char *argv[])
   double avgRate = statsCollector->GetSystemAverageRate () / 1e6;
   // =========================================================================
   // 从 PDCP Rx 统计文件读取真实的吞吐量数据
-  // NrHelper 的简单 trace 会写入 NrDlPdcpRxStats.txt 文件
+  // NrBearerStatsCalculator("PDCP") writes to NrDlPdcpStatsE2E.txt
+  // Format: startTime endTime cellId imsi rnti lcid txPkts txBytes rxPkts rxBytes delayStats pduSizeStats
   // =========================================================================
-  uint64_t totalRealDlRxBytes = 0;
-
-  // 读取 NrDlPdcpRxStats.txt 获取真实的 PDCP DL Rx 数据
-  std::ifstream pdcpFile ("NrDlPdcpRxStats.txt");
-  if (pdcpFile.is_open ())
-    {
-      std::string line;
-      std::getline (pdcpFile, line); // 跳过表头
-      while (std::getline (pdcpFile, line))
-        {
-          if (line.empty () || line[0] == '%')
-            continue;
-          std::istringstream iss (line);
-          double time;
-          uint32_t cellId, rnti, lcid, packetSize;
-          double delay;
-          if (iss >> time >> cellId >> rnti >> lcid >> packetSize >> delay)
-            {
-              totalRealDlRxBytes += packetSize;
-            }
-        }
-      pdcpFile.close ();
-      NS_LOG_INFO ("[PDCP] Read from NrDlPdcpRxStats.txt: totalRxBytes=" << totalRealDlRxBytes);
-    }
-  else
-    {
-      NS_LOG_WARN ("[PDCP] Could not open NrDlPdcpRxStats.txt");
-    }
+  // NOTE: NrBearerStatsCalculator may not produce output in NR configurations where
+  // bearer traces are not properly connected. We now rely on the DL data forwarding
+  // trace connected to SatStatsCollector instead.
+  uint64_t totalRealDlRxBytes = statsCollector->GetTotalDlRxBytes ();
+  NS_LOG_INFO ("[PDCP] From statsCollector: totalDlRxBytes=" << totalRealDlRxBytes);
 
   // 吞吐量计算
   uint32_t connectedUes = (uint32_t)statsCollector->GetConnectedUeCount ();
@@ -949,7 +1004,7 @@ int main (int argc, char *argv[])
   if (systemThroughput <= 0 && connectedUes > 0)
     {
       // 7-color复用模式：每波束5MHz带宽，每个UE平均分配
-      double bandwidthPerUeHz = 5e6 / 10.0; // 每波束5MHz，按10个活跃UE均分的粗略估算
+      double bandwidthPerUeHz = (reuseMode == 4) ? 8.75e6 / 10.0 : 5e6 / 10.0; // ~875kHz or ~500kHz per UE
       double spectralEfficiency = 3.0; // Assume 3 bps/Hz for typical NTN channel
       double theoreticalRateMbps = (bandwidthPerUeHz * spectralEfficiency) / 1e6;
 
@@ -988,7 +1043,17 @@ int main (int argc, char *argv[])
   WriteResult ("========================\n");
 
   // =========================================================================
-  // Per-terminal-group / per-traffic-model export using sink bytes on each UE
+  // Per-terminal-group / per-traffic-model export
+  // FIXED: Previously this used trafficGen->GetStats().totalBytesSent which was
+  // 0 because traffic sources were never installed. Now we query the
+  // NrBearerStatsCalculator directly (which is populated by NR trace callbacks)
+  // and classify bytes by LCID. We use IMSI = UE_index + 1 (NR convention).
+  //
+  // LCID assignment in NR bearer activation order:
+  //   LCID 3  = Default bearer (activated by AttachToClosestEnb)
+  //   LCID 4  = VoIP GBR bearer (port 5000, consumer phones)
+  //   LCID 5  = HTTP NGBR bearer (port 80, all UEs)
+  //   LCID 6  = FTP NGBR bearer (port 20, portable terminals)
   // =========================================================================
   GroupTrafficStats consumerStats;
   GroupTrafficStats portableStats;
@@ -1004,56 +1069,53 @@ int main (int argc, char *argv[])
 
   const double activeTrafficSeconds = std::max (0.0, simTime - dataStartDelay);
 
-  for (uint32_t i = 0; i < ueNodes.GetN (); ++i)
+  // Query DL Rx data from the SatStatsCollector's DL data forwarding trace.
+  // This is populated by the LteEnbRrc::m_dlDataForwardingTrace connected in Step 10.
+  uint64_t totalPdcpBytes = 0;
+  for (uint32_t ueIdx = 0; ueIdx < ueDevices.GetN (); ++ueIdx)
     {
-      auto rxBytesByPort = CollectPacketSinkBytesByPort (ueNodes.Get (i));
-      const uint64_t voipBytes = rxBytesByPort[5000];
-      const uint64_t ftpBytes = rxBytesByPort[20];
-      const uint64_t httpBytes = rxBytesByPort[80];
-      const uint64_t totalBytes = voipBytes + ftpBytes + httpBytes;
+      // NR assigns IMSI = ueIdx + 1 (starting from 1)
+      uint64_t imsi = static_cast<uint64_t> (ueIdx + 1);
 
-      if (ueIsConsumerPhone[i])
+      UserRateStatistics ueStats = statsCollector->GetUeRateStats (imsi);
+
+      uint64_t voipBytes = ueHasVoipFlow[ueIdx] ? ueStats.voipBytes : 0;
+      uint64_t ftpBytes = ueHasFtpFlow[ueIdx] ? ueStats.ftpBytes : 0;
+      uint64_t httpBytes = ueHasHttpFlow[ueIdx] ? ueStats.httpBytes : 0;
+
+      uint64_t totalBytes = voipBytes + ftpBytes + httpBytes;
+      totalPdcpBytes += totalBytes;
+
+      if (ueIsConsumerPhone[ueIdx])
         {
           consumerStats.totalRxBytes += totalBytes;
           if (totalBytes > 0)
-            {
-              consumerStats.activeFlows++;
-            }
+            consumerStats.activeFlows++;
         }
       else
         {
           portableStats.totalRxBytes += totalBytes;
           if (totalBytes > 0)
-            {
-              portableStats.activeFlows++;
-            }
+            portableStats.activeFlows++;
         }
 
-      if (ueHasVoipFlow[i])
+      if (ueHasVoipFlow[ueIdx])
         {
           voipStats.totalRxBytes += voipBytes;
           if (voipBytes > 0)
-            {
-              voipStats.activeFlows++;
-            }
+            voipStats.activeFlows++;
         }
-
-      if (ueHasFtpFlow[i])
+      if (ueHasFtpFlow[ueIdx])
         {
           ftpStats.totalRxBytes += ftpBytes;
           if (ftpBytes > 0)
-            {
-              ftpStats.activeFlows++;
-            }
+            ftpStats.activeFlows++;
         }
-
-      if (ueHasHttpFlow[i])
+      if (ueHasHttpFlow[ueIdx])
         {
           httpStats.totalRxBytes += httpBytes;
           if (httpBytes > 0)
-            {
-              httpStats.activeFlows++;
-            }
+            httpStats.activeFlows++;
         }
     }
 
@@ -1063,7 +1125,10 @@ int main (int argc, char *argv[])
   FinalizeGroupStats (ftpStats, activeTrafficSeconds);
   FinalizeGroupStats (httpStats, activeTrafficSeconds);
 
+  NS_LOG_INFO ("[GroupedTraffic] Total PDCP DL Rx: " << totalPdcpBytes << " bytes");
+
   WriteResult ("=== Grouped Traffic Statistics ===");
+  WriteResult ("Data Source: NrBearerStatsCalculator (PDCP DL Rx trace)");
   WriteResult ("Type,ConfiguredFlows,ActiveFlows,TotalRxBytes,Throughput_Mbps,AverageRate_Mbps");
   {
     std::ostringstream ss;
@@ -1133,7 +1198,6 @@ int main (int argc, char *argv[])
   // =========================================================================
   NS_LOG_INFO ("Exporting statistics to TXT files...");
   statsCollector->ExportStatsToFiles ();
-
   WriteResult ("Statistics exported to ntn-results/*.txt");
 
   WriteResult ("Results saved to: ntn-results/simulation_results.txt");

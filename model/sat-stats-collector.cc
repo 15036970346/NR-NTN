@@ -422,6 +422,12 @@ void SatStatsCollector::RecordNrHarqFeedback (const DlHarqInfo& params)
   uint16_t rnti = params.m_rnti;
   uint8_t harqId = params.m_harqProcessId;
 
+  if (rnti == 0)
+    {
+      NS_LOG_DEBUG ("[HARQ Feedback] RNTI=0, ignoring");
+      return;
+    }
+
   auto& ueStats = m_ueHarqStats[rnti];
 
   // 每个 HARQ 进程独立的传输状态追踪
@@ -486,6 +492,46 @@ void SatStatsCollector::RecordNrHarqFeedback (const DlHarqInfo& params)
                << " ACK=" << ueStats.ackCount << " NACK=" << ueStats.nackCount
                << " TotalTx=" << ueStats.totalTransmissions << " Retx=" << ueStats.retransmissions
                << " RetxRate=" << ueStats.retransmissionRate * 100 << "%");
+}
+
+void SatStatsCollector::RecordDlDataForwarding (uint64_t imsi,
+                                               uint16_t rnti,
+                                               uint8_t lcid,
+                                               uint32_t bytes)
+{
+  NS_LOG_FUNCTION (this << imsi << rnti << (uint16_t)lcid << bytes);
+  NS_LOG_UNCOND ("[DL DATA] imsi=" << imsi << " rnti=" << rnti << " lcid=" << (uint16_t)lcid << " bytes=" << bytes);
+
+  if (imsi == 0 || rnti == 0)
+    {
+      NS_LOG_DEBUG ("[DL Data Forwarding] imsi=0 or rnti=0, ignoring");
+      return;
+    }
+
+  // Record DL bytes for this IMSI/LCID
+  auto& dlStats = m_ueRateStats[imsi];
+  dlStats.totalBytesRx += bytes;
+  dlStats.imsi = imsi;
+
+  // Classify by LCID for grouped traffic stats
+  // LCID 3 = default bearer, LCID 4 = VoIP, LCID 5 = HTTP, LCID 6 = FTP
+  if (lcid == 4)
+    {
+      dlStats.voipBytes += bytes;
+    }
+  else if (lcid == 5)
+    {
+      dlStats.httpBytes += bytes;
+    }
+  else if (lcid == 6)
+    {
+      dlStats.ftpBytes += bytes;
+    }
+  // LCID 3 (default bearer) is also counted in totalBytesRx but not separately
+
+  NS_LOG_DEBUG ("[DL Data Forwarding] IMSI=" << imsi << " RNTI=" << rnti
+               << " LCID=" << (uint16_t)lcid << " bytes=" << bytes
+               << " totalDlRx=" << dlStats.totalBytesRx);
 }
 
 void SatStatsCollector::RecordHarqTransmission (uint16_t rnti, bool isRetransmission)
@@ -968,6 +1014,16 @@ uint64_t SatStatsCollector::GetTotalDlRxBytes () const
 uint32_t SatStatsCollector::GetUeRateStatsCount () const
 {
   return static_cast<uint32_t> (m_ueRateStats.size ());
+}
+
+UserRateStatistics SatStatsCollector::GetUeRateStats (uint64_t imsi) const
+{
+  auto it = m_ueRateStats.find (imsi);
+  if (it != m_ueRateStats.end ())
+    {
+      return it->second;
+    }
+  return UserRateStatistics (); // zero-initialized
 }
 
 void SatStatsCollector::SetPdcpStatsCalculator (Ptr<NrBearerStatsCalculator> pdcpStats)

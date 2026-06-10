@@ -9,7 +9,9 @@
 #include "ns3/packet.h"
 #include "ns3/event-id.h"
 #include "ns3/traced-callback.h"
+#include "ns3/ptr.h"
 #include "sat-mac-phy-sap.h"
+#include "frequency-reuse.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -103,6 +105,16 @@ public:
     // 设置CQI回调
     void SetCqiReportCallback (Callback<void, uint8_t> callback);
 
+    // ==============================================================
+    // 多波束同色 C/I 干扰模型 (helper 注入)
+    // ==============================================================
+    /// 注入 FrequencyReuse 实例 (查同色干扰束). nullptr → 退回到 legacy mock 干扰数。
+    void SetFrequencyReuse (Ptr<FrequencyReuse> fr);
+    /// 单干扰束 C/I_co (dB). 缺省 18, 即主瓣 43 - 旁瓣 25。
+    void SetCoBeamCIDb (double ciDb);
+    /// 当前服务波束 ID, 写入后 SinrTrace 才能区分。
+    void SetCurrentBeamId (uint32_t beamId);
+
 private:
     double GetInterferenceFromTrace (uint32_t beamId);
     double GetAdjacentChannelInterference (uint32_t beamId);
@@ -147,6 +159,10 @@ private:
     TracedCallback<uint16_t, double> m_rsrpTrace;   // (rnti, rsrp_dBm)
     TracedCallback<uint16_t, double> m_sinrTrace;   // (rnti, sinr_dB)
     TracedCallback<uint16_t, double> m_rsrqTrace;   // (rnti, rsrq_dB)
+
+    // 多波束 C/I_co 模型 (helper 注入)
+    Ptr<FrequencyReuse> m_freqReuse;
+    double              m_coBeamCIDb {18.0};
 };
 
 } // namespace ns3

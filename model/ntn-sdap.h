@@ -1,10 +1,10 @@
 /*
- * contrib/geo-sat/model/sat-sdap.h
+ * contrib/geo-sat/model/ntn-sdap.h
  * SDAP (Service Data Adaptation Protocol) layer: QoS flow <-> DRB mapping
  * 3GPP TS 37.324 compliant interface
  */
-#ifndef SAT_SDAP_H
-#define SAT_SDAP_H
+#ifndef NTN_SDAP_H
+#define NTN_SDAP_H
 
 #include "ns3/object.h"
 #include "ns3/packet.h"
@@ -19,14 +19,14 @@ namespace ns3 {
 /**
  * Timestamp tag for SDAP-level E2E delay measurement.
  */
-class SatSdapTag : public Tag
+class NtnSdapTag : public Tag
 {
 public:
     static TypeId GetTypeId (void);
     virtual TypeId GetInstanceTypeId (void) const override;
 
-    SatSdapTag ();
-    SatSdapTag (Time sendTime, uint8_t qfi);
+    NtnSdapTag ();
+    NtnSdapTag (Time sendTime, uint8_t qfi);
 
     virtual void Serialize (TagBuffer i) const override;
     virtual void Deserialize (TagBuffer i) override;
@@ -41,12 +41,12 @@ private:
     uint8_t m_qfi;
 };
 
-class SatSdap : public Object
+class NtnSdap : public Object
 {
 public:
     static TypeId GetTypeId (void);
-    SatSdap ();
-    virtual ~SatSdap ();
+    NtnSdap ();
+    virtual ~NtnSdap ();
 
     void SetRnti (uint16_t rnti);
 
@@ -70,4 +70,4 @@ private:
 
 } // namespace ns3
 
-#endif /* SAT_SDAP_H */
+#endif /* NTN_SDAP_H */

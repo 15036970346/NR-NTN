@@ -15,7 +15,7 @@ SatTerminalProfile::GetTypeId (void)
 }
 
 SatTerminalProfile::SatTerminalProfile ()
-  : m_terminalType (UT_CONSUMER),
+  : m_terminalType (UT_CONSUMER),//默认终端类型是消费级终端
     m_beamId (0),
     m_voiceEnabled (true),
     m_dataServiceType (SAT_DATA_HTTP)
@@ -49,30 +49,30 @@ SatTerminalProfile::GetBeamId () const
 }
 
 void
-SatTerminalProfile::SetVoiceEnabled (bool enabled)
+SatTerminalProfile::SetVoiceEnabled (bool enabled)//设置是否开启语音业务
 {
   m_voiceEnabled = enabled;
 }
 
-bool
+bool//查询是否有语音业务
 SatTerminalProfile::HasVoiceService () const
 {
   return m_voiceEnabled;
 }
 
 void
-SatTerminalProfile::SetDataServiceType (SatDataServiceType type)
+SatTerminalProfile::SetDataServiceType (SatDataServiceType type)//设置数据业务类型
 {
   m_dataServiceType = type;
 }
 
-SatDataServiceType
+SatDataServiceType//获取数据业务类型
 SatTerminalProfile::GetDataServiceType () const
 {
   return m_dataServiceType;
 }
 
-std::string
+std::string//生成终端业务画像描述字符串
 SatTerminalProfile::DescribeTrafficProfile () const
 {
   std::string terminal = (m_terminalType == UT_CONSUMER) ? "UT_CONSUMER" : "UT_PORTABLE";

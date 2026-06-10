@@ -6,10 +6,17 @@
 #include "ns3/event-id.h"
 #include "ns3/nstime.h"
 #include "ns3/traced-callback.h"
+#include "ns3/callback.h"
+#include "ns3/packet.h"
+#include "ns3/spectrum-model.h"
 #include "sat-mac-common.h"
-#include "resource-manager.h"
 #include "sat-phy.h"        // 引入物理层
 #include "sat-ut-phy.h"     // 引入终端物理层(含MultipleAccessMode枚举)
+#include "resource-manager.h"  // UtType 定义
+#include "ntn-mac-tags.h"   // NtnDciTag
+#include "ntn-rlc.h"        // 全栈集成: 下层 RLC
+#include "ntn-phy-error-model.h"  // PHY 错误模型 (SINR -> BLER)
+#include "msg4-demod-model.h"      // qyh 增量: Msg4 BLER-SNR 解调
 
 namespace ns3 {
 
@@ -29,7 +36,51 @@ public:
     };
 
     // 绑定底层物理层指针 (组装网络时使用)
+    // 同时把 phy->SetRxCallback 收口到 DoPhyRx, 经 m_dlCallback 转给上层。
     void SetPhy (Ptr<SatPhy> phy);
+
+    // ====================================================================
+    // 3B (UE 侧对称): 简化数据面接口, 与 NtnGwMac 的 SendDlPdu/SetUlPduCallback
+    // 对称, 让两端 MAC 看起来"形状一样"。
+    // ====================================================================
+    /// 配置 PHY 发送时所需参数 (SpectrumModel/带宽/功率/时长), 一次配置长期复用
+    void SetTxConfig (Ptr<const SpectrumModel> spectrumModel,
+                      double bandwidthHz,
+                      double txPowerDbm,
+                      Time   duration);
+
+    /// 上行: 把上层 packet 经 PHY 推到用户信道
+    void SendUlPdu (Ptr<Packet> packet);
+
+    /// 下行: 注册回调, PHY 上送 (并通过 RNTI 过滤的) 下行包时触发
+    void SetDlPduCallback (Callback<void, Ptr<Packet>> cb);
+
+    /// 设置/获取本 UE 当前用于过滤 DL 与给 UL 打 tag 的 RNTI (默认 0)
+    void     SetRnti (uint16_t rnti) { m_dataRnti = rnti; }
+    uint16_t GetRnti () const { return m_dataRnti; }
+
+    /// qyh 增量: 取本 UE 当前实际生效的 RNTI, 优先序: m_cRnti (正式 C-RNTI) >
+    /// m_tcRnti (TC-RNTI) > m_dataRnti (多 UE 调度过滤 RNTI). 返回 0 表示尚未入网。
+    uint16_t GetActiveRnti () const;
+
+    /// 全栈集成: 注入下层 RLC, DoPhyRx 收到本 UE DL 数据后投递给 RLC 而不是 m_dlCallback
+    void SetRlc (Ptr<NtnRlc> rlc);
+    Ptr<NtnRlc> GetRlc () const { return m_rlc; }
+
+    /// 全栈集成: 注入 PHY 错误模型, DoPhyRx 入口按 BLER 概率 drop user data
+    void SetPhyErrorModel (Ptr<NtnPhyErrorModel> em);
+
+    // qyh 增量: 注入 Msg4 PDCCH/PDSCH 解调模型 (BLER-SNR), ReceiveMsg4 /
+    // ReceiveMsgB(SUCCESS_RAR) 入口调 DecodeMsg4(m_prachSnrDb)。
+    // null/!IsEnabled = 回退原路径 (当前行为不变)。
+    void SetMsg4DemodModel (Ptr<class Msg4DemodModel> model);
+    Ptr<class Msg4DemodModel> GetMsg4DemodModel () const { return m_msg4DemodModel; }
+
+    /// 设置 PRACH 时刻的 SNR (dB), 供 Msg4 解调模型查 BLER. 默认 20 dB.
+    void   SetPrachSnrDb (double s) { m_prachSnrDb = s; }
+    double GetPrachSnrDb () const { return m_prachSnrDb; }
+    /// Msg4 解调累计失败 (PDCCH/PDSCH 伯努利失败) 计数
+    uint32_t GetTotalMsg4DemodFail () const { return m_totalMsg4DemodFail; }
 
     // 状态切换辅助函数
     void SwitchState (UtMacState newState);
@@ -38,6 +89,8 @@ public:
     void ProcessDciAndSchedule (DciInfo dci);
 
     // 核心任务2：执行实际的数据传输操作
+    void DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs);
+    /// qyh 增量: 4 参版本, 带 PUSCH 发射功率 dBm (与 ResourceManager::AdjustUtTxPower 联动)
     void DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs, double txPowerDbm);
 
     // 核心任务3：接收下行数据
@@ -65,10 +118,10 @@ public:
     void SendBsr (uint8_t lcgId, uint32_t bufferSize);
 
     // 设置BSR回调 (用于通知调度器有数据需要发送)
-    void SetBsrCallback (Callback<void, const BsR_MAC_CE&> callback);
+    void SetBsrCallback (Callback<void, BsR_MAC_CE> callback);
 
     // 设置PUCCH回调 (用于向信关站发送UCI)
-    void SetPucchCallback (Callback<void, const PucchInfo&> callback);
+    void SetPucchCallback (Callback<void, PucchInfo> callback);
 
     // 设置PRACH回调 (用于随机接入)
     void SetPrachCallback (Callback<void, const PrachPreamble&> callback);
@@ -86,7 +139,6 @@ public:
 
     // Msg3: 组装 RRCSetupRequest (携带自身 ueIdentity 与收到的 tcRnti) 并上送
     void SendMsg3 ();
-    void DeliverPendingMsg3 ();
 
     // Msg4: 接收 RRCSetup, 比对回显的 ueIdentity 完成竞争解决
     void ReceiveMsg4 (const RrcSetupMessage& msg4);
@@ -110,8 +162,6 @@ public:
     // 设置本 UE 的唯一身份 (40-bit contention resolution ID)
     void SetUeIdentity (uint64_t ueIdentity);
     uint64_t GetUeIdentity () const;
-    void SetRnti (uint16_t rnti);
-    uint16_t GetActiveRnti () const;
 
     // 配置 RA 定时器和最大重传次数
     void SetRaTimers (Time raResponseWindow, Time contentionResolutionTimer, uint8_t maxAttempts);
@@ -120,8 +170,8 @@ public:
     void SetNumPreambles (uint32_t n);
     uint32_t GetNumPreambles () const;
 
-    // 设置 Msg3 发送回调 (上送到 GeoBeamScheduler::ReceiveMsg3Packet)
-    void SetMsg3Callback (Callback<void, Ptr<Packet>> callback);
+    // 设置 Msg3 发送回调 (上送到 GeoBeamScheduler::ReceiveMsg3)
+    void SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback);
 
     // 随机接入完成 (成功/失败) 回调, 便于测试统计
     enum RaResult {
@@ -170,8 +220,8 @@ private:
     bool m_srPending;       // SR挂起标志
     uint8_t m_pendingCqi;   // 待发送的CQI值
     bool m_pendingHarqAck;  // 待发送的HARQ ACK/NACK
-    Callback<void, const BsR_MAC_CE&> m_bsrCallback;
-    Callback<void, const PucchInfo&> m_pucchCallback;
+    Callback<void, BsR_MAC_CE> m_bsrCallback;
+    Callback<void, PucchInfo> m_pucchCallback;
     Callback<void, const PrachPreamble&> m_prachCallback;
     uint32_t m_currentBufferBytes; // 当前缓冲区字节数
     
@@ -181,11 +231,8 @@ private:
     bool m_isRaInitiated;                      // 是否正在执行 RA
     uint32_t m_pendingUlGrant;                 // RAR 中收到的 UL Grant (PRB 数)
     uint8_t m_pendingUlGrantMcs;               // RAR 中收到的 Msg3 MCS
-    double m_pendingUlGrantTxPowerDbm;         // RAR 中收到的 Msg3 目标发射功率
 
     uint64_t m_ueIdentity;                     // 本 UE 的竞争解决身份
-    UtType m_utType;                          // 终端类型
-    uint16_t m_rnti;                          // 已连接业务面使用的 UE 标识
     uint32_t m_currentPreambleId;              // 当前本次 RA 使用的 preambleId
     uint32_t m_currentRaRnti;                  // 当前本次 RA 的 RA-RNTI (区分 PRACH occasion)
     uint16_t m_tcRnti;                         // Msg2 中分配给本 UE 的 TC-RNTI (0 表示尚未获得)
@@ -201,7 +248,7 @@ private:
     EventId m_contentionResolutionTimer;       // 竞争解决定时器 (等 Msg4)
     EventId m_msg3TxEvent;                     // Msg3 延迟发送事件
 
-    Callback<void, Ptr<Packet>>            m_msg3Callback;
+    Callback<void, const RrcSetupRequest&> m_msg3Callback;
     Callback<void, RaResult>                m_raCompleteCallback;
 
     // ---------- 接入过程统计计数器 ----------
@@ -214,12 +261,24 @@ private:
     TracedCallback<uint16_t, uint32_t> m_queueLengthTrace;  // (rnti, bufferBytes)
     TracedCallback<uint16_t, int64_t>  m_queueDelayTrace;   // (rnti, delay_ns)
 
+    // 复用/解复用 (UL Tx / DL Rx)
+    TracedCallback<uint16_t, uint8_t, uint32_t, uint32_t> m_txMacPduTrace;  // (rnti, lcid, rlcSize, macPduSize)
+    TracedCallback<uint16_t, uint8_t, uint32_t, uint32_t> m_rxMacPduTrace;  // (rnti, lcid, macPduSize, sduSize)
+    // PHY→MAC 跨层时延
+    TracedCallback<uint16_t, int64_t>                     m_phyMacDelayTrace;
+
     // ---------- 信道质量门限 ----------
+    // 基线：卫星 EIRP - 路损(190dB) + 手机天线增益(0dBi) = -93 dBm
+    // 链路余量 1.5 dB → RSRP 门限 = -94.5 dBm
+    // 消费级手机 SNR 门限: 3.3 - 1.5 = 1.8 dB
+    // 便携终端 SNR 门限: 22.3 - 1.5 = 20.8 dB
     static constexpr double RSRP_THRESHOLD_DBM    = -94.5;
     static constexpr double SNR_THRESHOLD_CONSUMER = 1.8;
     static constexpr double SNR_THRESHOLD_PORTABLE = 20.8;
 
-    bool CheckChannelQuality () const;
+    bool CheckChannelQuality () const;  // true = 满足门限, false = 信道不足
+
+    UtType m_utType;                               // 终端类型 (影响 SNR 门限选择)
 
     // ---------- 2 步随机接入状态 ----------
     RachType m_rachType;                           // 当前 RA 模式 (默认 FOUR_STEP)
@@ -230,10 +289,26 @@ private:
     // ---------- MAC 层队列时延追踪 ----------
     Time m_bufferArrivalTime;  // 最早未发送数据的入队时间
 
-    // ---------- Msg3 Packet 缓存 (qyh) ----------
-    bool m_hasPendingMsg3;
-    RrcSetupRequest m_pendingMsg3Request;
-    Ptr<Packet> m_pendingMsg3Packet;
+    // ---------- 3B 数据面字段 (与 NtnGwMac 对称) ----------
+    void DoPhyRx (Ptr<Packet> packet);                            // PHY -> MAC 收口
+    void SendHarqAck ();                                          // 收到本 UE 的 DL 后自动回 ACK
+    Ptr<const SpectrumModel>     m_txSpectrumModel;
+    double                       m_txBandwidthHz {20e6};
+    double                       m_txPowerDbm    {23.0};          // 终端默认 23 dBm
+    Time                         m_txDuration    {MilliSeconds (1)};
+    Callback<void, Ptr<Packet>>  m_dlCallback;
+    uint16_t                     m_dataRnti      {0};              // 多 UE 调度用的过滤 RNTI
+                                                                   // (与 m_cRnti 接入流程用的 RNTI 解耦)
+
+    // 全栈集成
+    Ptr<NtnRlc>            m_rlc;
+    Ptr<NtnPhyErrorModel>  m_phyErr;
+
+    // qyh 增量 (S2/S3)
+    Ptr<class Msg4DemodModel> m_msg4DemodModel;
+    // NaN = UE 未显式注入 per-UE SNR → 回退 PHY/调度器默认; 非 NaN = ntn-ra-compare 等注入的 per-UE 值
+    double                    m_prachSnrDb {std::numeric_limits<double>::quiet_NaN ()};
+    uint32_t                  m_totalMsg4DemodFail {0};
 };
 
 } // namespace ns3

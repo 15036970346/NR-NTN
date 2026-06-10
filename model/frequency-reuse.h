@@ -21,7 +21,13 @@ public:
 
     // 设置总带宽和可用RB数
     void Configure (double totalBandwidthHz, uint32_t totalRbs, uint8_t reuseFactor);
-    
+
+    /**
+     * \brief 显式登记某波束所属颜色 (例如 helper 按 g_4ColorFrequencyConfig 中的 colorId 注入)。
+     *        登记后 GetColorForBeam / GetInterferingBeams 才会返回真实物理布局; 不登记走 fallback (beamId % reuseFactor)。
+     */
+    void AddBeam (uint32_t beamId, uint8_t colorId);
+
     // 获取某个波束的频率分配
     std::vector<uint32_t> GetBeamAllocation (uint32_t beamId) const;
     

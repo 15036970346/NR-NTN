@@ -13,7 +13,7 @@
 namespace ns3 {
 
 class RohcCompressor;
-class SatPdcp;
+class NtnPdcp;
 class HarqManager;
 
 class NtnConfigHelper
@@ -33,15 +33,17 @@ public:
   static void EnableRohc (bool enable);
   static void SetRohcMode (uint8_t mode);
   static Ptr<RohcCompressor> CreateRohcCompressor (uint16_t cid);
-  static Ptr<SatPdcp> CreatePdcpWithRohc (uint16_t rnti, uint8_t lcId);
+  static Ptr<NtnPdcp> CreatePdcpWithRohc (uint16_t rnti, uint8_t lcId);
 
   /**
    * \brief 配置HARQ管理器
    * \param harqManager HARQ管理器实例
    * \param enableHarq true: 启用HARQ重传; false: 禁用HARQ（NACK不触发重传）
+   * \param processCount qyh 增量: 每 UE HARQ 进程数 (1/2/4/8/16/32), 默认 8
    * \details 用于对比HARQ开启/关闭时的系统性能差异
    */
-  static void ConfigureHarqManager (Ptr<HarqManager> harqManager, bool enableHarq);
+  static void ConfigureHarqManager (Ptr<HarqManager> harqManager, bool enableHarq,
+                                    uint8_t processCount = 8);
 
 private:
   static Time m_pollRetransmitTimer;

@@ -36,7 +36,7 @@ public:
     SatPdcpStatsCollector ();
     virtual ~SatPdcpStatsCollector ();
 
-    // TracedCallback sinks (matching NR-compatible SatPdcp signatures)
+    // TracedCallback sinks (matching NR-compatible NtnPdcp signatures)
     void DlTxPdu (uint16_t rnti, uint8_t lcid, uint32_t size);
     void DlRxPdu (uint16_t rnti, uint8_t lcid, uint32_t size, uint64_t delayNs);
     void UlTxPdu (uint16_t rnti, uint8_t lcid, uint32_t size);

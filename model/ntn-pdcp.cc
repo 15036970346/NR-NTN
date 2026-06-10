@@ -1,8 +1,9 @@
 /*
- * contrib/geo-sat/model/sat-pdcp.cc
+ * contrib/geo-sat/model/ntn-pdcp.cc
  * GEO satellite PDCP layer with ROHC and NR-compatible TracedCallbacks
  */
-#include "sat-pdcp.h"
+#include "ntn-pdcp.h"
+#include "ntn-rlc.h"
 #include "ns3/log.h"
 #include "ns3/boolean.h"
 #include "ns3/uinteger.h"
@@ -10,48 +11,48 @@
 
 namespace ns3 {
 
-NS_LOG_COMPONENT_DEFINE ("SatPdcp");
-NS_OBJECT_ENSURE_REGISTERED (SatPdcp);
+NS_LOG_COMPONENT_DEFINE ("NtnPdcp");
+NS_OBJECT_ENSURE_REGISTERED (NtnPdcp);
 
-// ==================== SatPdcpTag ====================
+// ==================== NtnPdcpTag ====================
 
-NS_OBJECT_ENSURE_REGISTERED (SatPdcpTag);
+NS_OBJECT_ENSURE_REGISTERED (NtnPdcpTag);
 
 TypeId
-SatPdcpTag::GetTypeId (void)
+NtnPdcpTag::GetTypeId (void)
 {
-    static TypeId tid = TypeId ("ns3::SatPdcpTag")
+    static TypeId tid = TypeId ("ns3::NtnPdcpTag")
         .SetParent<Tag> ()
         .SetGroupName ("SatGeo")
-        .AddConstructor<SatPdcpTag> ();
+        .AddConstructor<NtnPdcpTag> ();
     return tid;
 }
 
 TypeId
-SatPdcpTag::GetInstanceTypeId (void) const
+NtnPdcpTag::GetInstanceTypeId (void) const
 {
     return GetTypeId ();
 }
 
-SatPdcpTag::SatPdcpTag ()
+NtnPdcpTag::NtnPdcpTag ()
     : m_sendTime (Seconds (0))
 {
 }
 
-SatPdcpTag::SatPdcpTag (Time sendTime)
+NtnPdcpTag::NtnPdcpTag (Time sendTime)
     : m_sendTime (sendTime)
 {
 }
 
 void
-SatPdcpTag::Serialize (TagBuffer i) const
+NtnPdcpTag::Serialize (TagBuffer i) const
 {
     int64_t sendTimeNs = m_sendTime.GetNanoSeconds ();
     i.Write (reinterpret_cast<const uint8_t*> (&sendTimeNs), 8);
 }
 
 void
-SatPdcpTag::Deserialize (TagBuffer i)
+NtnPdcpTag::Deserialize (TagBuffer i)
 {
     int64_t sendTimeNs;
     i.Read (reinterpret_cast<uint8_t*> (&sendTimeNs), 8);
@@ -59,53 +60,53 @@ SatPdcpTag::Deserialize (TagBuffer i)
 }
 
 uint32_t
-SatPdcpTag::GetSerializedSize (void) const
+NtnPdcpTag::GetSerializedSize (void) const
 {
     return 8;
 }
 
 void
-SatPdcpTag::Print (std::ostream& os) const
+NtnPdcpTag::Print (std::ostream& os) const
 {
-    os << "SatPdcpTag sendTime=" << m_sendTime.GetNanoSeconds () << "ns";
+    os << "NtnPdcpTag sendTime=" << m_sendTime.GetNanoSeconds () << "ns";
 }
 
 Time
-SatPdcpTag::GetSendTime () const
+NtnPdcpTag::GetSendTime () const
 {
     return m_sendTime;
 }
 
-// ==================== SatPdcp ====================
+// ==================== NtnPdcp ====================
 
 TypeId
-SatPdcp::GetTypeId (void)
+NtnPdcp::GetTypeId (void)
 {
-    static TypeId tid = TypeId ("ns3::SatPdcp")
+    static TypeId tid = TypeId ("ns3::NtnPdcp")
         .SetParent<Object> ()
         .SetGroupName ("SatGeo")
-        .AddConstructor<SatPdcp> ()
+        .AddConstructor<NtnPdcp> ()
         .AddAttribute ("RohcEnabled",
                        "Enable ROHC header compression for NTN",
                        BooleanValue (true),
-                       MakeBooleanAccessor (&SatPdcp::m_rohcEnabled),
+                       MakeBooleanAccessor (&NtnPdcp::m_rohcEnabled),
                        MakeBooleanChecker ())
         .AddTraceSource ("TxPDCP",
                          "PDCP PDU transmitted (rnti, lcid, size)",
-                         MakeTraceSourceAccessor (&SatPdcp::m_txPdu),
-                         "ns3::SatPdcp::TxPduCallback")
+                         MakeTraceSourceAccessor (&NtnPdcp::m_txPdu),
+                         "ns3::NtnPdcp::TxPduCallback")
         .AddTraceSource ("RxPDCP",
                          "PDCP PDU received (rnti, lcid, size, delay_ns)",
-                         MakeTraceSourceAccessor (&SatPdcp::m_rxPdu),
-                         "ns3::SatPdcp::RxPduCallback")
+                         MakeTraceSourceAccessor (&NtnPdcp::m_rxPdu),
+                         "ns3::NtnPdcp::RxPduCallback")
         .AddTraceSource ("RohcCompression",
                          "ROHC compression event (rnti, lcid, origSize, compressedSize)",
-                         MakeTraceSourceAccessor (&SatPdcp::m_rohcTrace),
-                         "ns3::SatPdcp::RohcCallback");
+                         MakeTraceSourceAccessor (&NtnPdcp::m_rohcTrace),
+                         "ns3::NtnPdcp::RohcCallback");
     return tid;
 }
 
-SatPdcp::SatPdcp ()
+NtnPdcp::NtnPdcp ()
     : m_rnti (0),
       m_lcId (0),
       m_rohcEnabled (true),
@@ -114,13 +115,13 @@ SatPdcp::SatPdcp ()
     NS_LOG_FUNCTION (this);
 }
 
-SatPdcp::~SatPdcp ()
+NtnPdcp::~NtnPdcp ()
 {
     NS_LOG_FUNCTION (this);
 }
 
 void
-SatPdcp::SetRohcCompressor (Ptr<RohcCompressor> rohc)
+NtnPdcp::SetRohcCompressor (Ptr<RohcCompressor> rohc)
 {
     m_rohc = rohc;
     if (rohc)
@@ -130,38 +131,55 @@ SatPdcp::SetRohcCompressor (Ptr<RohcCompressor> rohc)
 }
 
 Ptr<RohcCompressor>
-SatPdcp::GetRohcCompressor () const
+NtnPdcp::GetRohcCompressor () const
 {
     return m_rohc;
 }
 
 void
-SatPdcp::SetPdcpSapUser (Ptr<Object> sapUser)
+NtnPdcp::SetPdcpSapUser (Ptr<Object> sapUser)
 {
     m_pdcpSapUser = sapUser;
 }
 
 void
-SatPdcp::SetRnti (uint16_t rnti)
+NtnPdcp::SetRnti (uint16_t rnti)
 {
     m_rnti = rnti;
 }
 
 void
-SatPdcp::SetLcId (uint8_t lcId)
+NtnPdcp::SetLcId (uint8_t lcId)
 {
     m_lcId = lcId;
 }
 
 void
-SatPdcp::DoSendData (Ptr<Packet> p)
+NtnPdcp::SetRlc (Ptr<NtnRlc> rlc)
+{
+    m_rlc = rlc;
+    if (m_rlc)
+    {
+        // RLC 上送回 PDCP DoReceiveData
+        m_rlc->SetReceiveCallback (MakeCallback (&NtnPdcp::DoReceiveData, this));
+    }
+}
+
+void
+NtnPdcp::SetIpRxCallback (Callback<void, Ptr<Packet>> cb)
+{
+    m_ipRxCb = cb;
+}
+
+void
+NtnPdcp::DoSendData (Ptr<Packet> p)
 {
     NS_LOG_FUNCTION (this << p->GetSize ());
 
     uint32_t originalSize = p->GetSize ();
 
     // Add timestamp tag for delay measurement (before compression)
-    SatPdcpTag tag (Simulator::Now ());
+    NtnPdcpTag tag (Simulator::Now ());
     p->AddByteTag (tag);
 
     if (m_rohcEnabled && m_rohc)
@@ -184,11 +202,20 @@ SatPdcp::DoSendData (Ptr<Packet> p)
 
     // Fire NR-compatible TX trace
     m_txPdu (m_rnti, m_lcId, p->GetSize ());
-    NS_LOG_INFO ("PDCP send complete, packet passed to lower layer (RLC)");
+
+    // 下推到 RLC (若已注入); 否则只触发 trace, 老 demo 兼容
+    if (m_rlc)
+    {
+        m_rlc->TransmitPdcpPdu (p);
+    }
+    else
+    {
+        NS_LOG_INFO ("PDCP send complete (no RLC attached, trace only)");
+    }
 }
 
 void
-SatPdcp::DoReceiveData (Ptr<Packet> p)
+NtnPdcp::DoReceiveData (Ptr<Packet> p)
 {
     NS_LOG_FUNCTION (this << p->GetSize ());
 
@@ -220,7 +247,7 @@ SatPdcp::DoReceiveData (Ptr<Packet> p)
 
     // Compute delay from timestamp tag
     uint64_t delayNs = 0;
-    SatPdcpTag tag;
+    NtnPdcpTag tag;
     if (p->FindFirstMatchingByteTag (tag))
     {
         delayNs = (Simulator::Now () - tag.GetSendTime ()).GetNanoSeconds ();
@@ -228,11 +255,16 @@ SatPdcp::DoReceiveData (Ptr<Packet> p)
 
     // Fire NR-compatible RX trace
     m_rxPdu (m_rnti, m_lcId, p->GetSize (), delayNs);
-    NS_LOG_INFO ("PDCP receive complete, packet passed to upper layer (IP)");
+
+    // 上送到 IP/App (若 callback 已设置)
+    if (!m_ipRxCb.IsNull ())
+    {
+        m_ipRxCb (p);
+    }
 }
 
 uint32_t
-SatPdcp::GetIncompletePacketCount () const
+NtnPdcp::GetIncompletePacketCount () const
 {
     return m_incompletePackets;
 }

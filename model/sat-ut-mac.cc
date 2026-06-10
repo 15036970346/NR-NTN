@@ -1,6 +1,9 @@
 // 文件路径：contrib/geo-sat/model/sat-ut-mac.cc
 #include "sat-ut-mac.h"
 #include "sat-phy.h"
+#include "ntn-rlc.h"
+#include "ntn-phy-error-model.h"
+#include "msg4-demod-model.h"
 #include "ns3/simulator.h"
 #include "ns3/log.h"
 #include "ns3/packet.h"
@@ -29,7 +32,19 @@ TypeId SatUtMac::GetTypeId (void) {
         .AddTraceSource ("QueueDelay",
                          "MAC buffer queue delay trace (rnti, delay_ns)",
                          MakeTraceSourceAccessor (&SatUtMac::m_queueDelayTrace),
-                         "ns3::TracedCallback::UintInt64");
+                         "ns3::TracedCallback::UintInt64")
+        .AddTraceSource ("TxMacPdu",
+                         "UL MAC PDU 复用打包 (rnti, lcid, rlcSize, macPduSize)",
+                         MakeTraceSourceAccessor (&SatUtMac::m_txMacPduTrace),
+                         "ns3::TracedCallback::Uint16Uint8Uint32Uint32")
+        .AddTraceSource ("RxMacPdu",
+                         "DL MAC PDU 解复用上送 (rnti, lcid, macPduSize, sduSize)",
+                         MakeTraceSourceAccessor (&SatUtMac::m_rxMacPduTrace),
+                         "ns3::TracedCallback::Uint16Uint8Uint32Uint32")
+        .AddTraceSource ("PhyMacDelay",
+                         "PHY→MAC 跨层时延 (rnti, delay_ns)",
+                         MakeTraceSourceAccessor (&SatUtMac::m_phyMacDelayTrace),
+                         "ns3::TracedCallback::Uint16Int64");
     return tid;
 }
 
@@ -45,9 +60,7 @@ SatUtMac::SatUtMac ()
       m_isRaInitiated (false),
       m_pendingUlGrant (0),
       m_pendingUlGrantMcs (0),
-      m_pendingUlGrantTxPowerDbm (23.0),
       m_ueIdentity (0),
-      m_rnti (0),
       m_currentPreambleId (0),
       m_currentRaRnti (0),
       m_tcRnti (0),
@@ -65,9 +78,9 @@ SatUtMac::SatUtMac ()
       m_totalMsgBTimeouts (0),
       m_utType (UT_CONSUMER),
       m_rachType (RachType::FOUR_STEP),
+      // MsgB 响应窗口: UL prop(300) + processing(2) + DL prop(300) + margin
       m_msgBResponseWindow (MilliSeconds (1500)),
-      m_bufferArrivalTime (Seconds (0)),
-      m_hasPendingMsg3 (false)
+      m_bufferArrivalTime (Seconds (0))
 {
     NS_LOG_FUNCTION (this);
 
@@ -81,6 +94,219 @@ SatUtMac::~SatUtMac () {}
 
 void SatUtMac::SetPhy (Ptr<SatPhy> phy) {
     m_phy = phy;
+    if (m_phy)
+      {
+        // PHY 上送的下行包统一收口到 DoPhyRx
+        m_phy->SetRxCallback (MakeCallback (&SatUtMac::DoPhyRx, this));
+      }
+}
+
+// ====================================================================
+// 3B (UE 侧对称): 简化数据面接口实现
+// ====================================================================
+
+void SatUtMac::SetTxConfig (Ptr<const SpectrumModel> spectrumModel,
+                            double bandwidthHz,
+                            double txPowerDbm,
+                            Time   duration)
+{
+    NS_LOG_FUNCTION (this << bandwidthHz << txPowerDbm << duration);
+    m_txSpectrumModel = spectrumModel;
+    m_txBandwidthHz   = bandwidthHz;
+    m_txPowerDbm      = txPowerDbm;
+    m_txDuration      = duration;
+}
+
+void SatUtMac::SendUlPdu (Ptr<Packet> packet)
+{
+    NS_LOG_FUNCTION (this << packet);
+    if (!m_phy)
+      {
+        NS_LOG_ERROR ("SatUtMac::SendUlPdu before SetPhy()");
+        return;
+      }
+    if (!m_txSpectrumModel)
+      {
+        NS_LOG_ERROR ("SatUtMac::SendUlPdu before SetTxConfig() (no SpectrumModel)");
+        return;
+      }
+
+    // 默认认为是 UL 用户数据 (isAck=false); ACK 走 SendHarqAck() 内部直接打 tag。
+    // 上层调用 SendUlPdu 时若 packet 上已存在 NtnDciTag (例如 ACK 路径), 这里不覆盖。
+    NtnDciTag existing;
+    if (!packet->PeekPacketTag (existing))
+      {
+        NtnDciTag tag (m_dataRnti, false);
+        packet->AddPacketTag (tag);
+      }
+
+    // 简易 PSD: 在唯一 band 上均匀填入 txPower / BW
+    const double txPowerW = std::pow (10.0, (m_txPowerDbm - 30.0) / 10.0);
+    Ptr<SpectrumValue> psd = Create<SpectrumValue> (m_txSpectrumModel);
+    (*psd)[0] = txPowerW / m_txBandwidthHz;
+
+    Ptr<SatSignalParameters> params = Create<SatSignalParameters> ();
+    params->psd = psd;
+    params->duration = m_txDuration;
+    params->packet = packet;
+
+    // UL Mux trace: 1:1 映射
+    m_txMacPduTrace (m_dataRnti, /*lcid=*/3, packet->GetSize (), packet->GetSize ());
+
+    NS_LOG_INFO ("[UE MAC] Tx UL rnti=" << m_dataRnti
+                 << " size=" << packet->GetSize ()
+                 << " B, t=" << Simulator::Now ().GetSeconds () << " s");
+    m_phy->SendPdu (packet, params);
+}
+
+void SatUtMac::SetDlPduCallback (Callback<void, Ptr<Packet>> cb)
+{
+    m_dlCallback = cb;
+}
+
+void SatUtMac::SetRlc (Ptr<NtnRlc> rlc)
+{
+    m_rlc = rlc;
+    if (m_rlc)
+      {
+        // RLC 下推到 MAC 的 UL 发送通路
+        m_rlc->SetTransmitCallback (MakeCallback (&SatUtMac::SendUlPdu, this));
+      }
+}
+
+void SatUtMac::SetPhyErrorModel (Ptr<NtnPhyErrorModel> em)
+{
+    m_phyErr = em;
+}
+
+void SatUtMac::SetMsg4DemodModel (Ptr<Msg4DemodModel> model)
+{
+    m_msg4DemodModel = model;
+}
+
+void SatUtMac::DoPhyRx (Ptr<Packet> packet)
+{
+    NS_LOG_FUNCTION (this << packet);
+
+    // PHY→MAC delay trace
+    NtnPhyDeliveryTag pdt;
+    if (packet->PeekPacketTag (pdt))
+      {
+        Time d = Simulator::Now () - pdt.GetPhyRxTime ();
+        m_phyMacDelayTrace (m_dataRnti, d.GetNanoSeconds ());
+      }
+
+    // 多 UE 模式: 按 NtnDciTag.rnti 过滤; 没 tag 则视为旧单 UE 模式(都收下)
+    NtnDciTag tag;
+    bool hasDci = packet->PeekPacketTag (tag);
+    if (hasDci)
+      {
+        if (m_dataRnti != 0 && tag.GetRnti () != m_dataRnti)
+          {
+            NS_LOG_DEBUG ("[UE MAC] drop DL: tag.rnti=" << tag.GetRnti ()
+                          << " != my rnti=" << m_dataRnti);
+            return;
+          }
+      }
+
+    // PHY 错误模型: 仅对用户数据 (非 HARQ ACK) 启用; ACK 视为控制信令不丢
+    const bool isAck = hasDci && tag.IsAck ();
+
+    // ------------------------------------------------------------------
+    // BLER 基准 SINR 的选取 (端到端物理因果链):
+    //   信道实算 SINR (NtnRxSinrTag) 是物理基准 —— 由 SatPhy::Receive 用本次收到信号的
+    //   PSD 总功率 / 本端热噪声算出, 反映弯管增益 + NOMA β 功率切分等"信道能看见"的部分。
+    //   但单 PSD-per-packet 模型里, 信道看不到"配对 near 在同一 RB 的叠加干扰"与 SIC 残差,
+    //   那部分由 NtnDciTag.effectiveSinrDb (调度器/链路预算算出) 携带, 作 NOMA 修正/覆盖。
+    //
+    //   优先级 (高 -> 低):
+    //     1) NtnDciTag.effectiveSinrDb 存在 (NOMA/调度器路径): 用它作最终 SINR ——
+    //        它已是配对干扰后/SIC 后的有效 SINR, 覆盖物理基准 (near 高、far 低 -> 差异化 BLER)。
+    //     2) 错误模型被显式 SetSinrDb 过 (调用方刻意注入的链路/损伤 SINR, 例如无路损拓扑里
+    //        手工设的低 SINR): 沿用它, 不被信道实算 SINR 误伤覆盖。
+    //     3) NtnRxSinrTag 存在 (信道实算 SINR): 用它作基准 —— 非 NOMA 普通包的真实物理通路。
+    //     4) 否则: 保持错误模型自身 SINR (向后兼容)。
+    // ------------------------------------------------------------------
+    if (m_phyErr && !isAck)
+      {
+        if (hasDci && tag.HasEffectiveSinr ())
+          {
+            // (1) NOMA 修正/覆盖: effSINR 是配对干扰后/SIC 后的有效 SINR
+            m_phyErr->SetSinrDb (tag.GetEffectiveSinrDb ());
+          }
+        else if (m_phyErr->HasExplicitSinr ())
+          {
+            // (2) 调用方刻意注入的链路 SINR: 保持不动 (不被信道实算覆盖)
+          }
+        else
+          {
+            NtnRxSinrTag rxSinrTag;
+            if (packet->PeekPacketTag (rxSinrTag) && rxSinrTag.HasRxSinr ())
+              {
+                // (3) 信道实算 per-packet 接收 SINR 作物理基准
+                m_phyErr->SetSinrDb (rxSinrTag.GetRxSinrDb ());
+              }
+            // (4) 否则保持错误模型自身 SINR (无 tag/向后兼容)
+          }
+      }
+    if (m_phyErr && !isAck && m_phyErr->ShouldDrop ())
+      {
+        NS_LOG_INFO ("[UE MAC] PHY-error drop DL rnti=" << m_dataRnti
+                     << " size=" << packet->GetSize ()
+                     << " B (sinr=" << m_phyErr->GetSinrDb () << " dB"
+                     << ", bler=" << m_phyErr->GetBler () << ")");
+        return;
+      }
+
+    // RxMacPdu trace: 1:1 映射, macPduSize == sduSize
+    m_rxMacPduTrace (m_dataRnti, /*lcid=*/3, packet->GetSize (), packet->GetSize ());
+
+    NS_LOG_INFO ("[UE MAC] Rx DL rnti=" << m_dataRnti
+                 << " size=" << packet->GetSize ()
+                 << " B, t=" << Simulator::Now ().GetSeconds () << " s");
+
+    // 全栈集成: 若注入了 RLC, 走 RLC 上送链 (RLC 内部自己做 SN/重组/重传)
+    // 否则走老的 dlCallback (兼容旧 demo)
+    if (m_rlc)
+      {
+        m_rlc->ReceiveRlcPdu (packet);
+      }
+    else if (!m_dlCallback.IsNull ())
+      {
+        m_dlCallback (packet);
+      }
+
+    // 自动回 HARQ ACK (仅在已配置 m_dataRnti 时回, 避免对旧单 UE demo 产生干扰)
+    if (m_dataRnti != 0)
+      {
+        SendHarqAck ();
+      }
+}
+
+void SatUtMac::SendHarqAck ()
+{
+    if (!m_phy || !m_txSpectrumModel)
+      {
+        return;
+      }
+
+    // 1 字节 ACK 报文 + NtnDciTag(isAck=true)
+    Ptr<Packet> ackPkt = Create<Packet> (1);
+    NtnDciTag tag (m_dataRnti, true);
+    ackPkt->AddPacketTag (tag);
+
+    const double txPowerW = std::pow (10.0, (m_txPowerDbm - 30.0) / 10.0);
+    Ptr<SpectrumValue> psd = Create<SpectrumValue> (m_txSpectrumModel);
+    (*psd)[0] = txPowerW / m_txBandwidthHz;
+
+    Ptr<SatSignalParameters> params = Create<SatSignalParameters> ();
+    params->psd = psd;
+    params->duration = m_txDuration;
+    params->packet = ackPkt;
+
+    NS_LOG_INFO ("[UE MAC] Tx HARQ ACK rnti=" << m_dataRnti
+                 << " t=" << Simulator::Now ().GetSeconds () << " s");
+    m_phy->SendPdu (ackPkt, params);
 }
 
 void SatUtMac::SwitchState (UtMacState newState) {
@@ -92,33 +318,32 @@ void SatUtMac::ProcessDciAndSchedule (DciInfo dci) {
     NS_LOG_FUNCTION (this);
     
     if (m_state == MAC_IDLE) {
-        const bool allowRaMsg3Grant = dci.isUplinkGrant && m_isRaInitiated && m_tcRnti != 0;
-        if (!allowRaMsg3Grant) {
-            NS_LOG_WARN ("UT 处于 IDLE 状态，忽略 DCI 调度。");
-            return;
-        }
-        NS_LOG_INFO ("UT 处于 IDLE，但当前为 RA Msg3 上行授权，允许继续调度。");
+        NS_LOG_WARN ("UT 处于 IDLE 状态，忽略 DCI 调度。");
+        return;
     }
 
     if (dci.isUplinkGrant) {
         NS_LOG_INFO ("解析到上行授权(PUSCH)。 RB分配: " << dci.rbAllocation 
                      << ", MCS: " << (uint32_t)dci.mcs
-                     << ", TxPower: " << dci.txPowerDbm << " dBm"
                      << ", 延迟: " << dci.delayToStart.GetMilliSeconds() << "ms");
-        m_srPending = false;
         
         // 如果有待发送的PUCCH信息(PUSCH可以承载BSR)，先发送BSR
         if (m_currentBufferBytes > 0) {
-            SendBsr (0, m_currentBufferBytes);
+            BsR_MAC_CE bsr;
+            bsr.rnti = 0;
+            bsr.lcgId = 0;
+            bsr.bufferSize = m_currentBufferBytes;
+            SendBsr (bsr.lcgId, bsr.bufferSize);
         }
         
-        m_txEvent = Simulator::Schedule (dci.delayToStart, 
-                                         &SatUtMac::DoTransmit, 
-                                         this, 
-                                         dci.duration, 
+        // 明确选 3 参重载 (避免与 qyh 4 参版本模板推导歧义)
+        void (SatUtMac::*doTx3)(Time, uint32_t, uint8_t) = &SatUtMac::DoTransmit;
+        m_txEvent = Simulator::Schedule (dci.delayToStart,
+                                         doTx3,
+                                         this,
+                                         dci.duration,
                                          dci.rbAllocation,
-                                         dci.mcs,
-                                         dci.txPowerDbm);
+                                         dci.mcs);
         SwitchState (MAC_TX);
     } else {
         NS_LOG_INFO ("解析到下行调度(PDSCH)。 RB分配: " << dci.rbAllocation 
@@ -134,33 +359,34 @@ void SatUtMac::ProcessDciAndSchedule (DciInfo dci) {
     }
 }
 
+// qyh 增量: 4 参重载, 内部转发到 3 参版本 (本期 PUSCH 实际功控由 RRM 在外部完成,
+// 这里只记录日志). 未来真接 PHY 功率控制时可以让 3 参版本调 4 参版本 (txPower=0).
 void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs, double txPowerDbm) {
+    NS_LOG_INFO ("[qyh] DoTransmit (with txPowerDbm=" << txPowerDbm << " dBm)");
+    DoTransmit (duration, rbAllocation, mcs);
+}
+
+uint16_t SatUtMac::GetActiveRnti () const {
+    if (m_cRnti != 0) return m_cRnti;
+    if (m_tcRnti != 0) return m_tcRnti;
+    return m_dataRnti;
+}
+
+void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs) {
     NS_LOG_FUNCTION (this);
-    
+
     SwitchState (MAC_TX);
-    
+
     NS_LOG_INFO ("执行PUSCH数据发送. RB: " << rbAllocation << ", MCS: " << (uint32_t)mcs
-                 << ", TxPower: " << txPowerDbm << " dBm"
                  << ", BufferBytes: " << m_currentBufferBytes);
                   
-    const uint32_t payloadBytes = (m_currentBufferBytes > 0) ? m_currentBufferBytes : 100;
-    Ptr<Packet> macPdu = (m_hasPendingMsg3 && m_pendingMsg3Packet != nullptr) ?
-                         m_pendingMsg3Packet->Copy () :
-                         Create<Packet> (payloadBytes);
-
-    if (!m_hasPendingMsg3)
-      {
-        GenericUlMacHeader ulHeader;
-        ulHeader.SetRnti (GetActiveRnti ());
-        ulHeader.SetPayloadBytes (payloadBytes);
-        ulHeader.SetTransmissionTime (Simulator::Now ());
-        macPdu->AddHeader (ulHeader);
-      }
+    Ptr<Packet> macPdu = Create<Packet> (m_currentBufferBytes > 0 ? m_currentBufferBytes : 100);
     
     if (m_phy) {
         Ptr<SatSignalParameters> params = Create<SatSignalParameters> ();
         params->duration = duration;
         
+        double txPowerDbm = 23.0;
         double bandwidthHz = 180000.0 * rbAllocation;
         double psdValue = txPowerDbm - 10.0 * std::log10 (bandwidthHz);
         
@@ -181,16 +407,6 @@ void SatUtMac::DoTransmit (Time duration, uint32_t rbAllocation, uint8_t mcs, do
     } else {
         NS_LOG_ERROR ("PHY层指针为空，无法发送！");
     }
-
-    if (m_hasPendingMsg3 && !m_msg3Callback.IsNull ())
-      {
-        NS_LOG_INFO ("[Msg3] PUSCH 已发送, 将在 "
-                     << (duration + m_timingAdvance).GetMilliSeconds ()
-                     << " ms 后送达 gNB");
-        Simulator::Schedule (duration + m_timingAdvance,
-                             &SatUtMac::DeliverPendingMsg3,
-                             this);
-      }
     
     // 触发队列时延统计 (从入队到出队)
     if (m_bufferArrivalTime > Seconds (0)) {
@@ -219,7 +435,7 @@ void SatUtMac::ReceiveData (Ptr<Packet> packet, const DciInfo& dci)
     bool decodeSuccess = true;
     SendHarqAck (decodeSuccess, 1);
     
-    NS_LOG_INFO ("ReceiveData: 当前示例未连接上层接收回调，数据在 UT MAC 侧记日志后结束");
+    m_rxPduCallback (packet);
     
     Simulator::Schedule (dci.duration, &SatUtMac::SwitchState, this, MAC_CONNECTED);
 }
@@ -229,17 +445,12 @@ void SatUtMac::ReceiveData (Ptr<Packet> packet, const DciInfo& dci)
 void SatUtMac::SendSchedulingRequest ()
 {
     NS_LOG_FUNCTION (this);
-    const uint16_t activeRnti = GetActiveRnti ();
-    if (activeRnti == 0) {
-        NS_LOG_WARN ("PUCCH Format 0: 当前没有有效 RNTI，SR 不发送");
-        return;
-    }
     
     m_srPending = true;
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_0;
-    pucch.rnti = activeRnti;
+    pucch.rnti = 0;
     pucch.srPending = true;
     pucch.transmissionTime = Simulator::Now ();
     
@@ -254,17 +465,12 @@ void SatUtMac::SendSchedulingRequest ()
 void SatUtMac::SendCqiReport (uint8_t cqi)
 {
     NS_LOG_FUNCTION (this << (uint32_t)cqi);
-    const uint16_t activeRnti = GetActiveRnti ();
-    if (activeRnti == 0) {
-        NS_LOG_WARN ("PUCCH Format 1: 当前没有有效 RNTI，CQI 不发送");
-        return;
-    }
     
     m_pendingCqi = cqi;
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_1;
-    pucch.rnti = activeRnti;
+    pucch.rnti = 0;
     pucch.cqi = cqi;
     pucch.transmissionTime = Simulator::Now ();
     
@@ -278,17 +484,12 @@ void SatUtMac::SendCqiReport (uint8_t cqi)
 void SatUtMac::SendHarqAck (bool ack, uint8_t bitmap)
 {
     NS_LOG_FUNCTION (this << ack << (uint32_t)bitmap);
-    const uint16_t activeRnti = GetActiveRnti ();
-    if (activeRnti == 0) {
-        NS_LOG_WARN ("PUCCH Format 2: 当前没有有效 RNTI，HARQ 反馈不发送");
-        return;
-    }
     
     m_pendingHarqAck = ack;
     
     PucchInfo pucch;
     pucch.format = PucchFormatType::FORMAT_2;
-    pucch.rnti = activeRnti;
+    pucch.rnti = 0;
     pucch.harqAck = ack;
     pucch.harqBitMap = bitmap;
     pucch.transmissionTime = Simulator::Now ();
@@ -337,7 +538,6 @@ void SatUtMac::SendPrachPreamble (uint32_t preambleId, uint8_t format)
     PrachPreamble preamble;
     preamble.preambleId = preambleId;
     preamble.format = format;
-    preamble.utType = static_cast<uint8_t> (m_utType);
     preamble.transmissionTime = Simulator::Now ();
     preamble.isRetransmission = false;
     
@@ -354,16 +554,11 @@ void SatUtMac::SendPrachPreamble (uint32_t preambleId, uint8_t format)
 void SatUtMac::SendBsr (uint8_t lcgId, uint32_t bufferSize)
 {
     NS_LOG_FUNCTION (this << (uint32_t)lcgId << bufferSize);
-    const uint16_t activeRnti = GetActiveRnti ();
-    if (activeRnti == 0) {
-        NS_LOG_WARN ("BSR MAC CE: 当前没有有效 RNTI，BSR 不发送");
-        return;
-    }
     
     BsR_MAC_CE bsr;
     bsr.lcgId = lcgId;
     bsr.bufferSize = bufferSize;
-    bsr.rnti = activeRnti;
+    bsr.rnti = 0;
     
     NS_LOG_INFO ("BSR MAC CE发送! LCG=" << (uint32_t)lcgId 
                  << ", BufferSize=" << bufferSize << " bytes");
@@ -373,12 +568,12 @@ void SatUtMac::SendBsr (uint8_t lcgId, uint32_t bufferSize)
     }
 }
 
-void SatUtMac::SetBsrCallback (Callback<void, const BsR_MAC_CE&> callback)
+void SatUtMac::SetBsrCallback (Callback<void, BsR_MAC_CE> callback)
 {
     m_bsrCallback = callback;
 }
 
-void SatUtMac::SetPucchCallback (Callback<void, const PucchInfo&> callback)
+void SatUtMac::SetPucchCallback (Callback<void, PucchInfo> callback)
 {
     m_pucchCallback = callback;
 }
@@ -473,6 +668,13 @@ void SatUtMac::DoRandomAccess (uint32_t preambleId, uint8_t format)
     preamble.transmissionTime = Simulator::Now ();
     preamble.isRetransmission = (m_raAttempt > 1);
     preamble.raRnti           = m_currentRaRnti;
+    // per-UE PRACH SNR 注入: 优先用上层 (ntn-ra-compare 按位置/仰角) 经 SetPrachSnrDb 注入的值;
+    // 未注入 (NaN) 则回退 PHY 实测 SINR; 都没有则保持 NaN, 由调度器用默认 SNR。
+    if (std::isfinite (m_prachSnrDb)) {
+        preamble.prachSnrDb = m_prachSnrDb;
+    } else if (utPhy) {
+        preamble.prachSnrDb = utPhy->GetLastCalculatedSinr ();
+    }
     if (!m_prachCallback.IsNull ()) {
         m_prachCallback (preamble);
     } else {
@@ -506,8 +708,7 @@ void SatUtMac::ReceiveRar (const RarMessage& rar)
     NS_LOG_INFO ("[Msg2] 收到匹配的 RAR: PreambleID=" << rar.preambleId
                  << " TC-RNTI=0x" << std::hex << rar.tcRnti << std::dec
                  << " TA=" << rar.timingAdvance.GetMicroSeconds () << "μs"
-                 << " UL Grant=" << rar.ulGrantRbs << " PRB"
-                 << " TxPower=" << rar.ulGrantTxPowerDbm << " dBm");
+                 << " UL Grant=" << rar.ulGrantRbs << " PRB");
 
     // 取消 RA Response Timer
     if (m_raResponseTimer.IsRunning ()) {
@@ -519,7 +720,6 @@ void SatUtMac::ReceiveRar (const RarMessage& rar)
     m_timingAdvance     = rar.timingAdvance;
     m_pendingUlGrant    = rar.ulGrantRbs;
     m_pendingUlGrantMcs = rar.ulGrantMcs;
-    m_pendingUlGrantTxPowerDbm = rar.ulGrantTxPowerDbm;
 
     // 在 Msg3 延迟后组装并发送 RRCSetupRequest
     m_msg3TxEvent = Simulator::Schedule (rar.msg3DelayToStart,
@@ -540,13 +740,11 @@ void SatUtMac::SendMsg3 ()
     dci.isUplinkGrant = true;
     dci.rbAllocation  = m_pendingUlGrant;
     dci.mcs           = m_pendingUlGrantMcs;
-    dci.txPowerDbm    = m_pendingUlGrantTxPowerDbm;
     dci.delayToStart  = MicroSeconds (0);
     dci.duration      = MilliSeconds (1);
 
     NS_LOG_INFO ("[Msg3] 组装 DciInfo: RB=" << dci.rbAllocation
                  << " MCS=" << (uint32_t)dci.mcs
-                 << " TxPower=" << dci.txPowerDbm << " dBm"
                  << " TA补偿=" << m_timingAdvance.GetMicroSeconds () << "μs");
 
     // 组装 RRCSetupRequest
@@ -559,13 +757,12 @@ void SatUtMac::SendMsg3 ()
 
     NS_LOG_INFO ("[Msg3] 发送 RRCSetupRequest: TC-RNTI=0x" << std::hex << m_tcRnti
                  << " UE-Id=0x" << m_ueIdentity << std::dec);
-    m_pendingMsg3Request = req;
-    m_hasPendingMsg3 = true;
-    Msg3MacHeader msg3Header;
-    msg3Header.SetRequest (req);
-    m_pendingMsg3Packet = Create<Packet> ();
-    m_pendingMsg3Packet->AddHeader (msg3Header);
-    ProcessDciAndSchedule (dci);
+
+    if (!m_msg3Callback.IsNull ()) {
+        m_msg3Callback (req);
+    } else {
+        NS_LOG_WARN ("[Msg3] msg3 callback 未设置, 无法上送 Msg3!");
+    }
 
     // 启动竞争解决定时器, 等待 Msg4
     NS_LOG_INFO ("[RA] 启动 Contention Resolution Timer: "
@@ -575,31 +772,6 @@ void SatUtMac::SendMsg3 ()
                                                        this);
 
     SwitchState (MAC_TX);
-}
-
-void SatUtMac::DeliverPendingMsg3 ()
-{
-    NS_LOG_FUNCTION (this);
-
-    if (!m_hasPendingMsg3)
-      {
-        return;
-      }
-
-    if (!m_msg3Callback.IsNull () && m_pendingMsg3Packet != nullptr)
-      {
-        NS_LOG_INFO ("[Msg3] PUSCH 已到达 gNB, 开始递交 RRCSetupRequest: TC-RNTI=0x"
-                     << std::hex << m_pendingMsg3Request.tcRnti
-                     << " UE-Id=0x" << m_pendingMsg3Request.ueIdentity << std::dec);
-        m_msg3Callback (m_pendingMsg3Packet->Copy ());
-      }
-    else
-      {
-        NS_LOG_WARN ("[Msg3] msg3 callback 未设置, 无法向 gNB 递交 Msg3!");
-      }
-
-    m_hasPendingMsg3 = false;
-    m_pendingMsg3Packet = nullptr;
 }
 
 void SatUtMac::ReceiveMsg4 (const RrcSetupMessage& msg4)
@@ -614,6 +786,17 @@ void SatUtMac::ReceiveMsg4 (const RrcSetupMessage& msg4)
     NS_LOG_INFO ("[Msg4] 收到 RRCSetup: TC-RNTI=0x" << std::hex << msg4.tcRnti
                  << " echoed UE-Id=0x" << msg4.echoedUeIdentity
                  << " (本地 UE-Id=0x" << m_ueIdentity << ")" << std::dec);
+
+    // qyh 增量: Msg4 PDCCH/PDSCH 解调 (两次伯努利). 失败静默 return, 由竞争解决
+    // 超时驱动 AbortOrRetryRa.
+    if (m_msg4DemodModel && m_msg4DemodModel->IsEnabled ()) {
+        if (!m_msg4DemodModel->DecodeMsg4 (m_prachSnrDb)) {
+            m_totalMsg4DemodFail++;
+            NS_LOG_WARN ("[Msg4] PDCCH/PDSCH 解调失败 (BLER@SNR=" << m_prachSnrDb
+                         << "dB), 静默丢弃 → 等竞争超时重传 (fail=" << m_totalMsg4DemodFail << ")");
+            return;
+        }
+    }
 
     // 关键: 竞争解决 —— 比对回显的 ueIdentity
     if (msg4.echoedUeIdentity != m_ueIdentity) {
@@ -645,7 +828,6 @@ void SatUtMac::ReceiveMsg4 (const RrcSetupMessage& msg4)
 
     m_totalMsg4Received++;        // 统计: 收到有效 Msg4 且信道质量达标
     m_cRnti = msg4.cRnti;
-    m_rnti = m_cRnti;
     m_isRaInitiated = false;
     m_raAttempt = 0;
 
@@ -750,20 +932,6 @@ uint64_t SatUtMac::GetUeIdentity () const
     return m_ueIdentity;
 }
 
-void SatUtMac::SetRnti (uint16_t rnti)
-{
-    m_rnti = rnti;
-}
-
-uint16_t SatUtMac::GetActiveRnti () const
-{
-    if (m_cRnti != 0) {
-        return m_cRnti;
-    }
-
-    return m_rnti;
-}
-
 void SatUtMac::SetRaTimers (Time raResponseWindow, Time contentionResolutionTimer, uint8_t maxAttempts)
 {
     m_raResponseWindow = raResponseWindow;
@@ -781,7 +949,7 @@ uint32_t SatUtMac::GetNumPreambles () const
     return m_numPreambles;
 }
 
-void SatUtMac::SetMsg3Callback (Callback<void, Ptr<Packet>> callback)
+void SatUtMac::SetMsg3Callback (Callback<void, const RrcSetupRequest&> callback)
 {
     m_msg3Callback = callback;
 }
@@ -867,6 +1035,12 @@ void SatUtMac::DoTwoStepRandomAccess (uint32_t preambleId, uint8_t format)
     msgA.transmissionTime  = Simulator::Now ();
     msgA.isRetransmission  = (m_raAttempt > 1);
     msgA.raRnti            = m_currentRaRnti;
+    // per-UE PRACH SNR 注入 (与 4 步 Msg1 同口径), 供 2 步 RA 的 MsgA 检测/Msg4 解调用
+    if (std::isfinite (m_prachSnrDb)) {
+        msgA.prachSnrDb = m_prachSnrDb;
+    } else if (utPhy) {
+        msgA.prachSnrDb = utPhy->GetLastCalculatedSinr ();
+    }
 
     NS_LOG_INFO ("[MsgA] 发送 2 步 RA MsgA: PreambleID=" << preambleId
                  << " UE-Id=0x" << std::hex << m_ueIdentity << std::dec
@@ -903,6 +1077,19 @@ void SatUtMac::ReceiveMsgB (const MsgB& msgB)
     }
 
     if (msgB.type == MsgBType::SUCCESS_RAR) {
+        // qyh 增量: SUCCESS_RAR 也走 Msg4DemodModel 解调判定; 失败重启 MsgB 定时器等重传
+        if (m_msg4DemodModel && m_msg4DemodModel->IsEnabled ()) {
+            if (!m_msg4DemodModel->DecodeMsg4 (m_prachSnrDb)) {
+                m_totalMsg4DemodFail++;
+                NS_LOG_WARN ("[MsgB] SUCCESS_RAR 解调失败 (BLER@SNR=" << m_prachSnrDb
+                             << "dB), 静默丢弃 → 等 MsgB 超时重传 (fail="
+                             << m_totalMsg4DemodFail << ")");
+                m_msgBResponseTimer = Simulator::Schedule (m_msgBResponseWindow,
+                                                            &SatUtMac::OnMsgBResponseTimeout,
+                                                            this);
+                return;
+            }
+        }
         // 验证回显的 ueIdentity
         if (msgB.echoedUeIdentity != m_ueIdentity) {
             NS_LOG_WARN ("[MsgB] SUCCESS_RAR 但 UE-Id 不匹配, 忽略");

@@ -222,7 +222,7 @@ SatRlcStatsCollector::ExportToFile (const std::string& filepath, Time simDuratio
     if (durSec > 0)
     {
         ofs << "\n# Per-mode throughput (bps)\n";
-        for (const std::string& mode : {"AM", "UM", "TM"})
+        for (const std::string mode : {"AM", "UM", "TM"})
         {
             double dlTput = GetModeThroughput (mode, simDuration, true);
             double ulTput = GetModeThroughput (mode, simDuration, false);

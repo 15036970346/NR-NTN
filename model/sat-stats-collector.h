@@ -53,7 +53,7 @@ struct UserRateStatistics {
     uint16_t rnti;
     uint64_t imsi;               // IMSI of the UE
     uint64_t totalBytesTx;       // 总发送字节数
-    uint64_t totalBytesRx;       // 总接收字节数
+    uint64_t totalBytesRx;       // 总接收字节数 (DL)
     double peakRate;             // 峰值速率 (bps)
     double averageRate;          // 平均速率 (bps)
     Time lastUpdateTime;         // 上次更新时间
@@ -61,6 +61,10 @@ struct UserRateStatistics {
     double windowedPeakRate;     // 滑动窗口峰值速率 (bps)
     Time windowStart;            // 当前窗口开始时间
     double currentWindowBytes;   // 当前窗口内字节数
+    // Per-LCID byte counters for grouped traffic statistics
+    uint64_t voipBytes{0};       // LCID 4
+    uint64_t httpBytes{0};       // LCID 5
+    uint64_t ftpBytes{0};       // LCID 6
 };
 
 struct BeamStatistics {
@@ -106,6 +110,15 @@ public:
      * \param params HARQ反馈信息，包含 m_rnti, m_harqProcessId, m_harqStatus
      */
     void RecordNrHarqFeedback (const struct DlHarqInfo& params);
+
+    /**
+     * \brief 接收 DL 数据转发 trace (LteEnbRrc::m_dlDataForwardingTrace)
+     * \param imsi UE IMSI
+     * \param rnti UE RNTI
+     * \param lcid Logical Channel ID (BID)
+     * \param bytes 包大小 (bytes)
+     */
+    void RecordDlDataForwarding (uint64_t imsi, uint16_t rnti, uint8_t lcid, uint32_t bytes);
 
     // ==================== 速率统计（来自 NrBearerStatsCalculator）====================
     /**
@@ -264,6 +277,12 @@ public:
     // 调试：获取详细的吞吐统计用于诊断
     uint64_t GetTotalDlRxBytes () const;
     uint32_t GetUeRateStatsCount () const;
+    /**
+     * \brief Get per-UE rate statistics by IMSI
+     * \param imsi IMSI of the UE
+     * \return UserRateStatistics (fields will be zero-initialized if IMSI not found)
+     */
+    UserRateStatistics GetUeRateStats (uint64_t imsi) const;
     
     // 设置 PDCP stats calculator 用于获取真实吞吐量
     void SetPdcpStatsCalculator (Ptr<NrBearerStatsCalculator> pdcpStats);

@@ -1,339 +1,590 @@
 /*
  * traffic-models.h
  *
- * Comprehensive traffic generation models based on 3GPP TR 37.901 V11.7.0 Clause 5.4.2
- * Implements: Full Buffer, FTP, HTTP, VoIP/RTP traffic models
- *
- * Key design goals:
- * - Saturation-oriented: designed to fill 25 PRB single-beam physical layer capacity
- * - BDP-aware TCP: TCP window sized for GEO RTT (600ms+ RTT)
- * - Closed-loop rate control: MAC queue state monitoring for adaptive transmission
+ * GEO traffic helper that keeps the original geo-sat API surface while
+ * delegating HTTP / FTP / VoIP generation to reusable ns-3 applications.
  */
 
 #ifndef SAT_TRAFFIC_MODELS_H
 #define SAT_TRAFFIC_MODELS_H
 
+#include "ns3/address.h"
+#include "ns3/application.h"
 #include "ns3/application-container.h"
-#include "ns3/node-container.h"
-#include "ns3/ipv4-address.h"
-#include "ns3/ipv4-interface-container.h"
-#include "ns3/object.h"
+#include "ns3/buffer.h"
 #include "ns3/event-id.h"
+#include "ns3/header.h"
+#include "ns3/ipv4-header.h"
+#include "ns3/ipv4-address.h"
+#include "ns3/node-container.h"
+#include "ns3/object.h"
+#include "ns3/packet.h"
+#include "ns3/ptr.h"
+#include "ns3/socket.h"
+#include "ns3/nstime.h"
 #include "ns3/traced-callback.h"
+#include "ns3/type-id.h"
+
+#include <iosfwd>
+#include <functional>
 #include <map>
 #include <memory>
+#include <set>
+#include <string>
+#include <tuple>
+#include <vector>
 
 namespace ns3 {
 
-/**
- * \enum TrafficModelType
- * \brief Traffic model types per 3GPP TR 37.901 Clause 5.4.2
- */
+class Node;
+class PacketSink;
+class UniformRandomVariable;
+class ExponentialRandomVariable;
+class LogNormalRandomVariable;
+class BulkSendApplication;
+class ThreeGppHttpClient;
+class ThreeGppHttpServer;
+class ThreeGppHttpVariables;
+
+// 3GPP TR 37.901 §5.4.2 FTP 流量模型类型
+//  - Model 1: 每用户文件按 Poisson(λ) 到达,每次到达发起一个新文件传输(允许并发)
+//  - Model 2: 单文件串行,一个传完后等指数 reading time 再传下一个
+//  - Model 3: 文件按 Poisson 到达,但同一时刻只允许一个活动传输,未完成则排队
+enum FtpModelType {
+    FTP_MODEL_1 = 1,
+    FTP_MODEL_2 = 2,
+    FTP_MODEL_3 = 3,
+};
+
+// 12 字节 RTP 头 (RFC 3550):V/P/X/CC | M/PT | Seq | Timestamp | SSRC
+class SatRtpHeader : public Header
+{
+  public:
+    static TypeId GetTypeId ();
+    TypeId GetInstanceTypeId () const override;
+    uint32_t GetSerializedSize () const override;
+    void Serialize (Buffer::Iterator start) const override;
+    uint32_t Deserialize (Buffer::Iterator start) override;
+    void Print (std::ostream& os) const override;
+
+    void SetSequenceNumber (uint16_t seq) { m_seq = seq; }
+    uint16_t GetSequenceNumber () const { return m_seq; }
+    void SetTimestamp (uint32_t ts) { m_timestamp = ts; }
+    uint32_t GetTimestamp () const { return m_timestamp; }
+    void SetSsrc (uint32_t ssrc) { m_ssrc = ssrc; }
+    uint32_t GetSsrc () const { return m_ssrc; }
+    void SetMarker (bool marker) { m_marker = marker; }
+    bool GetMarker () const { return m_marker; }
+
+    void SetPayloadType (uint8_t pt) { m_payloadType = pt; }
+    uint8_t GetPayloadType () const { return m_payloadType; }
+
+  private:
+    // 默认 PT=0 (PCMU/G.711),由 VoIP 安装侧按所选 codec 覆写 (SetPayloadType),
+    // 保证 PT 与 codec payload 大小 / 采样率自洽 (任务1)。
+    uint8_t m_payloadType {0};
+    bool m_marker {false};
+    uint16_t m_seq {0};
+    uint32_t m_timestamp {0};
+    uint32_t m_ssrc {0};
+};
+
+// 把 driver 生命周期挂到 ns-3 Application 的 Start/Stop 上,
+// 让 ApplicationContainer::Start/Stop 真正生效。
+class SatFlowDriverApp : public Application
+{
+  public:
+    static TypeId GetTypeId ();
+    SatFlowDriverApp ();
+    ~SatFlowDriverApp () override;
+
+    void SetStartCallback (std::function<void ()> cb);
+    void SetStopCallback (std::function<void ()> cb);
+
+  protected:
+    void StartApplication () override;
+    void StopApplication () override;
+
+  private:
+    std::function<void ()> m_startCb;
+    std::function<void ()> m_stopCb;
+};
+
 enum TrafficModelType {
-    TRAFFIC_FULL_BUFFER,     //!< Full Buffer - peak throughput test (saturation testing)
-    TRAFFIC_FTP,            //!< FTP - TCP-based file transfer
-    TRAFFIC_HTTP,           //!< HTTP - TCP-based web browsing (bursty)
-    TRAFFIC_VOIP_RTP,       //!< VoIP - UDP/RTP real-time voice
-    TRAFFIC_LEGACY_DATA,    //!< Legacy consumer data (backward compatible)
-    TRAFFIC_LEGACY_VOICE,   //!< Legacy voice (backward compatible)
+    TRAFFIC_FULL_BUFFER,
+    TRAFFIC_FTP,
+    TRAFFIC_HTTP,
+    TRAFFIC_VOIP_RTP,
+    TRAFFIC_LEGACY_DATA,   // Backward-compatible alias for HTTP-style consumer data.
+    TRAFFIC_LEGACY_VOICE,  // Backward-compatible alias for VoIP RTP.
+    TRAFFIC_MIXED,         // Multiple traffic models installed on the same generator.
 };
 
-/**
- * \struct TrafficModelStats
- * \brief Statistics for traffic model performance monitoring
- */
 struct TrafficModelStats {
-    uint64_t totalBytesGenerated {0};    //!< Total bytes generated at app layer (L5+ payload)
-    uint64_t totalPacketsGenerated {0};  //!< Total packets generated
-    uint64_t totalBytesSent {0};         //!< Total bytes actually sent (after socket)
-    uint64_t usefulBytesDelivered {0};   //!< Useful user bytes (excluding L2-L4 headers) per TR 37.901 Clause 5.1.2
-    uint64_t bufferUnderrunCount {0};    //!< Buffer underrun events (source couldn't fill fast enough)
-    Time lastGenerateTime {Time (0)};    //!< Last packet generation timestamp
-    double avgGenerateIntervalUs {0};     //!< Average inter-packet interval (microseconds)
-    double peakThroughputBps {0};        //!< Peak 1-second throughput (bits/s) per user
-    double beamPeakThroughputBps {0};    //!< Peak beam-aggregate 1-second throughput (bits/s)
-    uint32_t ipv4Packets {0};            //!< Number of IPv4 packets
-    uint32_t ipv6Packets {0};            //!< Number of IPv6 packets (future)
-    std::map<uint32_t, uint64_t> perUserUsefulBytes; //!< node id -> useful bytes
-    std::map<uint32_t, double>   perUserPeakBps;     //!< node id -> peak Bps
+    uint64_t totalBytesGenerated {0};  // Useful payload bytes generated by the traffic model.
+    uint64_t totalPacketsGenerated {0};
+    uint64_t totalBytesSent {0};       // Bytes emitted toward the network stack (L3+ when available).
+    uint64_t usefulBytesDelivered {0};
+    uint64_t sendBlockedCount {0};
+    Time lastGenerateTime {Time (0)};
+    double avgGenerateIntervalUs {0};
+    double peakThroughputBps {0};
+    uint32_t ipv4Packets {0};
+    std::map<uint32_t, uint64_t> perUserUsefulBytes;
+    std::map<uint32_t, double> perUserPeakBps;
 };
 
-/**
- * \class SatTrafficGenerator
- * \brief Advanced traffic generator with 4 traffic models per 3GPP TR 37.901
- *
- * This class implements:
- * 1. Full Buffer: Always keeps buffer full, for peak throughput testing
- * 2. FTP: TCP large file transfer, BDP-aligned window
- * 3. HTTP: TCP bursty traffic, statistical distribution modeling
- * 4. VoIP/RTP: UDP real-time voice, RTP encapsulation
- *
- * Performance optimization:
- * - Closed-loop rate control: Monitor MAC queue state, auto-adjust发包频率
- * - Packet size mapping: 25 PRB capacity calculation, maximize single packet
- * - ROHC-aware: Consider compressed header overhead in payload calculation
- */
+struct InstalledTerminalTraffic {
+    bool isConsumerPhone {false};
+    bool hasVoip {false};
+    bool hasHttp {false};
+    bool hasFtp {false};
+};
+
 class SatTrafficGenerator : public Object
 {
-public:
+  public:
     static TypeId GetTypeId (void);
 
     SatTrafficGenerator ();
-    virtual ~SatTrafficGenerator ();
+    ~SatTrafficGenerator () override;
 
-    // ========== Configuration ==========
-
-    /**
-     * \brief Set traffic model type
-     * \param type TRAFFIC_FULL_BUFFER | TRAFFIC_FTP | TRAFFIC_HTTP | TRAFFIC_VOIP_RTP
-     */
     void SetTrafficModel (TrafficModelType type);
+    TrafficModelType GetTrafficModel () const;
+    std::vector<TrafficModelType> GetInstalledTrafficModels () const;
+    std::string DescribeInstalledTrafficModels () const;
 
-    /**
-     * \brief Get current traffic model type
-     */
-    TrafficModelType GetTrafficModel () const { return m_modelType; }
-
-    /**
-     * \brief Set target data rate (for Full Buffer mode)
-     * \param rateBitsPerSec Target rate (bits/s)
-     */
     void SetTargetRate (uint64_t rateBitsPerSec);
-
-    /**
-     * \brief Set GEO satellite RTT (for TCP window calculation)
-     * \param rtt RTT delay
-     */
     void SetGeoRtt (Time rtt);
-
-    /**
-     * \brief Set max PRBs per TTI (for packet size calculation)
-     * \param numPrb PRB count
-     */
     void SetMaxPrbPerTti (uint32_t numPrb);
-
-    /**
-     * \brief Set ROHC compressed header size (for net payload calculation)
-     * \param bytes Compressed header bytes
-     */
     void SetRohcOverheadBytes (uint32_t bytes);
-
-    /**
-     * \brief Set application start/stop time used by subsequently installed flows.
-     */
     void SetApplicationWindow (Time start, Time stop);
-
-    /**
-     * \brief Enable/disable closed-loop rate control (MAC queue monitoring)
-     * \param enable true to enable
-     * \param lowWatermarkPercent Low watermark threshold (default 80%)
-     */
     void EnableClosedLoopControl (bool enable, uint8_t lowWatermarkPercent = 80);
+    void SetTcpCongestionTypeId (TypeId typeId);
+    TypeId GetTcpCongestionTypeId () const;
 
-    // ========== Application Installation ==========
+    // ===== 3GPP TR 37.901 §5.4.2 FTP 模型可配置项 =====
+    void SetFtpModel (FtpModelType model);          // 选择 Model 1/2/3 (默认 3)
+    FtpModelType GetFtpModel () const;
+    // 文件大小:截断对数正态分布的目标均值/标准差(字节)与截断区间 [min,max]
+    void SetFtpFileSize (double meanBytes, double stdDevBytes);
+    void SetFtpFileSizeBounds (uint32_t minBytes, uint32_t maxBytes);
+    void SetFtpFixedFileSize (uint32_t fixedBytes);  // >0 时改用固定文件大小模式
+    // Poisson 文件到达率 λ (文件/秒, 用于 Model 1/3 的指数到达间隔)
+    void SetFtpArrivalRate (double filesPerSecond);
+    // Model 2 传完后的指数 reading time 均值(秒)
+    void SetFtpReadingTimeMean (double seconds);
 
-    /**
-     * \brief Install Full Buffer traffic (peak throughput test)
-     *
-     * Full Buffer characteristics:
-     * - Buffer always in "full" state
-     * - Once RLC requests data, immediately fill
-     * - Target: fill 25 PRB single-beam downlink capacity
-     * - Target rate: 10Mbps+ (single user)
-     */
-    ApplicationContainer InstallFullBuffer (NodeContainer sourceNodes, Ipv4Address sinkAddress,
-                                           bool isUplink = false);
+    // ===== 任务1:VoIP codec 可配置项 =====
+    // 默认预设为 AMR 12.2k(8 kHz):active≈32 B@20 ms,SID/comfort-noise≈7 B@160 ms,
+    // RTP 时间戳按真实采样数推进(20 ms@8 kHz=160,160 ms@8 kHz=1280)。
+    // 让 payload 大小与 payloadType / sampleRateHz 自洽。
+    void SetVoipCodec (uint32_t activePayloadBytes,
+                       uint32_t frameMs,
+                       uint32_t silencePayloadBytes,
+                       uint32_t silenceFrameMs,
+                       uint8_t payloadType,
+                       uint32_t sampleRateHz);
+    void SetVoipActivePayloadBytes (uint32_t bytes);
+    void SetVoipFrameMs (uint32_t ms);
+    void SetVoipSilencePayloadBytes (uint32_t bytes);
+    void SetVoipSilenceFrameMs (uint32_t ms);
+    void SetVoipPayloadType (uint8_t pt);
+    void SetVoipSampleRateHz (uint32_t hz);
 
-    /**
-     * \brief Install FTP traffic (TCP-based large file transfer)
-     *
-     * FTP characteristics (3GPP TR 37.901 Clause 5.4.2.2):
-     * - TCP window > Bandwidth-Delay Product (BDP)
-     * - File size: 2GB for static 60s sim, 5GB for fading 164s sim
-     * - MTU: 1280-1500 bytes
-     * - Window Scaling enabled
-     */
-    ApplicationContainer InstallFtp (NodeContainer sourceNodes, Ipv4Address sinkAddress,
+    // ===== 任务3:HTTP 会话/页面到达 Poisson(独立于"内嵌对象数 Poisson") =====
+    // 语义:除了 ThreeGppHttpClient 自身的指数 reading-time 链式浏览外,再叠加一条
+    // 按 Poisson(λ) 到达的"新会话/页面请求"过程(类似 FTP 的 FtpScheduleNextArrival)。
+    // 每次到达让对应的 HTTP client 立即发起一个新的主对象请求。
+    // 默认 λ=0(关闭,保持现有纯链式行为),>0 时启用。
+    void SetHttpSessionArrivalRate (double sessionsPerSecond);
+    double GetHttpSessionArrivalRate () const;
+
+    ApplicationContainer InstallFullBuffer (NodeContainer sourceNodes,
+                                            Ipv4Address sinkAddress,
+                                            bool isUplink = false);
+    ApplicationContainer InstallFtp (NodeContainer sourceNodes,
+                                     Ipv4Address sinkAddress,
                                      bool isUplink = false);
-
-    /**
-     * \brief Install HTTP traffic (TCP-based bursty web browsing)
-     *
-     * HTTP characteristics (3GPP TR 37.901 Clause 5.4.2.3):
-     * - Simulates page parsing delay, main object/embedded object sizes
-     * - Uses statistical distributions: Pareto/Exponential
-     * - Exhibits bursty traffic pattern
-     */
-    ApplicationContainer InstallHttp (NodeContainer sourceNodes, Ipv4Address sinkAddress,
+    ApplicationContainer InstallHttp (NodeContainer sourceNodes,
+                                      Ipv4Address sinkAddress,
                                       bool isUplink = false);
-
-    /**
-     * \brief Install VoIP/RTP traffic (UDP real-time voice)
-     *
-     * VoIP characteristics (3GPP TR 37.901 Clause 5.4.2.4):
-     * - Maintains original 2.4Kbps logic
-     * - RTP protocol encapsulation (UDP transport)
-     * - Small packets: 40-60 bytes (voice + RTP header)
-     * - GEO long delay environment adaptation
-     */
-    ApplicationContainer InstallVoipRtp (NodeContainer sourceNodes, Ipv4Address sinkAddress,
-                                          bool isUplink = false);
-
-    /**
-     * \brief Install Legacy consumer data traffic (backward compatible)
-     */
-    ApplicationContainer InstallLegacyConsumerData (NodeContainer sourceNodes, Ipv4Address sinkAddress,
+    ApplicationContainer InstallHttpDownload (NodeContainer contentServerNodes,
+                                              Ipv4Address clientAddress);
+    ApplicationContainer InstallVoipRtp (NodeContainer sourceNodes,
+                                         Ipv4Address sinkAddress,
+                                         bool isUplink = false);
+    ApplicationContainer InstallLegacyConsumerData (NodeContainer sourceNodes,
+                                                    Ipv4Address sinkAddress,
                                                     bool isUplink = false);
 
-    // ========== Traffic Statistics ==========
+    InstalledTerminalTraffic InstallProfileTraffic (NodeContainer sourceNodes,
+                                                    Ptr<Node> terminalNode,
+                                                    Ipv4Address terminalAddress,
+                                                    bool isUplink = false);
 
-    /**
-     * \brief Get traffic statistics
-     */
-    TrafficModelStats GetStats () const { return m_stats; }
-
-    /**
-     * \brief Reset statistics
-     */
+    TrafficModelStats GetStats () const { return m_totalStats; }
+    TrafficModelStats GetStats (TrafficModelType type) const;
     void ResetStats ();
-
-    /**
-     * \brief Export statistics to file
-     */
     void DumpStats (std::ostream& os) const;
 
-    // ========== Callbacks ==========
-
-    /**
-     * \brief Set MAC queue state callback (for closed-loop control)
-     * Callback signature: void (queue_utilization_percent)
-     */
+    // Provide queue-utilization feedback from an external scheduler/MAC module.
+    void ReportQueueUtilization (double utilizationPercent);
     void SetQueueStateCallback (Callback<void, double> cb);
-
-    /**
-     * \brief Register Application Tx callback (for statistics)
-     */
     void SetTxTraceCallback (Callback<void, Ptr<const Packet>, const Address&> cb);
-
-    // ========== Compatibility Interfaces ==========
+    void OnTypedPacketTx (TrafficModelType type, uint32_t nodeId, Ptr<const Packet> packet);
 
     ApplicationContainer GenerateVoiceTraffic (NodeContainer sourceNodes, Ipv4Address sinkAddress);
-    ApplicationContainer GenerateConsumerDataTraffic (NodeContainer sourceNodes, Ipv4Address sinkAddress, bool isUplink);
-    ApplicationContainer GeneratePortableDataTraffic (NodeContainer sourceNodes, Ipv4Address sinkAddress, bool isUplink);
-    void AttachUserToBeam (uint16_t beamId, Ptr<Node> userNode, Ipv4Address destAddress, TrafficModelType type, bool isUplink);
-    /**
-     * \brief Install all required sinks for the supported TR 37.901 traffic models.
-     *
-     * Callers should install sinks on the actual receiving nodes before creating
-     * flows. Traffic model installers only create source-side applications.
-     */
+    ApplicationContainer GenerateConsumerDataTraffic (NodeContainer sourceNodes,
+                                                      Ipv4Address sinkAddress,
+                                                      bool isUplink);
+    ApplicationContainer GeneratePortableDataTraffic (NodeContainer sourceNodes,
+                                                      Ipv4Address sinkAddress,
+                                                      bool isUplink);
+    void AttachUserToBeam (uint16_t beamId,
+                           Ptr<Node> userNode,
+                           Ipv4Address destAddress,
+                           TrafficModelType type,
+                           bool isUplink);
     ApplicationContainer InstallSink (NodeContainer nodes);
 
-private:
-    // ========== Internal Methods ==========
+    uint64_t GetNodeReceivedBytes (uint32_t nodeId, TrafficModelType type) const;
 
-    /**
-     * \brief Calculate max payload bytes per TTI for Full Buffer
-     *
-     * Based on:
-     * - 25 PRB x 12 subcarriers x 14 symbols x 6 bits (64-QAM) / TTI
-     * - Minus ROHC compressed header overhead
-     * - Minus TCP/IP headers (40 bytes)
-     */
+    // ===================================================================
+    // 公共采样/查询访问器 (功能验证演示专用, functional-demo.cc)
+    // 谨慎、最小: 仅把内部已有的截断对数正态 / 指数采样逻辑暴露为只读采样,
+    // 不改变任何业务流程或仿真状态, 供离线分布验证使用。
+    // ===================================================================
+    /// 采样一个 FTP 文件大小(截断对数正态; 固定大小模式则返回固定值)。
+    /// 直接复用内部 SampleFtpFileSize(), 与真实业务采样完全一致。
+    uint64_t SampleFtpFileSizePublic ();
+    /// 取当前 FTP 文件大小所用对数正态底层正态分布参数 (Mu, Sigma)。
+    void GetFtpLogNormalParams (double& mu, double& sigma);
+    /// 采样一个 VoIP talk-spurt 时长(秒, 指数分布, 均值≈1.3s)。
+    double SampleVoipTalkSpurtSeconds ();
+    /// 采样一个 VoIP silence/turn-gap 时长(秒, 指数分布, 均值≈0.3s)。
+    double SampleVoipSilenceGapSeconds ();
+    /// 本生成器累计发起(spawn)的 FTP 文件数(Model 1/2/3 节奏对比用)。
+    uint64_t GetFtpFilesSpawned () const { return m_ftpFilesSpawned; }
+    /// 任务3:本生成器累计触发的 HTTP 会话/页面 Poisson 到达数(功能验证)。
+    uint64_t GetHttpSessionArrivals () const { return m_httpSessionArrivals; }
+
+  private:
+    struct VoipSessionState {
+        bool legATalking {true};
+        bool inMutualSilence {false};
+        Time stateChangeTime {Time (0)};
+        // 任务4:单时钟幂等推进。会话状态只由 AdvanceVoipSession() 推进到给定时刻,
+        // lastAdvancedTime 记录已推进到的时刻;两条 leg 在同一时刻只会真正推进一次,
+        // 后到的 leg 看到 lastAdvancedTime >= now 直接读取一致快照,不再各自写共享状态,
+        // 消除切换瞬间多发/漏发一帧的竞态。
+        Time lastAdvancedTime {Time (-1)};
+        // 标准语音 ON/OFF:talk spurt 与 silence/turn gap 均改用指数分布(任务2)
+        Ptr<ExponentialRandomVariable> talkSpurtRv;
+        Ptr<ExponentialRandomVariable> turnGapRv;
+    };
+
+    // 3GPP TR 37.901 §5.4.2:每个 FTP 用户的传输驱动状态。
+    // 用一个 SatFlowDriverApp 承载生命周期,逐文件动态创建 BulkSendApplication。
+    struct FtpDriverState {
+        Ptr<Node> node;                              // 发起 FTP 的源节点
+        Ipv4Address sinkAddress;                     // 对端 sink 地址
+        uint32_t nodeId {0};
+        bool active {false};                         // StartApplication 后置 true
+        // 当前文件正在累计的已发字节(由 BulkSend 的 Tx trace 累加),仅作进度参考
+        uint64_t currentFileBytesSent {0};
+        uint64_t currentFileSize {0};
+        bool fileInFlight {false};                   // Model 2/3:是否有活动传输
+        uint32_t pendingArrivals {0};                // Model 3:排队中的到达数
+        Ptr<BulkSendApplication> currentBulk;        // 当前文件的发送应用
+        // 任务2:更健壮的完成检测 + 超时兜底。每个文件分配单调递增 id,
+        // 完成回调(NormalClose)与超时看门狗都带上 id,只对"当前在飞的那个文件"
+        // 生效,避免迟到/串台的事件错误推进模型。
+        uint64_t currentFileId {0};                  // 当前在飞文件的 id
+        uint64_t nextFileId {1};                     // 下一个文件 id 分配器
+        uint64_t filesCompleted {0};                 // 累计真正完成(NormalClose)的文件数
+        uint64_t filesTimedOut {0};                  // 累计超时兜底处理的文件数
+    };
+
     uint32_t CalculateMaxPayloadBytesPerTti () const;
-
-    /**
-     * \brief Calculate TCP BDP window size
-     *
-     * BDP = bandwidth x RTT
-     * GEO: 单波束 25 PRB, RTT=630ms -> BDP ~ 15.9Mbits = 1.98MB
-     * TCP window should be 2-3x BDP to fully utilize link
-     */
     uint32_t CalculateTcpWindowBytes () const;
-
-    /**
-     * \brief Handle MAC queue state feedback (closed-loop control)
-     */
+    ApplicationContainer InstallArpSeedPingsOnce (NodeContainer sourceNodes, Ipv4Address sinkAddress);
+    ApplicationContainer InstallHttpInternal (NodeContainer sourceNodes,
+                                              Ipv4Address sinkAddress,
+                                              bool isUplink,
+                                              bool lightweightProfile);
+    void ApplyTcpCongestionType (Ptr<Socket> socket) const;
+    void ConfigureTcpSocket (Ptr<Socket> socket,
+                             uint32_t preferredSndBufBytes = 0,
+                             uint32_t preferredRcvBufBytes = 0);
     void OnQueueStateFeedback (double utilizationPercent);
-
-    /**
-     * \brief Adjust transmission rate based on queue utilization
-     */
     void AdjustRateForClosedLoop (double utilizationPercent);
+    void PruneInactiveFlows ();
+    void PrimeVoipSession (VoipSessionState& session, Time now) const;
+    // 任务4:单时钟幂等推进会话状态到时刻 now。已推进到(lastAdvancedTime>=now)则直接返回,
+    // 保证同一时刻两条 leg 读到一致快照,推进只发生一次。
+    void AdvanceVoipSession (VoipSessionState& session, Time now) const;
 
-    // ========== Member Variables ==========
+    // ===== 3GPP TR 37.901 §5.4.2 FTP driver 内部实现 =====
+    void EnsureFtpRandomVariables ();                          // 惰性创建 FTP 随机变量
+    uint64_t SampleFtpFileSize ();                            // 采样一个截断对数正态文件大小(或固定大小)
+    Ptr<SatFlowDriverApp> InstallFtpDriver (Ptr<Node> node,   // 在节点上装一个 FTP driver,返回第一个文件的 BulkSend
+                                            Ipv4Address sinkAddress,
+                                            Ptr<BulkSendApplication>& firstBulkOut);
+    Ptr<BulkSendApplication> FtpSpawnFile (const std::shared_ptr<FtpDriverState>& st,
+                                           Time startDelay);   // 动态创建一个新文件的 BulkSend
+    void FtpScheduleNextArrival (const std::shared_ptr<FtpDriverState>& st);  // Model 1/3:排下一个 Poisson 到达
+    void FtpOnArrival (std::weak_ptr<FtpDriverState> weak);                   // Model 1/3:到达事件
+    void FtpOnFileTx (std::weak_ptr<FtpDriverState> weak, Ptr<const Packet> packet);  // BulkSend Tx trace(仅累计进度)
+    void FtpOnFileComplete (const std::shared_ptr<FtpDriverState>& st);       // 一个文件传完后的处理(推进模型)
+    // 任务2:更健壮的完成检测——监听 BulkSend socket 的 NormalClose;只有发完(去重传)
+    // 的真实关闭才触发 FtpOnFileComplete。fileId 用于把迟到事件绑定到正确的文件。
+    void FtpOnSocketClose (std::weak_ptr<FtpDriverState> weak, uint64_t fileId);
+    // 任务2:超时兜底——spawn 时排一个看门狗,到期若该文件仍 inFlight 则视为失败,
+    // 复位 fileInFlight 并按模型推进,避免 socket 异常时 driver 卡死。
+    void FtpWatchdog (std::weak_ptr<FtpDriverState> weak, uint64_t fileId);
+    // 注册 BulkSend 的 NormalClose 回调(需在 socket 创建后,故延迟轮询取 socket)。
+    void FtpScheduleCloseHook (std::weak_ptr<FtpDriverState> weak,
+                               Ptr<BulkSendApplication> bulk,
+                               uint64_t fileId,
+                               uint32_t retriesRemaining = 16);
+
+    // 连接 ns-3 trace 并同时登记对应的 disconnect lambda,ResetStats 时统一断开,
+    // 避免重复 Install 时旧 trace 仍存活导致 AccountTx 双重计数。
+    template <typename ObjectPtrT, typename CallbackT>
+    void RegisterTraceConnect (ObjectPtrT obj,
+                               const std::string& name,
+                               const std::string& context,
+                               CallbackT cb)
+    {
+      if (obj == nullptr)
+        {
+          return;
+        }
+      obj->TraceConnect (name, context, cb);
+      m_traceDisconnects.push_back ([obj, name, context, cb] () {
+        if (obj != nullptr)
+          {
+            obj->TraceDisconnect (name, context, cb);
+          }
+      });
+    }
+
+    template <typename ObjectPtrT, typename CallbackT>
+    void RegisterTraceConnectWithoutContext (ObjectPtrT obj,
+                                             const std::string& name,
+                                             CallbackT cb)
+    {
+      if (obj == nullptr)
+        {
+          return;
+        }
+      obj->TraceConnectWithoutContext (name, cb);
+      m_traceDisconnects.push_back ([obj, name, cb] () {
+        if (obj != nullptr)
+          {
+            obj->TraceDisconnectWithoutContext (name, cb);
+          }
+      });
+    }
+
+    Ptr<Node> FindNodeByAddress (Ipv4Address address) const;
+    Ipv4Address GetPrimaryIpv4Address (Ptr<Node> node) const;
+    void RegisterNodeAddresses (NodeContainer nodes);
+    void RegisterNodeAddresses (Ptr<Node> node);
+    void RegisterManagedTcpSocket (Ptr<Socket> socket,
+                                   uint32_t preferredSndBufBytes = 0,
+                                   uint32_t preferredRcvBufBytes = 0);
+    void ScheduleManagedTcpSocketRegistration (Ptr<Application> app,
+                                               uint32_t preferredSndBufBytes = 0,
+                                               uint32_t preferredRcvBufBytes = 0,
+                                               uint32_t retriesRemaining = 8);
+    void RegisterIpv4TcpTxTrace (Ptr<Node> node,
+                                 TrafficModelType type,
+                                 uint16_t trackedPort,
+                                 bool matchSourcePort);
+    void NotifyIpv4TcpTx (std::string context,
+                          const Ipv4Header& header,
+                          Ptr<const Packet> packet,
+                          uint32_t interface);
+    void ApplyManagedTcpSocketRateControl ();
+    void OnHttpClientConnectionEstablished (Ptr<const ThreeGppHttpClient> httpClient);
+    void OnHttpServerConnectionEstablished (Ptr<const ThreeGppHttpServer> httpServer,
+                                           Ptr<Socket> socket);
+    Ptr<ThreeGppHttpServer> EnsureHttpServer (Ptr<Node> node,
+                                             Ipv4Address localAddress,
+                                             bool lightweightProfile,
+                                             bool uploadProfile = false);
+    void ConfigureHttpVariables (Ptr<ThreeGppHttpVariables> variables,
+                                 bool lightweightProfile,
+                                 bool uploadProfile = false) const;
+    // 任务3:HTTP 会话/页面到达 Poisson 过程。每个 source(浏览方)注册一个 spawn
+    // 上下文;到达时按 Poisson(λ) 立即在该节点新建一个 ThreeGppHttpClient 会话
+    // (短连接:取一个页面后由其自身链式逻辑结束),与"内嵌对象数 Poisson"完全分开。
+    // 默认 λ=0 时不注册,保持现有纯链式行为。
+    struct HttpArrivalContext {
+        Ptr<Node> clientNode;            // 发起浏览的节点(下行=UE;上行=远端)
+        Ipv4Address serverAddress;       // 目标 HTTP server 地址
+        Ipv4Address clientAddress;       // 浏览方自身地址(统计上下文 / ARP)
+        uint32_t rxNodeId {0};           // 收包统计归属的节点 id
+        TrafficModelType statType {TRAFFIC_HTTP};
+        uint16_t serverPort {80};
+        bool lightweightProfile {false};
+        bool uploadProfile {false};
+    };
+    void RegisterHttpSessionArrival (const HttpArrivalContext& ctx);
+    void HttpScheduleNextSessionArrival (std::size_t ctxIndex);
+    void HttpOnSessionArrival (std::size_t ctxIndex);
+    void EnsureHttpSessionArrivalRv ();
+
+    void RecordReceivedPacket (uint32_t nodeId, TrafficModelType type, Ptr<const Packet> packet);
+    void NotifyPacketTx (std::string context, Ptr<const Packet> packet);
+    void NotifyPacketRx (std::string context, Ptr<const Packet> packet, const Address& from);
+    void NotifyPacketRxNoAddress (std::string context, Ptr<const Packet> packet);
+    void MarkTrafficModelInstalled (TrafficModelType type);
+    static const char* TrafficModelTypeToString (TrafficModelType type);
 
     TrafficModelType m_modelType {TRAFFIC_FULL_BUFFER};
+    std::set<TrafficModelType> m_installedTypes;
 
-    // Performance parameters
-    uint64_t m_targetRateBps {10'000'000};    //!< Target rate 10Mbps
-    Time m_geoRtt {MilliSeconds (630)};        //!< GEO RTT (600ms + 30ms processing)
-    uint32_t m_maxPrbPerTti {25};             //!< Max PRBs per TTI (single beam)
-    uint32_t m_rohcOverheadBytes {2};         //!< ROHC compressed header (typical 2 bytes)
-    uint16_t m_mtu {1500};                     //!< MTU
-    Time m_appStartTime {Seconds (1.0)};       //!< Absolute application start time
-    Time m_appStopTime {Seconds (100.0)};      //!< Absolute application stop time
+    uint64_t m_targetRateBps {10'000'000};
+    Time m_geoRtt {MilliSeconds (630)};
+    uint32_t m_maxPrbPerTti {25};
+    uint32_t m_rohcOverheadBytes {2};
+    uint16_t m_mtu {1500};
+    Time m_appStartTime {Seconds (1.0)};
+    Time m_appStopTime {Seconds (100.0)};
+    TypeId m_tcpCongestionTypeId;
 
-    // Closed-loop rate control
+    // ===== 3GPP TR 37.901 §5.4.2 FTP 模型配置 =====
+    uint8_t m_ftpModel {FTP_MODEL_3};               // 默认 Model 3
+    double m_ftpFileSizeMeanBytes {2'000'000.0};    // 截断对数正态目标均值,默认 2 MB(3GPP 典型)
+    double m_ftpFileSizeStdDevBytes {1'000'000.0};  // 目标标准差,默认 1 MB
+    uint32_t m_ftpFileSizeMinBytes {100'000};       // 截断下限 100 KB
+    uint32_t m_ftpFileSizeMaxBytes {5'000'000};     // 截断上限 5 MB
+    uint32_t m_ftpFixedFileSizeBytes {0};           // >0 时使用固定文件大小
+    double m_ftpArrivalRate {0.5};                  // Poisson 到达率 λ=0.5 文件/秒 (Model 1/3)
+    double m_ftpReadingTimeMeanSeconds {5.0};       // Model 2 reading time 指数均值 5s
+    // FTP 文件大小(截断对数正态)与到达/阅读时间(指数)随机变量,惰性创建
+    Ptr<LogNormalRandomVariable> m_ftpFileSizeRv;
+    Ptr<ExponentialRandomVariable> m_ftpArrivalRv;
+    Ptr<ExponentialRandomVariable> m_ftpReadingTimeRv;
+    std::vector<std::shared_ptr<FtpDriverState>> m_ftpDrivers;  // 跟踪所有 FTP driver,ResetStats 时停掉
+    uint64_t m_ftpFilesSpawned {0};                 // 累计发起的 FTP 文件数(功能验证: Model 节奏对比)
+
+    // ===== 任务1:VoIP codec 配置(默认 AMR 12.2k @ 8 kHz)=====
+    uint32_t m_voipActivePayloadBytes {32};   // active speech 帧载荷 ≈32 B(AMR 12.2k/20 ms)
+    uint32_t m_voipFrameMs {20};              // active 帧间隔 20 ms
+    uint32_t m_voipSilencePayloadBytes {7};   // SID/comfort-noise 帧 ≈7 B
+    uint32_t m_voipSilenceFrameMs {160};      // SID 帧间隔 160 ms(DTX)
+    uint8_t m_voipPayloadType {96};           // 动态 PT 96(AMR 走动态范围;G.711 时用 0)
+    uint32_t m_voipSampleRateHz {8000};       // 采样率 8 kHz(窄带语音)
+
+    // ===== 任务2:FTP 超时兜底安全系数 =====
+    // 看门狗超时 = 估计传输时间 * 安全系数 + 往返时延余量。安全系数留足重传/慢启动余量。
+    double m_ftpTimeoutSafetyFactor {4.0};
+
+    // ===== 任务3:HTTP 会话/页面到达 Poisson =====
+    double m_httpSessionArrivalRate {0.0};    // λ(会话/秒);默认 0=关闭(纯链式浏览)
+    Ptr<ExponentialRandomVariable> m_httpSessionArrivalRv;
+    uint64_t m_httpSessionArrivals {0};       // 累计触发的会话到达数(功能验证)
+    // 每个浏览方的 Poisson 到达 spawn 上下文;到达事件按下标引用,生成器存活期间稳定。
+    std::vector<HttpArrivalContext> m_httpArrivalContexts;
+    bool m_httpArrivalActive {false};         // 业务窗口内是否允许继续排到达
+    // 仅用于离线分布采样验证(functional-demo)的 VoIP 指数随机变量, 与真实会话状态机
+    // 持有的 talkSpurtRv/turnGapRv 互不干扰, 惰性创建。
+    Ptr<ExponentialRandomVariable> m_voipTalkSampleRv;
+    Ptr<ExponentialRandomVariable> m_voipGapSampleRv;
+
     bool m_closedLoopControlEnabled {false};
     uint8_t m_lowWatermarkPercent {80};
     uint8_t m_highWatermarkPercent {95};
-    double m_currentRateMultiplier {1.0};      //!< Current rate multiplier (1.0=normal, 2.0=accelerated)
+    double m_currentRateMultiplier {1.0};
     Callback<void, double> m_queueStateCallback;
-    EventId m_closedLoopAdjustmentEvent;
 
-    // Statistics
-    TrafficModelStats m_stats;
+    TrafficModelStats m_totalStats;
+    std::map<TrafficModelType, TrafficModelStats> m_statsByType;
     Callback<void, Ptr<const Packet>, const Address&> m_txTraceCallback;
-    uint16_t m_port {9};  //!< Legacy port for backward compatibility
 
-    // Internal state
-    std::map<Ptr<Socket>, uint64_t> m_socketTxBytes;
-    std::map<Ptr<Socket>, EventId> m_pendingTxEvents;
-    std::map<Ptr<Socket>, bool> m_socketConnected;
-
-    /**
-     * \brief Per-flow runtime state used by recursive transmission loops.
-     *
-     * Held via shared_ptr and captured by value in std::function closures so
-     * the state outlives the Install* method that creates it (fixing the
-     * previous reference-capture dangling-pointer bug).
-     */
     struct FlowState {
         Ptr<Socket> socket;
+        TrafficModelType type {TRAFFIC_FULL_BUFFER};
         uint32_t nodeId {0};
-        uint32_t packetSize {0};          //!< Application-layer payload size
-        uint32_t headerOverheadBytes {0}; //!< TCP/UDP/IP/RTP header bytes per packet (not sent, used to adjust useful bytes)
-        uint64_t bytesSent {0};
-        uint64_t fileSizeBytes {0};       //!< FTP target; 0 = unbounded
-        Time     baseInterval {Time (0)}; //!< Base inter-packet interval
+        uint32_t packetSize {0};
+        Time baseInterval {Time (0)};
+        bool active {true};
+        bool started {false};
+        bool voiceVadEnabled {false};
+        bool voiceActive {true};
+        bool lastVoiceActive {false};
+        bool isVoipLegA {false};
+        uint32_t activePacketSize {0};
+        uint32_t silencePacketSize {0};
+        Time silenceInterval {Time (0)};
+        Time stateChangeTime {Time (0)};
+        std::shared_ptr<VoipSessionState> voipSession;
+        std::function<void (void)> driver;
         uint16_t rtpSeq {0};
         uint32_t rtpTimestamp {0};
-        uint32_t pageCount {0};
-        bool     active {true};
-        // Windowed peak tracking (rolling 1-second window)
-        Time     windowStart {Time (0)};
-        uint64_t windowBytes {0};
-        double   peakBytesPerSec {0};
-        std::function<void(void)> driver; //!< Recursive tx driver (captures shared_ptr to self)
     };
 
-    std::vector<std::shared_ptr<FlowState>> m_flows; //!< Keeps flow state alive for simulation lifetime
-    uint64_t m_totalWindowBytes {0};                  //!< Aggregate across flows for beam-peak tracking
-    Time     m_totalWindowStart {Time (0)};
+    std::vector<std::shared_ptr<FlowState>> m_flows;
+    std::vector<Ptr<SatFlowDriverApp>> m_driverApps;   // 跟踪挂在 node 上的 driver app,ResetStats 时统一停掉
+    // Issue 6: 跟踪通过 Helper 安装出来的标准 ns-3 应用 (BulkSendApplication /
+    // ThreeGppHttpClient / ThreeGppHttpServer),ResetStats 时一并 SetStopTime,
+    // 避免它们在统计被清空之后继续偷偷跑、产生"隐形网络负载"。
+    std::vector<Ptr<Application>> m_managedApps;
+    uint64_t m_totalWindowBytes {0};
+    Time m_totalWindowStart {Time (0)};
+    std::map<uint32_t, uint64_t> m_totalWindowBytesByNode;
+    std::map<uint32_t, Time> m_totalWindowStartByNode;
+    std::map<uint32_t, double> m_totalFlowPeakBpsByNode;
+    std::map<std::pair<TrafficModelType, uint32_t>, uint64_t> m_typeWindowBytesByFlow;
+    std::map<std::pair<TrafficModelType, uint32_t>, Time> m_typeWindowStartByFlow;
+    std::map<std::pair<TrafficModelType, uint32_t>, double> m_typeFlowPeakBpsByFlow;
 
-    /** Apply closed-loop multiplier to a base interval. */
+    std::map<Ipv4Address, Ptr<Node>> m_nodesByAddress;
+    struct HttpServerProfile
+    {
+        bool lightweightProfile {false};
+        bool uploadProfile {false};
+    };
+    std::map<uint32_t, Ptr<ThreeGppHttpServer>> m_httpServersByNodeId;
+    std::map<uint32_t, HttpServerProfile> m_httpServerProfilesByNodeId;
+    std::map<TrafficModelType, std::map<uint32_t, uint64_t>> m_rxBytesByType;
+    struct ManagedTcpSocketState
+    {
+        uint32_t baseSndBufBytes {0};
+        uint32_t baseRcvBufBytes {0};
+    };
+    // 用 std::map 替代 vector:O(log N) 去重,避免 HTTP server 多连接场景下 list
+    // 线性膨胀;HTTP server accepted socket 现在也可以安全加入,继续响应闭环。
+    std::map<Ptr<Socket>, ManagedTcpSocketState> m_managedTcpSockets;
+    std::set<std::tuple<uint32_t, TrafficModelType, uint16_t, bool>> m_ipv4TcpTxTraceRegistry;
+    std::set<std::tuple<uint32_t, uint32_t, int64_t>> m_arpSeedRegistry;
+    // ResetStats 时调用这些 lambda 把已注册的 ns-3 trace 一一断开,
+    // 避免后续重新 Install 同一 (node, type, port) 时出现双重计数。
+    std::vector<std::function<void ()>> m_traceDisconnects;
+    // VoIP SSRC 在生成器内单调递增,避免 (nodeId<<1) 在 nodeId ≥ 2^31 时溢出。
+    uint32_t m_nextSsrc {0xC0DE0000u};
+
     Time ScaledInterval (Time base) const;
-
-    /** Update stats for a successful Tx, including per-user + peak tracking. */
     void AccountTx (FlowState& fs, uint32_t bytesSentOnWire, uint32_t usefulBytes);
-
-    // Constants
-    static constexpr uint32_t TCP_HEADER_BYTES = 40;        //!< TCP+IP header
-    static constexpr uint32_t UDP_HEADER_BYTES = 28;       //!< UDP+IP header
-    static constexpr uint32_t RTP_HEADER_BYTES = 12;        //!< RTP header
-    static constexpr uint32_t IPv4_HEADER_BYTES = 20;       //!< IPv4 header
-    static constexpr uint32_t MAX_RTP_PAYLOAD_VOIP = 244;   //!< RFC3550 max RTP payload for VoIP
+    void AccountTx (TrafficModelType type, uint32_t nodeId, uint32_t bytesSentOnWire, uint32_t usefulBytes);
+    void UpdateTxStats (TrafficModelStats& stats, uint32_t bytesSentOnWire, uint32_t usefulBytes, Time now);
+    void UpdatePeakStats (TrafficModelStats& stats,
+                          uint32_t nodeId,
+                          uint64_t& windowBytes,
+                          Time& windowStart,
+                          double& flowPeakBytesPerSec,
+                          uint32_t usefulBytes,
+                          Time now);
+    static constexpr uint16_t LEGACY_PORT = 9;
+    static constexpr uint16_t FTP_PORT = 20;
+    static constexpr uint16_t HTTP_PORT = 80;
+    static constexpr uint16_t VOIP_PORT = 5000;
+    static constexpr uint32_t TCP_HEADER_BYTES = 40;
+    static constexpr uint32_t UDP_IPV4_HEADER_BYTES = 28;   // IP(20) + UDP(8)
 };
 
 } // namespace ns3

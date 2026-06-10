@@ -28,16 +28,18 @@ enum class HarqState {
 
 // HARQ进程信息 (重命名为SatHarqProcess避免与nr模块冲突)
 struct SatHarqProcess {
-    uint8_t processId;         // 进程ID (0-7)
-    uint16_t rnti;             // 用户ID
-    uint32_t txBuffer;        // 发送缓存
-    uint32_t txBytes;         // 已发送字节数
-    uint8_t mcs;              // 调制编码策略
-    uint8_t rvIndex;          // 冗余版本索引 (0-3 for IR)
-    HarqState state;          // 当前状态
-    uint8_t retransmitCount;  // 重传次数
-    Time startTime;           // 开始时间
-    Ptr<Packet> packet;       // 数据包副本
+    uint8_t processId {0};         // 进程ID
+    uint16_t rnti {0};             // 用户ID
+    uint32_t txBuffer {0};         // 发送缓存
+    uint32_t txBytes {0};          // 已发送字节数
+    uint8_t mcs {0};               // 调制编码策略
+    uint8_t rvIndex {0};           // 当前冗余版本值 (0/2/3/1)
+    uint8_t rvSequenceIndex {0};   // RV 序列位置
+    HarqState state {HarqState::IDLE}; // 当前状态
+    uint8_t retransmitCount {0};   // 已执行重传次数
+    Time startTime {Seconds (0)};  // 开始时间
+    Ptr<Packet> packet;            // 数据包副本
+    EventId ackTimeoutEvent;       // 等待 ACK/NACK 的超时事件
 };
 
 // HARQ反馈信息 (重命名为SatHarqFeedback避免与nr模块冲突)
@@ -45,13 +47,14 @@ struct SatHarqFeedback {
     uint16_t rnti;
     uint8_t processId;
     bool ack;           // true=ACK, false=NACK
-    uint8_t rvIndex;   // 下一个冗余版本
+    uint8_t rvIndex {0};   // 兼容字段: 当前实现会自行推进 RV 序列
 };
 
 class HarqManager : public Object
 {
 public:
     static TypeId GetTypeId (void);
+    static constexpr uint8_t INVALID_PROCESS_ID = 0xFF;
     HarqManager ();
     virtual ~HarqManager ();
 
@@ -66,6 +69,22 @@ public:
      * \brief 获取HARQ是否启用
      */
     bool IsHarqEnabled () const;
+
+    /**
+     * \brief 设置每 UE HARQ 进程数
+     * \param count 仅支持 1 / 2 / 4 / 8 / 16 / 32
+     */
+    void SetProcessCount (uint8_t count);
+
+    /**
+     * \brief 获取当前 HARQ 进程数
+     */
+    uint8_t GetProcessCount () const;
+
+    /**
+     * \brief 检查进程数配置是否合法
+     */
+    static bool IsSupportedProcessCount (uint8_t count);
 
     // ==================== HARQ进程管理 ====================
     // 开启新传输 (分配HARQ进程)
@@ -83,6 +102,13 @@ public:
     // ==================== IR增量冗余 ====================
     // 获取下一个冗余版本 (用于重传)
     uint8_t GetNextRedundancyVersion (uint16_t rnti, uint8_t processId);
+
+    // 获取当前冗余版本 (用于构造重传 DCI)
+    uint8_t GetCurrentRedundancyVersion (uint16_t rnti, uint8_t processId) const;
+
+    // 获取进程已执行的重传次数 (终态时仍保留, 供 OLLA 判定"首传(rv==0)是否成功":
+    // retransmitCount==0 表示该进程从未重传, 终态 SUCCESS 即首传 ACK)。
+    uint8_t GetRetransmitCount (uint16_t rnti, uint8_t processId) const;
     
     // 计算IR增益因子
     double CalculateIrGain (uint8_t rvIndex) const;
@@ -105,18 +131,21 @@ public:
 
 private:
     SatHarqProcess* GetProcess (uint16_t rnti, uint8_t processId);
+    const SatHarqProcess* GetProcess (uint16_t rnti, uint8_t processId) const;
     SatHarqProcess* AllocateProcess (uint16_t rnti);
     void ScheduleRetransmission (uint16_t rnti, uint8_t processId);
     void ProcessTimeout (uint16_t rnti, uint8_t processId);
+    void ScheduleAckTimeout (SatHarqProcess& process);
+    void FinalizeProcess (SatHarqProcess& process, HarqState finalState);
 
-    static const uint8_t MAX_HARQ_PROCESSES = 8;
+    static const uint8_t DEFAULT_HARQ_PROCESSES = 8;
     static const uint8_t MAX_RETRANSMISSIONS = 4;
     static const Time HARQ_ACK_TIMEOUT;
 
     bool m_harqEnabled;  //!< HARQ使能开关
+    uint8_t m_processCount; //!< 每 UE HARQ 进程数 (1/2/4/8/16/32)
 
     std::map<std::pair<uint16_t, uint8_t>, SatHarqProcess> m_harqProcesses;
-    std::map<uint16_t, std::vector<uint8_t>> m_rntiToProcesses;
 
     uint32_t m_totalTransmissions;
     uint32_t m_totalRetransmissions;

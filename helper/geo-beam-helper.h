@@ -6,10 +6,14 @@
 #include "ns3/object-factory.h"
 #include "ns3/ptr.h"
 #include "ns3/spectrum-channel.h"
+#include "ns3/spectrum-model.h"
 #include "ns3/vector.h"
 #include "ns3/epc-helper.h"
 #include "ns3/nr-helper.h"
+#include "../model/sat-phy.h"
+#include "../model/frequency-reuse.h"
 #include <vector>
+#include <map>
 
 namespace ns3 {
 
@@ -77,31 +81,86 @@ public:
 
   void SetBeamConf (double centerFreqHz, double bandwidthHz);
 
+  /// 设置馈电链路中心频率/带宽 (默认 30 GHz / 100 MHz)
+  void SetFeederConf (double centerFreqHz, double bandwidthHz);
+
+  /// 实际接线的波束数 (默认 1)。每束有独立 user channel/SpectrumModel,
+  /// SatGeoFeederPhy 用 NtnBeamIdTag 在共享 feeder channel 上做 beam 路由。
+  void SetActiveBeamCount (uint32_t n);
+
   /**
    * \brief 获取当前配置的波束频点信息
    */
   std::vector<BeamFrequencyConfig> GetBeamFrequencyConfig () const;
 
+  /// 用户链路信道 (兼容旧 API: 返回第一个波束的 user channel)
   Ptr<SpectrumChannel> GetSpectrumChannel (void) const;
+  /// 馈电链路信道 (GW 与卫星 SatGeoFeederPhy 共用)
+  Ptr<SpectrumChannel> GetFeederChannel (void) const;
+  /// 兼容旧 API: 返回第一个波束的 user SpectrumModel
+  Ptr<const SpectrumModel> GetUserSpectrumModel (void) const;
+  Ptr<const SpectrumModel> GetFeederSpectrumModel (void) const;
+
+  /// 多波束扩展: 按 beamId 取出该束的独立 user channel / SpectrumModel
+  Ptr<SpectrumChannel>     GetUserChannel        (uint32_t beamId) const;
+  Ptr<const SpectrumModel> GetUserSpectrumModel  (uint32_t beamId) const;
+
+  /// 按波束 id 取出对应卫星 PHY (Install 之后可用)
+  Ptr<SatGeoUserPhy>   GetUserPhy   (uint32_t beamId) const;
+  Ptr<SatGeoFeederPhy> GetFeederPhy (uint32_t beamId) const;
+
+  // ===== 频率复用 + 同色波束 C/I 模型 =====
+  /// 当前 reuse 配置 (Install 后会按 m_beamFreqConfig 的 colorId 注入每束)
+  Ptr<FrequencyReuse> GetFrequencyReuse () const;
+  /// 单束主瓣峰值天线增益 (dBi), 默认 43
+  void   SetMainLobeGainDbi (double v);
+  double GetMainLobeGainDbi () const;
+  /// 同色波束方向上的旁瓣增益 (dBi), 默认 25
+  void   SetSideLobeGainDbi (double v);
+  double GetSideLobeGainDbi () const;
+  /// 单干扰束 C/I_co = MainLobe - SideLobe (dB), 默认 18
+  double GetCoBeamCIDb () const;
 
 private:
-  // 为卫星安装多个点波束 (User Links)
-  NetDeviceContainer InstallBeams (Ptr<Node> satNode, Ptr<SpectrumChannel> channel);
+  // 为卫星安装多个点波束: 每束创建一对 SatGeoFeederPhy + SatGeoUserPhy 并 SetPeer。
+  // 返回该卫星节点上挂的 NetDevice 列表(目前仍创建 NrGnbNetDevice 占位,以保持原 API)。
+  NetDeviceContainer InstallBeams (Ptr<Node> satNode);
 
   // 配置卫星交换机：将波束接口和馈电接口桥接
   Ptr<NetDevice> InstallSwitch (Ptr<Node> satNode, NetDeviceContainer beamDevices, Ptr<NetDevice> feederDevice);
+
+  Ptr<const SpectrumModel> BuildBeamUserSpectrumModel (const BeamFrequencyConfig& cfg) const;
+  Ptr<const SpectrumModel> BuildFeederSpectrumModel () const;
 
   ObjectFactory m_deviceFactory;
   ObjectFactory m_phyFactory;
   ObjectFactory m_channelFactory;
   ObjectFactory m_antennaFactory;
 
-  Ptr<SpectrumChannel> m_channel;
+  /// 每波束独立 user channel + SpectrumModel (按 beamId 索引)
+  std::map<uint32_t, Ptr<SpectrumChannel>>     m_userChannels;
+  std::map<uint32_t, Ptr<const SpectrumModel>> m_userSpectrumModels;
+  /// 共享馈电链路 channel + SpectrumModel
+  Ptr<SpectrumChannel>     m_feederChannel;
+  Ptr<const SpectrumModel> m_feederSpectrumModel;
+
   double m_centerFreqHz;
   double m_bandwidthHz;
+  double m_feederCenterFreqHz;
+  double m_feederBandwidthHz;
+  uint32_t m_activeBeamCount;
 
   FrequencyReuseMode m_reuseMode;  //!< 频率复用模式
   std::vector<BeamFrequencyConfig> m_beamFreqConfig;  //!< 各波束频点配置
+
+  /// 同色 C/I 解析模型用 (helper 注入到 SatUtPhy)
+  Ptr<FrequencyReuse> m_freqReuse;
+  double m_mainLobeGainDbi {43.0};
+  double m_sideLobeGainDbi {25.0};
+
+  // 安装后按 beamId 索引到对应的卫星 PHY 对, 便于上层访问
+  std::map<uint32_t, Ptr<SatGeoUserPhy>>   m_userPhys;
+  std::map<uint32_t, Ptr<SatGeoFeederPhy>> m_feederPhys;
 };
 
 } // namespace ns3

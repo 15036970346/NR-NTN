@@ -135,7 +135,7 @@ SatE2eStatsCollector::ExportToFile (const std::string& filepath) const
     ofs << "# Per-Layer Delay Breakdown\n";
     ofs << "# Layer\tMin(ms)\tMax(ms)\tAvg(ms)\tP95(ms)\tSamples\n";
 
-    for (const std::string& layer : {"PHY", "MAC", "RLC", "PDCP", "SDAP"})
+    for (const std::string layer : {"PHY", "MAC", "RLC", "PDCP", "SDAP"})
     {
         auto s = GetLayerStats (layer);
         if (s.sampleCount > 0)

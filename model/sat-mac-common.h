@@ -5,38 +5,129 @@
 #ifndef SAT_MAC_COMMON_H
 #define SAT_MAC_COMMON_H
 
-#include "ns3/buffer.h"
-#include "ns3/header.h"
 #include "ns3/nstime.h"
 #include "ns3/vector.h"
+#include "ns3/buffer.h"
+#include "ns3/header.h"
+#include "ns3/type-id.h"
 #include <stdint.h>
+#include <limits>
 
 namespace ns3 {
 
+enum class ServiceObjectType {
+    SERVICE_OBJECT_UNKNOWN = 0,
+    SERVICE_OBJECT_GROUND,
+    SERVICE_OBJECT_SAT_BEAM
+};
+
+enum class MeasEventType {
+    MEAS_EVENT_NONE = 0,
+    MEAS_EVENT_A3,
+    MEAS_EVENT_SERVING_UNAVAILABLE
+};
+
+struct ServiceObjectId {
+    ServiceObjectType type {ServiceObjectType::SERVICE_OBJECT_UNKNOWN};
+    uint32_t objectId {0};
+
+    bool operator< (const ServiceObjectId& other) const
+    {
+        if (type != other.type)
+        {
+            return static_cast<uint32_t> (type) < static_cast<uint32_t> (other.type);
+        }
+        return objectId < other.objectId;
+    }
+
+    bool operator== (const ServiceObjectId& other) const
+    {
+        return type == other.type && objectId == other.objectId;
+    }
+
+    bool operator!= (const ServiceObjectId& other) const
+    {
+        return !(*this == other);
+    }
+
+    bool IsValid () const
+    {
+        return type != ServiceObjectType::SERVICE_OBJECT_UNKNOWN;
+    }
+};
+
+struct NeighborMeasurement {
+    ServiceObjectId object;
+    double filteredMetric {-140.0};
+    double rawMetric {-140.0};
+    bool isAvailable {true};
+    Time sampleTime {Seconds (0)};
+};
+
 // 1. 测量配置结构体 (用于RRC层)
 struct MeasConfig {
-    double rsrpThreshold;    // RSRP门限 (dBm)
-    double hysteresis;       // 迟滞 (dB)
-    Time timeToTrigger;      // Time-to-Trigger定时器
-    double filterCoeff;      // L3滤波系数
+    double rsrpThreshold {-105.0};     // Legacy: 绝对门限 (dBm)
+    double hysteresis {2.0};           // Legacy/通用迟滞 (dB)
+    Time timeToTrigger {MilliSeconds (200)}; // TTT
+    double filterCoeff {0.5};          // L3滤波系数
+
+    double a3Offset {3.0};             // A3: 邻区优于服务区的最小偏置 (dB)
+    double leaveMargin {1.0};          // A3退出/回摆保护边界 (dB)
+    Time minDwellTime {Seconds (1)};   // 最短驻留时间
+
+    bool enableGroundService {true};   // 是否允许地面服务对象参与评估
+    bool enableSatelliteService {true};// 是否允许卫星波束参与评估
+    bool reportFilteredMeasurements {true};
 };
 
 // 2. 测量报告结构体 (用于崔博开的测量模块与秦宇航的调度器交互)
 struct MeasReport {
-    uint16_t ueId;           // 用户标识
-    uint32_t bestBeamId;     // 测量到的最强波束 ID
-    double rsrp;             // 接收信号参考功率
-    Vector position;         // UE位置 (星地切换用)
+    uint16_t ueId {0};           // 用户标识
+
+    // Legacy字段：保留给当前 beam-only 流程使用
+    uint32_t bestBeamId {0};     // 测量到的最强波束 ID
+    double rsrp {-140.0};        // Legacy: 当前上报主值
+
+    MeasEventType eventType {MeasEventType::MEAS_EVENT_NONE};
+    ServiceObjectId servingObject;
+    ServiceObjectType servingObjectType {ServiceObjectType::SERVICE_OBJECT_UNKNOWN};
+    uint32_t servingObjectId {0};
+    double servingMetric {-140.0};
+    double servingFilteredMetric {-140.0};
+
+    ServiceObjectId bestNeighborObject;
+    ServiceObjectType bestNeighborObjectType {ServiceObjectType::SERVICE_OBJECT_UNKNOWN};
+    uint32_t bestNeighborObjectId {0};
+    double bestNeighborMetric {-140.0};
+    double bestNeighborFilteredMetric {-140.0};
+
+    double a3Delta {-1e9};       // neighbor - serving
+    Time measurementTime {Seconds (0)};
+    Vector position;             // UE位置 (星地切换用)
+
+    bool groundAvailable {true};
+    bool satelliteAvailable {true};
+    bool servingAvailable {true};
+    bool bestNeighborAvailable {true};
+
+    NeighborMeasurement servingSnapshot;
+    NeighborMeasurement bestNeighborSnapshot;
 };
 
 // 2. 下行控制信息结构体 (用于秦宇航的调度器下发给你谢昀松的终端 MAC 层)
 struct DciInfo {
+    static constexpr uint8_t INVALID_HARQ_PROCESS_ID = 0xFF;
+
     bool isUplinkGrant;      // 是否为上行授权
     uint32_t rbAllocation;   // 分配的 RB 数量
     uint8_t mcs;             // 调制编码策略
-    double txPowerDbm;       // 上行授权对应的目标发射功率 (DL调度时置0)
+    double txPowerDbm {0.0}; // 上行授权对应的目标发射功率 (DL调度时默认置0)
     Time delayToStart;       // 调度延迟 (K2)
     Time duration;           // 授权持续时间
+    uint8_t symStart {0};    // UL grant 对应的起始 symbol, 供 UL CQI/ledger 关联
+    uint8_t harqProcessId {INVALID_HARQ_PROCESS_ID}; // DL HARQ 进程号
+    uint8_t harqRv {0};      // 当前传输使用的冗余版本 RV
+    bool isHarqRetransmission {false}; // 是否为 HARQ 重传
 };
 
 // 3. PUCCH信息结构体 (上行控制信息 - UCI)
@@ -49,12 +140,15 @@ enum class PucchFormatType {
 };
 
 struct PucchInfo {
+    static constexpr uint8_t INVALID_HARQ_PROCESS_ID = 0xFF;
+
     PucchFormatType format;   // PUCCH格式
     uint16_t rnti;           // 用户标识
     bool srPending;          // SR挂起标志
     uint8_t cqi;             // CQI值 (1-15)
     bool harqAck;            // HARQ ACK/NACK (true=ACK, false=NACK)
     uint8_t harqBitMap;      // 多bit HARQ (如多TB)
+    uint8_t harqProcessId {INVALID_HARQ_PROCESS_ID}; // 对应的 HARQ 进程号
     Time transmissionTime;   // 传输时间
 };
 
@@ -81,10 +175,11 @@ struct PrachPreamble {
     uint16_t rnti;           // 用户标识 (如果已分配)
     uint32_t preambleId;      // 前导码ID (0-63)
     uint8_t format;          // PRACH格式 (0-4)
-    uint8_t utType;          // 终端类型 (0=portable, 1=consumer)
+    uint8_t utType {0};      // 终端类型 (0=portable, 1=consumer), 供 Msg3 功控
     Time transmissionTime;    // 传输时间
     bool isRetransmission;   // 是否为重传
     uint32_t raRnti;         // RA-RNTI: 由 PRACH 发送时刻派生, 区分不同 PRACH occasion
+    double prachSnrDb {std::numeric_limits<double>::quiet_NaN ()}; // PRACH 检测用 per-UE SNR, NaN=用调度器默认
 };
 
 // 7. SSB同步信号块结构体
@@ -109,7 +204,7 @@ struct RarMessage {
     Time     timingAdvance;       // 定时提前量 (GEO ~300 ms)
     uint32_t ulGrantRbs;          // Msg3 的 UL Grant (PRB 数)
     uint8_t  ulGrantMcs;          // Msg3 的 MCS
-    double   ulGrantTxPowerDbm;   // Msg3 的目标发射功率
+    double   ulGrantTxPowerDbm {0.0}; // Msg3 的目标发射功率 (资源门控功控产物)
     Time     msg3DelayToStart;    // Msg3 相对 RAR 的触发延迟 (K2)
     Time     transmissionTime;    // 发送时间戳
 };
@@ -125,6 +220,8 @@ struct RrcSetupRequest {
     Time     transmissionTime;    // 发送时间戳
 };
 
+// qyh 增量: 通用 UL MAC PDU header (Add/Remove Header 用), 字段简化为 rnti +
+// payloadBytes + 发送时戳, 14 字节固定长度
 class GenericUlMacHeader : public Header
 {
 public:
@@ -136,24 +233,14 @@ public:
             .AddConstructor<GenericUlMacHeader> ();
         return tid;
     }
-
-    TypeId GetInstanceTypeId () const override
-    {
-        return GetTypeId ();
-    }
-
-    uint32_t GetSerializedSize () const override
-    {
-        return 14;
-    }
-
+    TypeId GetInstanceTypeId () const override { return GetTypeId (); }
+    uint32_t GetSerializedSize () const override { return 14; }
     void Serialize (Buffer::Iterator start) const override
     {
         start.WriteU16 (m_rnti);
         start.WriteU32 (m_payloadBytes);
         start.WriteU64 (m_transmissionTimeNs);
     }
-
     uint32_t Deserialize (Buffer::Iterator start) override
     {
         m_rnti = start.ReadU16 ();
@@ -161,50 +248,24 @@ public:
         m_transmissionTimeNs = start.ReadU64 ();
         return GetSerializedSize ();
     }
-
     void Print (std::ostream& os) const override
     {
-        os << "rnti=" << m_rnti
-           << " payloadBytes=" << m_payloadBytes
+        os << "rnti=" << m_rnti << " payloadBytes=" << m_payloadBytes
            << " txNs=" << m_transmissionTimeNs;
     }
-
-    void SetRnti (uint16_t rnti)
-    {
-        m_rnti = rnti;
-    }
-
-    uint16_t GetRnti () const
-    {
-        return m_rnti;
-    }
-
-    void SetPayloadBytes (uint32_t payloadBytes)
-    {
-        m_payloadBytes = payloadBytes;
-    }
-
-    uint32_t GetPayloadBytes () const
-    {
-        return m_payloadBytes;
-    }
-
-    void SetTransmissionTime (Time txTime)
-    {
-        m_transmissionTimeNs = static_cast<uint64_t> (txTime.GetNanoSeconds ());
-    }
-
-    Time GetTransmissionTime () const
-    {
-        return NanoSeconds (m_transmissionTimeNs);
-    }
-
+    void     SetRnti (uint16_t rnti) { m_rnti = rnti; }
+    uint16_t GetRnti () const { return m_rnti; }
+    void     SetPayloadBytes (uint32_t b) { m_payloadBytes = b; }
+    uint32_t GetPayloadBytes () const { return m_payloadBytes; }
+    void     SetTransmissionTime (Time t) { m_transmissionTimeNs = static_cast<uint64_t> (t.GetNanoSeconds ()); }
+    Time     GetTransmissionTime () const { return NanoSeconds (m_transmissionTimeNs); }
 private:
     uint16_t m_rnti {0};
     uint32_t m_payloadBytes {0};
     uint64_t m_transmissionTimeNs {0};
 };
 
+// qyh 增量: Msg3 MAC header (RrcSetupRequest 序列化), 23 字节
 class Msg3MacHeader : public Header
 {
 public:
@@ -216,17 +277,8 @@ public:
             .AddConstructor<Msg3MacHeader> ();
         return tid;
     }
-
-    TypeId GetInstanceTypeId () const override
-    {
-        return GetTypeId ();
-    }
-
-    uint32_t GetSerializedSize () const override
-    {
-        return 23;
-    }
-
+    TypeId GetInstanceTypeId () const override { return GetTypeId (); }
+    uint32_t GetSerializedSize () const override { return 23; }
     void Serialize (Buffer::Iterator start) const override
     {
         start.WriteU16 (m_tcRnti);
@@ -235,7 +287,6 @@ public:
         start.WriteU32 (m_preambleIdUsed);
         start.WriteU64 (m_transmissionTimeNs);
     }
-
     uint32_t Deserialize (Buffer::Iterator start) override
     {
         m_tcRnti = start.ReadU16 ();
@@ -245,16 +296,12 @@ public:
         m_transmissionTimeNs = start.ReadU64 ();
         return GetSerializedSize ();
     }
-
     void Print (std::ostream& os) const override
     {
-        os << "tcRnti=" << m_tcRnti
-           << " ueIdentity=" << m_ueIdentity
+        os << "tcRnti=" << m_tcRnti << " ueIdentity=" << m_ueIdentity
            << " cause=" << static_cast<uint32_t> (m_establishmentCause)
-           << " preambleId=" << m_preambleIdUsed
-           << " txNs=" << m_transmissionTimeNs;
+           << " preambleId=" << m_preambleIdUsed << " txNs=" << m_transmissionTimeNs;
     }
-
     void SetRequest (const RrcSetupRequest& req)
     {
         m_tcRnti = req.tcRnti;
@@ -263,7 +310,6 @@ public:
         m_preambleIdUsed = req.preambleIdUsed;
         m_transmissionTimeNs = static_cast<uint64_t> (req.transmissionTime.GetNanoSeconds ());
     }
-
     RrcSetupRequest ToRequest () const
     {
         RrcSetupRequest req;
@@ -274,11 +320,10 @@ public:
         req.transmissionTime = NanoSeconds (m_transmissionTimeNs);
         return req;
     }
-
 private:
     uint16_t m_tcRnti {0};
     uint64_t m_ueIdentity {0};
-    uint8_t m_establishmentCause {0};
+    uint8_t  m_establishmentCause {0};
     uint32_t m_preambleIdUsed {0};
     uint64_t m_transmissionTimeNs {0};
 };
@@ -311,6 +356,7 @@ struct MsgA {
     Time     transmissionTime;    // 发送时间戳
     bool     isRetransmission;    // 是否为重传
     uint32_t raRnti;              // RA-RNTI: 区分不同 PRACH occasion
+    double   prachSnrDb {std::numeric_limits<double>::quiet_NaN ()}; // PRACH 检测用 per-UE SNR, NaN=用调度器默认
 };
 
 // MsgB 结果类型

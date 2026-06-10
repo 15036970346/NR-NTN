@@ -225,6 +225,35 @@ void ResultWriter::WriteBeamStats (uint32_t beamId, uint32_t activeUes,
   ofs.close ();
 }
 
+void ResultWriter::WriteNomaReuseStats (const std::string& filename, uint32_t beamId,
+                                        uint64_t sharedRbs, uint64_t usedRbs, double reuseGain)
+{
+  std::string fullPath = GetFullPath (filename);
+
+  std::ofstream ofs (fullPath, std::ios::app);
+  if (!ofs.is_open ()) {
+      ofs.open (fullPath, std::ios::out);
+      if (!ofs.is_open ()) {
+          NS_LOG_ERROR ("ResultWriter: Cannot open " << fullPath);
+          return;
+      }
+      ofs << "# NR NTN Power-domain NOMA Reuse Statistics\n";
+      ofs << "# =========================================\n";
+      ofs << "# Beam_ID | NOMA_Shared_RBs | Primary_Used_RBs | Reuse_Gain (shared/used)\n";
+  }
+
+  ofs << beamId << " | "
+      << sharedRbs << " | "
+      << usedRbs << " | "
+      << std::fixed << std::setprecision (4) << reuseGain << "\n";
+
+  ofs.close ();
+
+  NS_LOG_INFO ("ResultWriter: NOMA reuse stat written for beam " << beamId
+               << " (shared=" << sharedRbs << " used=" << usedRbs
+               << " gain=" << reuseGain << ")");
+}
+
 void ResultWriter::WriteSystemStats (uint64_t totalCapacity, double peakRate,
                                     double avgRate, double spectrumEfficiency)
 {

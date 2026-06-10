@@ -1,7 +1,10 @@
 /*
- * 文件路径：contrib/geo-sat/model/admit-control.h
+ * 文件路径：contrib/0603geo-sat/model/admit-control.h
  * 功能：GEO卫星准入控制与波束协调模块
  * 实现：在切换发生时判断目标波束是否有足够资源接纳新用户
+ *
+ * 合并说明：以 qyh 原版(功能完整: isUplink/utType/trafficType 感知的多因子准入)
+ *           为基底，嫁接 0603 的星地切换 API(地面服务对象准入/注册/可用性)。
  */
 #ifndef ADMIT_CONTROL_H
 #define ADMIT_CONTROL_H
@@ -10,6 +13,7 @@
 #include "ns3/vector.h"
 #include "ns3/nstime.h"
 #include "ns3/callback.h"
+#include "sat-mac-common.h"
 #include "resource-manager.h"
 #include <map>
 #include <vector>
@@ -48,11 +52,14 @@ struct BeamResourceStatus {
 struct UeContextInfo {
     uint16_t rnti {0};
     uint32_t currentBeamId {0};
+    ServiceObjectId currentServiceObject;  // 0603 增量: UE 当前所属服务对象(波束/地面)
     ServicePriority priority {ServicePriority::PRIORITY_DATA};
     UtType utType {UT_CONSUMER};
     TrafficType trafficType {TRAFFIC_DATA};
     Vector position {0.0, 0.0, 0.0};
-    double latestCqi {7.0};
+    double latestCqi {7.0};            // 0603 增量: 兼容字段, 等价 latestDlCqi
+    double latestDlCqi {7.0};
+    double latestUlCqi {7.0};
     uint32_t requiredRbs {1};
     Time connectedTime {Seconds (0)};
 };
@@ -65,30 +72,47 @@ public:
     virtual ~AdmitControl ();
 
     // ==================== 准入控制核心接口 ====================
-    
+
     // 准入决策：判断UE是否可以接入目标波束
-    AdmitDecision CanAdmitUe (uint32_t targetBeamId, ServicePriority priority, 
+    AdmitDecision CanAdmitUe (uint32_t targetBeamId, ServicePriority priority,
                                UtType utType, TrafficType trafficType, uint32_t requiredRbs,
                                bool isUplink = false);
-    
-    // 切换准入决策：判断切换是否可行
+
+    // 切换准入决策：判断切换是否可行 (完整版, qyh)
     AdmitDecision CanHandoverUe (uint32_t sourceBeamId, uint32_t targetBeamId,
                                   ServicePriority priority, UtType utType,
                                   TrafficType trafficType, uint32_t requiredRbs,
                                   bool isUplink = false);
-    
+
+    // 0603 增量: 4 参精简重载, 供 ntn-gw-rrc 调用; 内部委托完整版,
+    // utType/trafficType 取默认值 (UT_CONSUMER / TRAFFIC_DATA)。
+    AdmitDecision CanHandoverUe (uint32_t sourceBeamId, uint32_t targetBeamId,
+                                  ServicePriority priority, uint32_t requiredRbs);
+
+    // 0603 增量: 地面服务对象准入决策
+    AdmitDecision CanAdmitGroundUe (uint32_t groundId,
+                                    ServicePriority priority,
+                                    uint32_t requiredRbs) const;
+
     // 注册UE到波束
     void RegisterUeToBeam (uint16_t rnti, uint32_t beamId, ServicePriority priority,
                            UtType utType, TrafficType trafficType, Vector position);
-    
+
+    // 0603 增量: 注册UE到地面服务对象
+    void RegisterUeToGround (uint16_t rnti, uint32_t groundId, ServicePriority priority,
+                             UtType utType, TrafficType trafficType, Vector position);
+
     // 从波束注销UE
     void UnregisterUeFromBeam (uint16_t rnti, uint32_t beamId);
-    
+
+    // 0603 增量: 从地面服务对象注销UE
+    void UnregisterUeFromGround (uint16_t rnti, uint32_t groundId);
+
     // 更新UE上下文
-    void UpdateUeContext (uint16_t rnti, double latestCqi, uint32_t requiredRbs);
+    void UpdateUeContext (uint16_t rnti, double latestDlCqi, double latestUlCqi, uint32_t requiredRbs);
 
     // ==================== 波束协调接口 ====================
-    
+
     // 获取目标波束的推荐列表 (基于资源状况)
     std::vector<uint32_t> GetRecommendedBeams (uint32_t sourceBeamId,
                                                ServicePriority priority,
@@ -96,22 +120,25 @@ public:
                                                TrafficType trafficType,
                                                uint32_t requiredRbs,
                                                bool isUplink = false);
-    
+
     // 获取波束资源状态
     BeamResourceStatus GetBeamResourceStatus (uint32_t beamId);
-    
+
     // 检查波束间负载均衡
     void CheckBeamLoadBalancing ();
-    
+
     // 触发波束间负载重平衡
     void TriggerLoadRebalancing ();
     void SetHandoverExecutor (Callback<void, uint16_t, uint32_t> handoverExecutor);
 
     // ==================== 资源配置 ====================
-    
+
     // 设置波束总RB资源
     void SetBeamTotalRbs (uint32_t beamId, uint32_t totalRbs);
-    
+
+    // 0603 增量: 设置应急业务预留比例 (按总RB比例的应急预留接口)
+    void SetEmergencyReservationRatio (double ratio);
+
     // 设置应急/语音的刚性预留策略
     void SetPriorityReservationPolicy (uint32_t emergencyReservedRbs,
                                        uint32_t emergencyBurstCapRbs,
@@ -124,14 +151,24 @@ public:
     uint32_t GetEmergencyReservedRbs () const;
     uint32_t GetEmergencyBurstCapRbs () const;
     uint32_t GetVoiceReservedRbs () const;
-    
+
+    // 0603 增量: 地面接入点可用性/容量配置
+    void SetGroundAvailability (uint32_t groundId, bool available);
+    bool IsGroundAvailable (uint32_t groundId) const;
+    void SetGroundCapacity (uint32_t groundId, uint32_t maxUes);
+
     // 获取当前系统总活跃UE数
     uint32_t GetTotalActiveUes () const;
 
 private:
     // 内部辅助函数
     uint32_t GetAvailableRbs (uint32_t beamId, ServicePriority priority, bool isUplink);
+    uint32_t GetGuaranteedAvailableRbs (uint32_t beamId, ServicePriority priority, bool isUplink);
     uint32_t GetPhysicalRemainingRbs (uint32_t beamId, bool isUplink);
+    // 每波束总RB的"单一真源": 绑定了 ResourceManager 时, 直接取其 Dl/Ul 预算
+    // (按方向); 未绑定时回退到本地 m_totalDlRbs/m_totalUlRbs。利用率分母与各类
+    // RB 上限统一以此为准, 不再读 BeamResourceStatus::totalRbs 的独立默认值。
+    uint32_t GetBeamBudgetRbs (bool isUplink) const;
     bool CheckEmergencyCapacity (uint32_t beamId);
     double CalculateHandoverBenefit (uint32_t sourceBeamId, uint32_t targetBeamId,
                                      ServicePriority priority, UtType utType,
@@ -152,21 +189,28 @@ private:
 
     // 波束资源映射
     std::map<uint32_t, BeamResourceStatus> m_beamResources;
-    
+
     // UE上下文映射
     std::map<uint16_t, UeContextInfo> m_ueContextMap;
-    
+
+    // 0603 增量: 地面服务对象状态映射
+    std::map<uint32_t, bool> m_groundAvailability;
+    std::map<uint32_t, uint32_t> m_groundActiveUes;
+    std::map<uint32_t, uint32_t> m_groundCapacity;
+
     // 配置参数
-    double m_emergencyReservationRatio;  // 应急业务预留比例 (默认20%, xys ratio模式)
-    uint32_t m_emergencyReservedRbs;     // 应急控制默认刚性预留 (默认1 PRB, qyh bucket模式)
+    uint32_t m_emergencyReservedRbs;     // 应急控制默认刚性预留 (默认1 PRB)
     uint32_t m_emergencyBurstCapRbs;     // 应急突发模式上限 (默认3 PRB)
     uint32_t m_voiceReservedRbs;         // 语音业务默认刚性预留 (默认2 PRB)
-    uint32_t m_totalDlRbs;              // 每波束下行可用RB基线 (25)
-    uint32_t m_totalUlRbs;              // 每波束上行可用RB基线 (25)
+    uint32_t m_totalDlRbs;              // 7色复用下每波束下行可用RB (25)
+    uint32_t m_totalUlRbs;              // 7色复用下每波束上行可用RB (25)
     uint32_t m_dlReservedRbs;           // 下行侧为PRACH/控制信道保留的RB
     double m_admissionThreshold;        // 准入阈值 (资源利用率>90%拒绝)
     double m_handoverBenefitThreshold;   // 切换收益阈值
     uint32_t m_emergencyUserCapPerBeam;  // 每波束允许的应急用户上限
+    double m_highCapacityRbMultiplier;   // 高容量业务准入 RB 余量因子(1.0=完全对齐调度器)
+    double m_consumerUlRbMargin;         // 消费级终端上行额外 RB 余量
+    double m_emergencyReservationRatio;  // 0603 增量: 应急业务预留比例 (默认20%)
     Ptr<ResourceManager> m_resourceManager;
     Callback<void, uint16_t, uint32_t> m_handoverExecutor;
 };

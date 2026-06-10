@@ -68,9 +68,19 @@ private:
   double CalcFspl (double distance3D, double frequencyHz) const;
 
   /**
-   * \brief 辅助函数：计算多波束增益/干扰
+   * \brief 辅助函数：计算多波束增益/干扰 (旧接口, 假设 nadir 波束)
    */
   double CalcBeamGain (Ptr<const MobilityModel> satMob, Ptr<const MobilityModel> ueMob) const;
+
+  // qyh 增量: 公开包装 + 多波束 boresight 偏轴 + 抛物面增益滚降
+  /// 自由空间损耗 (dB), CalcFspl 公开包装
+  double FsplDb (double distance3D, double frequencyHz) const;
+  /// 多波束抛物面天线增益 (dBi), 偏轴角相对该波束的 boresight (波束中心)
+  double BeamGainDbi (const Vector& satPos, const Vector& uePos,
+                      const Vector& beamCenter, double theta3dbRad) const;
+  /// 抛物面增益滚降 G(θ) = max(Gmax - 12·(θ/θ3dB)², 旁瓣地板)
+  static double ParabolicGainDbi (double thetaRad, double theta3dbRad,
+                                  double maxGainDbi, double sideLobeDbi);
 };
 
 } // namespace ns3

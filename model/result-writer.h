@@ -44,6 +44,11 @@ public:
     void WriteBeamStats (uint32_t beamId, uint32_t activeUes,
                         uint64_t throughputBits, double avgCqi,
                         double spectrumEfficiency);
+
+    // 功率域 NOMA 复用记账: 每波束累计共享(复用)RB、累计已用RB、复用增益比例。
+    // reuseGain = sharedRbs / usedRbs, 表示功率域复用等效额外提供的 RB 占主用户已用RB比例。
+    void WriteNomaReuseStats (const std::string& filename, uint32_t beamId,
+                             uint64_t sharedRbs, uint64_t usedRbs, double reuseGain);
     
     void WriteSystemStats (uint64_t totalCapacity, double peakRate,
                           double avgRate, double spectrumEfficiency);

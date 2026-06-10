@@ -1,6 +1,15 @@
 /*
  * 文件路径：contrib/geo-sat/model/geo-beam-scheduler.h
  * 功能：GEO 卫星波束感知 MAC 层调度器 (透明转发模式) - 融合 RRM 版
+ *
+ * 合并说明 (geo-sat-merged):
+ *   - 基底 = 0603 版: 完整 4步+2步 RA、PRACH 检测模型、CqiAmcController 钩子、
+ *     多目标切换 (波束/地面) 类型、供 NtnGwRrc 调用的 UE 上下文访问器、Msg3 资源门控。
+ *   - 嫁接 = qyh 原版重型 RRM: CLPC 闭环功控、功率域 NOMA、下行动态功率分配、
+ *     上行动态调度全链路 (UL ledger)、HARQ 集成、DL/UL 双 CQI、NrAmc 的 MCS/字节估计、
+ *     DCI 回调、SPS 半持续调度、~28 个可配置 TypeId 属性。
+ *   - 切换"决策"归 NtnGwRrc (MeasReport 由 sat-ut-phy 投递给 NtnGwRrc); 调度器仅保留
+ *     被 NtnGwRrc 回调的 ExportUeContext / ImportUeContext / ExecuteHandover。
  */
 #ifndef GEO_BEAM_SCHEDULER_H
 #define GEO_BEAM_SCHEDULER_H
@@ -8,46 +17,87 @@
 #include "ns3/nr-mac-scheduler.h"
 #include "ns3/nr-mac-csched-sap.h"
 #include "ns3/nr-mac-sched-sap.h"
+#include "ns3/nr-phy-mac-common.h"
+#include "ns3/nr-amc.h"
 #include "ns3/log.h"
 #include "ns3/packet.h"
 #include "ns3/vector.h"
+#include "ns3/nstime.h"
+#include "ns3/traced-callback.h"
+#include "ns3/random-variable-stream.h"
 #include "sat-mac-common.h"
 #include "resource-manager.h"
 #include "admit-control.h"
+#include "cqi-predictor.h"
+#include "cqi-amc-controller.h"
+#include "cqi-amc-predictor.h"
+#include "prach-detection-model.h"
 #include <map>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace ns3 {
 
+class HarqManager;
+class ResultWriter;
+
 struct SatUeContext {
   uint16_t rnti;
   uint32_t currentBeamId;
-  double latestCqi;
-  double latestRsrp;
-  uint32_t dlBufferStatus;
-  uint32_t ulBufferStatus;
-  uint32_t pendingUlGrantRbs;
-  uint32_t pendingUlGrantBytes;
-  bool srPending;
-  double dlAverageThroughput;
-  double ulAverageThroughput;
+
+  // ----- 兼容字段 (0603): latestCqi == latestDlCqi, bufferStatus == dlBufferStatus -----
+  double latestCqi;            // 兼容字段, 等价 latestDlCqi
+  uint32_t bufferStatus;       // 兼容字段, 等价 dlBufferStatus
+  double averageThroughput;    // 兼容字段, 等价 dlAverageThroughput
   Vector position;             // UE位置 (用于IPF算法)
 
   UtType utType;
   TrafficType trafficType;
   ServicePriority priority;     // 业务优先级
   double wrrWeight;            // WRR权重
-  Time lastDlScheduledTime;    // 上次下行调度时间
-  Time lastUlScheduledTime;    // 上次上行调度时间
+  Time lastScheduledTime;      // 兼容字段 (0603): 上次调度时间
+
+  // ----- qyh 增量: DL/UL 双 CQI / 双 Buffer / 路损 / CLPC / SPS / 吞吐 / 时间戳 -----
+  double  latestDlCqi {7.0};
+  double  latestUlCqi {7.0};
+  double  latestRsrp {-120.0};
+  double  pathLossDb {190.0};        // 每-UE 上行路径损耗估计(由 RSRP 推算), 取代全局常量
+  uint32_t dlBufferStatus {0};       // = bufferStatus (DL)
+  uint32_t ulBufferStatus {0};
+  uint32_t pendingUlGrantRbs {0};
+  uint32_t pendingUlGrantBytes {0};
+  bool     srPending {false};
+  double   dlAverageThroughput {0.0};
+  double   ulAverageThroughput {0.0};
+  Time     lastDlScheduledTime;      // 上次下行调度时间
+  Time     lastUlScheduledTime;      // 上次上行调度时间
+  Time     lastDlCqiUpdateTime;      // 最近一次收到 DL CQI 的时间
+  Time     lastUlCqiUpdateTime;      // 最近一次收到 UL CQI 的时间
+  Time     lastDlSpsTime;            // 上次下行 SPS(半持续)授权时间
+  Time     lastUlSpsTime;            // 上次上行 SPS(半持续)授权时间
+  double   clpcOffsetDb {0.0};       // 上行闭环功控累积修正项 f(i) (dB)
 };
 
-// 用于切换上下文转移的结构体
+// 用于切换上下文转移的结构体 (并集: qyh 丰富字段 + 0603 多目标 ServiceObject)
 struct HandoverUeContext {
     uint16_t rnti;
     uint32_t sourceBeamId;
     uint32_t targetBeamId;
+    // 0603 多目标切换标识
+    ServiceObjectId sourceObject;
+    ServiceObjectId targetObject;
+    // 0603 兼容字段
     double latestCqi;
+    uint32_t unsentBufferBytes;
+    double averageThroughput;
+    // qyh 丰富字段
+    double latestDlCqi;
+    double latestUlCqi;
     double latestRsrp;
+    double pathLossDb;
+    double clpcOffsetDb;
     uint32_t unsentDlBufferBytes;
     uint32_t unsentUlBufferBytes;
     uint32_t pendingUlGrantRbs;
@@ -55,11 +105,80 @@ struct HandoverUeContext {
     bool srPending;
     double dlAverageThroughput;
     double ulAverageThroughput;
+    Vector position;
     UtType utType;
     TrafficType trafficType;
     Callback<void, DciInfo> dciCallback;
     Time lastDlScheduledTime;
     Time lastUlScheduledTime;
+    Time lastDlCqiUpdateTime;
+    Time lastUlCqiUpdateTime;
+};
+
+enum class HandoverTargetType {
+    HANDOVER_TARGET_UNKNOWN = 0,
+    HANDOVER_TARGET_SAT_BEAM,
+    HANDOVER_TARGET_GROUND
+};
+
+enum class HandoverExecutionType {
+    HANDOVER_EXEC_UNKNOWN = 0,
+    HANDOVER_EXEC_BEAM_TO_BEAM,
+    HANDOVER_EXEC_GROUND_TO_SAT,
+    HANDOVER_EXEC_SAT_TO_GROUND
+};
+
+struct HandoverTargetInfo {
+    HandoverTargetType targetType {HandoverTargetType::HANDOVER_TARGET_UNKNOWN};
+    ServiceObjectId targetObject;
+    uint32_t targetBeamId {0};
+    uint32_t targetGroundId {0};
+    bool targetAvailable {true};
+};
+
+struct HandoverExecutionRequest {
+    uint16_t rnti {0};
+    ServiceObjectId sourceObject;
+    ServiceObjectId targetObject;
+    HandoverExecutionType executionType {HandoverExecutionType::HANDOVER_EXEC_UNKNOWN};
+    bool groundAvailable {true};
+    bool satelliteAvailable {true};
+};
+
+struct HandoverDecisionResult {
+    bool shouldHandover {false};
+    AdmitDecision admitDecision {AdmitDecision::ADMIT_REJECTED};
+    HandoverExecutionRequest request;
+    std::string reason;
+};
+
+// 单次切换事件记录 (TracedCallback 载荷)
+struct HandoverStatsRecord {
+    uint16_t rnti {0};
+    ServiceObjectId sourceObject;
+    ServiceObjectId targetObject;
+    HandoverExecutionType executionType {HandoverExecutionType::HANDOVER_EXEC_UNKNOWN};
+    MeasEventType triggerEvent {MeasEventType::MEAS_EVENT_NONE};
+    Time triggerTime {Seconds (0)};        // 触发该切换的测量上报生成时间
+    Time finishTime {Seconds (0)};         // 目标侧上下文注入完成时间
+    Time handoverDelay {Seconds (0)};      // finishTime - triggerTime
+    Time interruptionDelay {Seconds (0)};  // 数据面中断时延 (源停止调度 -> 目标恢复)
+    bool success {false};
+    std::string reason;
+};
+
+// 切换统计汇总
+struct HandoverStatsSummary {
+    uint32_t attempts {0};
+    uint32_t successes {0};
+    uint32_t failures {0};
+    double failureRate {0.0};
+    double avgHandoverDelayMs {0.0};
+    double maxHandoverDelayMs {0.0};
+    double avgInterruptionDelayMs {0.0};
+    double maxInterruptionDelayMs {0.0};
+    std::map<HandoverExecutionType, uint32_t> attemptsByType;
+    std::map<HandoverExecutionType, uint32_t> successesByType;
 };
 
 class GeoBeamScheduler : public NrMacScheduler
@@ -77,26 +196,116 @@ public:
   void AddUeInfo (uint16_t rnti, uint32_t targetBeamId);
   void RemoveUt (uint16_t rnti);
   HandoverUeContext ExportUeContext (uint16_t rnti, uint32_t targetBeamId);
+  HandoverUeContext ExportUeContext (uint16_t rnti, const HandoverTargetInfo& targetInfo);
   void ImportUeContext (const HandoverUeContext& hoCtx);
   void ExecuteHandover (uint16_t rnti, uint32_t targetBeamId);
 
+  // ==================== UE 上下文查询/修改 (供 RRC 等上层调用) ====================
+  bool HasUeContext (uint16_t rnti) const;
+  SatUeContext GetUeContext (uint16_t rnti) const;
+  void SetUeBeamId (uint16_t rnti, uint32_t beamId);
+  ServicePriority GetUePriority (uint16_t rnti) const;
+  uint32_t EstimateRequiredRbs (uint16_t rnti) const;
+
+  // ==================== GEO 信令传播参数 (供 RRC 估算中断时延) ====================
+  Time GetRarTxDelay () const { return m_rarTxDelay; }
+  Time GetUplinkPropDelay () const { return m_uplinkPropDelay; }
+
+  // ==================== CQI 预测器 / AMC 控制器 / PRACH 检测 钩子 ====================
+  /// CQI 预测器: 默认直通 (回退实测 CQI)
+  void              SetCqiPredictor (Ptr<CqiPredictor> cqiPredictor);
+  Ptr<CqiPredictor> GetCqiPredictor () const { return m_cqiPredictor; }
+
+  /// OLLA + Kalman 链路自适应控制器
+  void                   SetCqiAmcController (Ptr<CqiAmcController> ctrl) { m_cqiAmc = ctrl; }
+  Ptr<CqiAmcController>  GetCqiAmcController () const { return m_cqiAmc; }
+
+  /// PRACH 检测模型 (Pd/Pfa 系统级)
+  void                       SetPrachDetectionModel (Ptr<PrachDetectionModel> model);
+  Ptr<PrachDetectionModel>   GetPrachDetectionModel () const { return m_prachDetectionModel; }
+  void                       SetDefaultPrachSnrDb (double s) { m_defaultPrachSnrDb = s; }
+  double                     GetDefaultPrachSnrDb () const { return m_defaultPrachSnrDb; }
+
+  // ==================== 准入控制 / HARQ 注入 (qyh) ====================
+  void SetAdmitControl (Ptr<AdmitControl> admitControl);
+  bool CheckHandoverAdmission (uint32_t sourceBeamId, uint32_t targetBeamId,
+                               ServicePriority priority, UtType utType,
+                               TrafficType trafficType, uint32_t requiredRbs, bool isUplink = false);
+  void SetHarqManager (Ptr<HarqManager> harqManager);
+  void RegisterUeDciCallback (uint16_t ueId, Callback<void, DciInfo> dciCb);
+
   void UpdateUeCsi (uint16_t rnti, double cqi);
+  /// qyh 增量: DL CQI 上报入口 (喂 CqiPredictor + CqiAmcController)
+  void UpdateUeDlCqi (uint16_t rnti, double cqi);
+  /// qyh 增量: UL CQI 上报入口 (对称 DL)
+  void UpdateUeUlCqi (uint16_t rnti, double cqi);
+  /// qyh 增量: 上层通知 DL/UL Buffer Status 变化
   void UpdateUeDlBufferStatus (uint16_t rnti, uint32_t bufferBytes);
   void UpdateUeUlBufferStatus (uint16_t rnti, uint32_t bufferBytes);
+
+  /// qyh 增量: 给某 UE 选 MCS。m_cqiAmc 注入则走 EffectiveCqi 路径; 否则回退 latestCqi → GetMcsFromCqi。
+  uint8_t GetMcsForNewTx (uint16_t rnti);
+
+  // qyh 增量: PRACH 检测模型包装层 (lazy-create m_prachDetectionModel)
+  void   EnablePrachDetectionErrors (bool enabled);
+  bool   SetPrachDetectionCurveCsv (const std::string& path);
+  void   SetPrachDetectionFixed (double pd, double pfa);
+  void   SetNumPrachPreambles (uint32_t numPreambles) { m_numPrachPreambles = numPreambles; }
+  uint32_t GetNumPrachPreambles () const { return m_numPrachPreambles; }
+  PrachDetectionStats GetPrachDetectionStats () const;
+  void   ResetPrachDetectionStats ();
+
   void UpdateUePosition (uint16_t rnti, Vector position);
   void PreProcessRequests ();
+
+  // ==================== 功率域 NOMA: 有效 SINR / 共享RB 查询 (供数据面/统计读取) ====================
+  /// 返回某 UE 本轮下行的"有效接收 SINR"(dB)。NOMA near=SIC后, far=被干扰后,
+  /// 普通用户=CQI 等效 SINR。未记录则返回 NaN。供 NtnGwMac 在 SendDlPdu 时打 tag。
+  double GetEffectiveDlSinrDb (uint16_t rnti) const;
+
+  // ==================== 数据面单一真源 (跨调度轮持久化, 供 NtnGwMac 自动接线) ====================
+  // m_effectiveDlSinrDb 每轮 RunScheduler 开头会清空, 与异步的数据面 (NtnGwMac 调度 tick)
+  // 不同步。下面两张表在"真正下发 DL DCI"的位置持久化最近一次的 {有效SINR, 发射功率},
+  // 不随调度轮清空, 让 NtnGwMac 能在任意时刻按 rnti 取到与最近一次授权一致的真值。
+  /// 某 UE 最近一次 DL 授权的有效接收 SINR(dB)。无记录返回 NaN。
+  double GetLastDlEffSinrDb (uint16_t rnti) const;
+  /// 某 UE 最近一次 DL 授权的发射功率(dBm)。无记录返回 NaN。
+  double GetLastDlTxPowerDbm (uint16_t rnti) const;
+  /// 某 UE 最近一次 CLPC 闭环用到的实测接收 UL SINR(dB)。无记录返回 NaN。
+  /// (只读观测器: 供 demo 展示 CLPC 收敛, 实测 SINR 趋近 TargetUlSinrDb。)
+  double GetLastMeasuredUlSinrDb (uint16_t rnti) const;
+  /// 某波束本轮 NOMA 功率域复用的下行/上行共享 RB 数 (读 ResourceManager 记账)。
+  uint32_t GetBeamSharedRbs (uint32_t beamId, bool isUplink) const;
+  /// 某波束当前已用的下行/上行 RB 数 (主用户占用, 用于算 NOMA 复用增益比例)。
+  uint32_t GetBeamUsedRbs (uint32_t beamId, bool isUplink) const;
+  uint32_t GetMyBeamId () const { return m_myBeamId; }
+
+  // ----- NOMA 复用累计统计 (跨调度轮次, 供 result-writer / 例子读取并落盘) -----
+  /// 某波束 NOMA 下行累计共享(复用) RB 数。
+  uint64_t GetCumulativeNomaSharedDlRbs (uint32_t beamId) const;
+  /// 某波束下行累计已用(主用户占用) RB 数。
+  uint64_t GetCumulativeNomaUsedDlRbs (uint32_t beamId) const;
+  /// 某波束 NOMA 下行复用增益 = 累计共享RB / 累计已用RB (无复用为0)。
+  double GetNomaDlReuseGain (uint32_t beamId) const;
+  /// 把本调度器各波束的 NOMA 复用记账写入 ResultWriter (消除 GetSharedRbs 死代码)。
+  /// writer 为空则跳过; filename 默认 "NomaReuseStats.txt"。
+  void WriteNomaReuseStats (Ptr<ResultWriter> writer,
+                            const std::string& filename = "NomaReuseStats.txt") const;
 
   void RunScheduler ();
   void SendControlMsg (uint16_t rnti, uint8_t msgType);
 
-  void ReceiveMeasReport (const MeasReport& report);
-  void SendDciToUe (uint16_t ueId, const DciInfo& dci);
-  void RegisterUeDciCallback (uint16_t ueId, Callback<void, DciInfo> dciCb);
+  // ==================== 功能验证演示访问器 (functional-demo.cc 专用) ====================
+  // 谨慎、最小: 只读地暴露调度器内部已有的 "每RB字节估算" 与 "调度用CQI(经预测器处理)",
+  // 以及一个 UE 优先级直设接口(供构造应急/语音/数据三类对比)。不改变调度流程。
+  /// 公共包装: 走 CQI→MCS→NrAmc 通路返回每 RB 可承载字节数。
+  double EstimateBytesPerRbForCqi (double cqi, bool isUplink) const { return EstimateBytesPerRb (cqi, isUplink); }
+  /// 公共包装: 返回某 UE 本轮调度实际使用的 CQI(关预测器=实测直通, 开=Kalman+OLLA有效CQI)。
+  double GetSchedulingCqiForUe (uint16_t rnti, bool isUplink) const;
+  /// 直接设置某 UE 的业务优先级(用于构造 EMERGENCY 等无法由业务类型映射得到的等级)。
+  void SetUePriority (uint16_t rnti, ServicePriority priority);
 
-  // ==================== 准入控制接口 ====================
-  void SetAdmitControl (Ptr<AdmitControl> admitControl);
-  bool CheckHandoverAdmission (uint32_t targetBeamId, ServicePriority priority, UtType utType,
-                               TrafficType trafficType, uint32_t requiredRbs, bool isUplink = false);
+  void SendDciToUe (uint16_t ueId, const DciInfo& dci);
 
   // ==================== PUCCH/BSR 处理接口 ====================
   void ReceivePucchInfo (const PucchInfo& pucchInfo);
@@ -105,24 +314,17 @@ public:
   uint32_t ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs);
 
   // ==================== 4 步随机接入接口 (基站侧) ====================
-  // Msg1: UE → gNB, 前导码收集
   void ReceivePrachPreamble (const PrachPreamble& preamble);
-  // Msg3: UE → gNB, RRC 连接建立请求 (承载在 PUSCH 上)
   void ReceiveMsg3 (const RrcSetupRequest& req);
   void ReceiveMsg3Packet (Ptr<Packet> packet);
-  // UE 订阅下行 RA 消息 (RAR/Msg4) 的广播回调
   void RegisterUeRaCallbacks (Callback<void, const RarMessage&> rarCb,
                               Callback<void, const RrcSetupMessage&> msg4Cb);
-  // 配置随机接入参数
   void SetRaConfig (Time prachWindow, Time rarProcessingDelay,
                     Time rarTxDelay, Time msg4ProcessingDelay, Time msg4TxDelay);
 
   // ==================== 2 步随机接入接口 (基站侧) ====================
-  // MsgA: UE → gNB, 前导码 + RRC 建链请求打包
   void ReceiveMsgA (const MsgA& msgA);
-  // UE 订阅 MsgB 下行广播回调
   void RegisterUeTwoStepRaCallbacks (Callback<void, const MsgB&> msgBCb);
-  // 配置 2 步 RA 参数
   void SetTwoStepRaConfig (Time msgAWindow, Time msgBProcessingDelay, Time msgBTxDelay);
 
   // 必须实现的 5G-LENA 接口
@@ -145,123 +347,266 @@ public:
   virtual int64_t AssignStreams (int64_t stream) override;
 
 private:
-  uint8_t GetMcsFromCqi (double cqi) const;
+  uint8_t GetMcsFromCqi (double cqi, bool isUplink) const;  // qyh DL/UL 版 (统一口径, 走 NrAmc)
+  // 由 RSRP 推算每-UE 上行路径损耗(dB), 并写回 ctx.pathLossDb
+  double DerivePathLossFromRsrp (double rsrpDbm) const;
+  // 静态(SPS)固定 RB
+  uint32_t GetSpsFixedRbs (const SatUeContext& ctx) const;
+  bool TryScheduleDlSps (uint16_t rnti, uint32_t beamId, uint32_t& availableRbs);
+  bool TryScheduleUlSps (uint16_t rnti, uint32_t beamId);
   ServicePriority MapTrafficTypeToPriority (TrafficType trafficType);
   double CalculateWrrWeight (ServicePriority priority, UtType utType);
-  double EstimateBytesPerRb (double cqi) const;
+  double EstimateBytesPerRb (double cqi, bool isUplink) const;
+  // 对目标 RB 数求真实 TBS 字节(NR TBS 随 RB 非线性, 直接走 NrAmc::GetPayloadSize(mcs,rbs))。
+  // 用于"按已分配 RB 计实发字节"与"按 buffer 反推所需 RB", 取代单RB×N 线性外推。
+  uint32_t EstimateTbsBytes (double cqi, uint32_t rbs, bool isUplink) const;
+  // 二分: 返回承载 targetBytes 所需的最小 RB 数(clamp 到 maxRbs); targetBytes==0 → 0。
+  uint32_t RbsForBytes (double cqi, uint32_t targetBytes, uint32_t maxRbs, bool isUplink) const;
   double CalculateLocationFactor (const Vector& position) const;
   double CalculateSchedulerMetric (const SatUeContext& ctx,
                                    uint32_t queueBudget,
                                    bool isUplink,
                                    double urgencyBoost,
                                    double demandBytes) const;
+  double ExtractWidebandDlCqi (const DlCqiInfo& cqiInfo) const;
+  double EstimateWidebandUlCqiFromSinr (const UlCqiInfo& ulCqiInfo) const;
+  // 闭环功控
+  double AverageUlSinrDb (const UlCqiInfo& ulCqiInfo) const;
+  // 统一上行实测应用(以 rnti 为键): 更新 UL CQI + (开启时)推进 CLPC。供标准 SAP 入口
+  // (反查 rnti 后) 与 CLPC 直透回灌共用; 返回是否成功应用(样本有效)。
+  bool ApplyUlSinrMeasurement (uint16_t rnti, const UlCqiInfo& ulCqiInfo);
+  void UpdateClosedLoopPowerControl (uint16_t rnti, double measuredSinrDb);
+  void ApplyClpcDelta (uint16_t rnti, double deltaDb);
+  int QuantizeTpcDb (double errorDb) const;
+  // ---------- 上行实测 SINR 反馈 (链路预算法, 闭合 CLPC 回路) ----------
+  // 由 ProcessUlGrant 调用: 基于本次授权的 txPower/路损/天线增益/热噪声算出 gNB 侧
+  // 接收 UL SINR(dB), 延迟 m_ulCqiFeedbackDelay 后回灌给 DoSchedUlCqiInfoReq。
+  void ScheduleUlSinrFeedback (uint16_t rnti, uint32_t approvedRb, uint8_t symStart,
+                               const SfnSf& sfnSf, double txPowerDbm,
+                               double pathLossDb, double clpcOffsetDb);
+  // 链路预算: 计算 gNB 侧接收 UL SINR(dB)。
+  double ComputeReceivedUlSinrDb (uint32_t approvedRb, double txPowerDbm,
+                                  double pathLossDb) const;
+  // 延迟回调: 构造 SchedUlCqiInfoReqParameters 并喂入 DoSchedUlCqiInfoReq。
+  void DeliverUlSinrFeedback (uint16_t rnti, uint32_t approvedRb, uint8_t symStart,
+                              SfnSf sfnSf, double measuredSinrDb);
+
+  // ---------- 功率域 NOMA 辅助 ----------
+  double SinrDbFromCqi (double cqi) const;
+  double CqiFromSinrDb (double sinrDb) const;
+  // betaFar = 该 far 用户实际占的功率份额 (1:1 时 = m_nomaFarPowerFraction; 1:N 时为
+  // m_nomaFarPowerFraction 在各 far 间的等分)。betaFarTotal = 所有 far 占的总份额
+  // (near 承受的 (1-betaFarTotal) 自身衰减)。1:1 时两者相等 = m_nomaFarPowerFraction。
+  std::pair<double, double> ComputeNomaEffectiveCqi (double nearCqi, double farCqi) const;
+  // 功率域 NOMA 的真实功率切分(单位 dBm), 由波束下行总功率预算按 β / (1-β) 切分:
+  //   near 用户拿 (1-β) 份额、far 用户拿 β 份额。
+  double NomaNearTxPowerDbm () const;
+  double NomaFarTxPowerDbm () const;
+  // 按给定功率份额(线性, 0..1)把波束下行总功率预算切成 dBm; 供 1:N 的 per-far 份额使用。
+  double NomaTxPowerDbmForFraction (double fraction) const;
+  // 同时返回该 NOMA 对的 near/far 有效 SINR(dB): {nearSinrDb, farSinrDb}。
+  std::pair<double, double> ComputeNomaEffectiveSinrDb (double nearCqi, double farCqi) const;
+  // 1:N 版: betaFar=该 far 份额, betaFarTotal=全部 far 总份额(near 承受的自身衰减为
+  // 1-betaFarTotal, 该 far 把"near 的 (1-betaFarTotal) 份 + 其它 far 的份额"当作干扰)。
+  std::pair<double, double> ComputeNomaEffectiveSinrDb (double nearCqi, double farCqi,
+                                                        double betaFar, double betaFarTotal) const;
+  // 记录某 UE 本轮下行有效 SINR(dB), 供 GetEffectiveDlSinrDb 读取后随 DL 包下发。
+  void RecordEffectiveDlSinrDb (uint16_t rnti, double sinrDb);
+  void BuildNomaPairs (uint32_t beamId, const std::vector<uint16_t>& candidates);
+  void EmitNomaFarGrant (uint16_t farRnti, uint32_t sharedRb, double farEffCqi,
+                         double farEffSinrDb, uint32_t beamId, double farTxPowerDbm);
+  uint8_t AllocateUlLedgerSymStart (void) const;
+  void RecordPendingUlCqiAllocation (uint16_t rnti, uint32_t approvedRb, uint8_t mcs, uint8_t symStart);
   void BeginUlSchedulingPeriod (uint32_t beamId, uint64_t schedulingRoundId = 0);
   void RunUlScheduler ();
   void RunUlSchedulerForBeam (uint32_t beamId);
+  void HandleDlHarqRetransmission (uint16_t rnti, uint8_t processId, Ptr<Packet> packet);
+  void HandleDlHarqFeedbackResult (uint16_t rnti, uint8_t processId, bool completedSuccessfully);
   uint32_t GetEffectiveUlDemandBytes (const SatUeContext& ctx) const;
   void RefreshPendingUlGrantEstimate (SatUeContext& ctx) const;
+  double GetSchedulingCqi (const SatUeContext& ctx, bool isUplink) const;
 
   // ---------- 随机接入辅助 ----------
-  // 上行到达后延迟入缓冲 (模拟上行传播)
   void DoBufferPreamble (PrachPreamble preamble);
   void DoBufferMsg3 (RrcSetupRequest req);
   void DoBufferMsgA (MsgA msgA);
-  // 收集窗口内到达的 preamble 并为每个唯一的 preambleId 生成 RAR
   void ProcessPrachWindow ();
-  // 真正发送 RAR (广播至所有订阅的 UE)
   void DispatchRar (RarMessage rar);
-  // 处理 Msg3 窗口结束, 判定竞争解决并发 Msg4
   void ProcessMsg3Window ();
-  // 真正发送 Msg4 (广播至所有订阅的 UE)
   void DispatchMsg4 (RrcSetupMessage msg4);
-  // 分配一个 TC-RNTI (简单线性递增)
   uint16_t AllocateTcRnti ();
 
   // 计算UE间距离 (用于IPF)
   double CalculateUeDistance (uint16_t rnti1, uint16_t rnti2);
 
-  std::map<uint16_t, SatUeContext> m_ueContextMap;           
-  std::map<uint32_t, std::vector<uint16_t>> m_beamToUesMap;  
+  std::map<uint16_t, SatUeContext> m_ueContextMap;
+  std::map<uint32_t, std::vector<uint16_t>> m_beamToUesMap;
   std::map<uint16_t, Callback<void, DciInfo>> m_ueDciCallbackMap;
-  
-  Time m_defaultK2Delay; 
-  uint32_t m_myBeamId;   
-  uint32_t m_prachReservedRbs; 
+
+  Time m_defaultK2Delay;
+  uint32_t m_myBeamId;
+  uint32_t m_prachReservedRbs;
 
   Ptr<ResourceManager> m_resourceManager;
   Ptr<AdmitControl> m_admitControl;
-  
+  Ptr<HarqManager> m_harqManager;
+  Ptr<NrAmc> m_dlAmc;
+  Ptr<NrAmc> m_ulAmc;
+  Time m_dlSchedHorizon;  // DL 预测提前量
+  Time m_ulSchedHorizon;  // UL 预测提前量
+
   // WRR状态
   uint8_t m_wrrCurrentPriority;  // 当前服务的优先级
   uint32_t m_wrrCurrentIndex;    // 当前轮询索引
-  
+
   // IPF参数
   double m_ipfLocationWeight;   // 位置权重因子 (0-1)
   double m_ipfFairnessWeight;    // 公平性权重因子
+
+  // ---------- qyh RRM 配置 ----------
   double m_emergencyDelayThresholdSeconds;
-  double m_referencePathLossDb;
+  double m_referencePathLossDb;  // RA(Msg3)阶段无UE上下文时的回退路损
+  double m_refSatEirpDbm;        // 卫星每波束参考 EIRP(dBm); 路损 = EIRP - RSRP
+  Time m_dlCqiValidityTime;
+  Time m_ulCqiValidityTime;
   uint32_t m_srGrantRbs;
   uint8_t m_srGrantMcs;
-  uint32_t m_msg3RequestedRbs;
-  uint8_t m_msg3GrantMcs;
-  uint32_t m_msg3DefaultUtTypeValue;
+  uint32_t m_dataAdmitRbCap;     // DATA/BE 准入"粗粒度闸"的宽松度上限(非分配上限)
+  // 静态(SPS / 半持续)调度配置
+  bool m_spsEnabled;
+  uint32_t m_spsVoiceRbs;
+  uint32_t m_spsEmergencyRbs;
+  uint32_t m_spsPortableFloorRbs;
+  Time m_spsPeriod;
+  // 上行闭环功控(CLPC)配置
+  bool m_clpcEnabled;
+  double m_targetUlSinrDb;
+  double m_clpcMinDb;
+  double m_clpcMaxDb;
+  Time m_clpcLoopDelay;
+  // ---------- 上行 SINR 反馈链路预算参数 ----------
+  double m_utTxAntennaGainDb;     // 终端发射天线增益 G_ut_tx (dB)
+  double m_satRxAntennaGainDb;    // 卫星接收天线增益 G_sat_rx (dB)
+  double m_noiseFigureDb;         // gNB 接收机噪声系数 NF (dB)
+  double m_ulSinrMeasErrorSigmaDb;// 接收 SINR 估计误差标准差 (dB), 0=无测量噪声
+  Time   m_ulCqiFeedbackDelay;    // UL CQI/SINR 反馈时延 (UE→卫星→gNB 上行单程)
+  Ptr<NormalRandomVariable> m_ulSinrMeasErrorRv; // SINR 测量误差随机源
+  bool m_dlPowerAllocEnabled;    // 下行动态功率调配
+  // 功率域 NOMA 共享配置
+  bool m_nomaEnabled;
+  double m_nomaFarPowerFraction;
+  double m_nomaMinCqiGap;
+  uint32_t m_nomaMaxFar {1};                    // 单 near 可叠加的 far 上限 (1=经典 1:1)
+  std::map<uint16_t, std::vector<uint16_t>> m_nomaPartner;  // 本轮 near->far(s) 配对
+  std::set<uint16_t> m_nomaFarThisRound;       // 本轮作为 far 被 NOMA 服务的 UE
+  // 本轮各 UE 下行有效接收 SINR(dB): NOMA near=SIC后, far=被干扰后, 普通=CQI等效。
+  // 数据面(NtnGwMac::SendDlPdu)经 GetEffectiveDlSinrDb 读取后写进 NtnDciTag, 驱动 BLER。
+  std::map<uint16_t, double> m_effectiveDlSinrDb;
+  // 数据面单一真源(不随调度轮清空): 最近一次 DL 授权的 {有效SINR, 发射功率}。
+  // 在真正发 DL DCI 的位置(scheduleClassQueue 发 near/普通 DCI、EmitNomaFarGrant 发 far DCI)写入。
+  std::map<uint16_t, double> m_lastDlEffSinrDb;
+  std::map<uint16_t, double> m_lastDlTxPowerDbm;
+  // CLPC 只读观测: 最近一次实测接收 UL SINR(dB) (供 demo 展示收敛, 不参与调度逻辑)。
+  std::map<uint16_t, double> m_lastMeasuredUlSinrDb;
+  // NOMA 功率域复用累计记账(跨调度轮次, 因每轮 ResetBeamAllocation 会清零瞬时值)。
+  // 每波束: 累计共享 RB 数 / 累计主用户已用 RB 数; 二者之比即该波束 NOMA 复用增益。
+  std::map<uint32_t, uint64_t> m_cumNomaSharedDlRbs;
+  std::map<uint32_t, uint64_t> m_cumNomaUsedDlRbs;
+
+  // ---------- Msg3 资源门控 (0603, 与主代码 ProcessPrachWindow 对齐) ----------
+  uint32_t  m_msg3RequestedRbs {6};
+  uint8_t   m_msg3GrantMcs {4};
+  uint32_t  m_msg3DefaultUtTypeValue {0};      // 0 = UT_PORTABLE
+  // 每波束 UL 调度轮次
   std::map<uint32_t, uint64_t> m_ulSchedulingRoundIdByBeam;
-  uint64_t m_nextUlSchedulingRoundId;
+  uint64_t                     m_nextUlSchedulingRoundId {0};
+
   std::map<uint16_t, Time> m_admissionQueueSince;
 
+  struct PendingUlCqiAllocation
+  {
+    uint16_t rnti {0};
+    uint8_t symStart {0};
+    uint32_t tbsBytes {0};
+  };
+  std::map<uint64_t, std::vector<PendingUlCqiAllocation>> m_ulCqiAllocationMap;
+  bool m_hasCurrentUlTriggerSfnSf {false};
+  SfnSf m_currentUlTriggerSfnSf;
+
+  struct PendingDlHarqTransmission
+  {
+    DciInfo dci;
+    Ptr<Packet> packet;
+    uint32_t packetBytes {0};
+  };
+  std::map<std::pair<uint16_t, uint8_t>, PendingDlHarqTransmission> m_dlHarqProcessMap;
+  /// 记录 (rnti,processId) 是否发生过重传 (=首传 NACK), 用于 OLLA 推导初传结果。
+  std::map<std::pair<uint16_t, uint8_t>, bool> m_dlHarqEverRetx;
+
   // ---------- 4 步 RA 运行时状态 ----------
-  // 每条记录一次 preamble 到达；末尾字段为真实发送时间戳 (tie-break 用)
   struct PreambleArrival {
     uint32_t preambleId;
-    UtType   utType;
+    UtType   utType {UT_PORTABLE};
     Time     arrivalTime;
-    uint32_t raRnti;       // UE 提供的 RA-RNTI, 区分不同 PRACH occasion
+    uint32_t raRnti;
+    double   prachSnrDb {0.0};
   };
   std::vector<PreambleArrival> m_prachWindowBuf;
-  EventId  m_prachWindowEvent;             // 当前 PRACH 窗口处理事件
+  EventId  m_prachWindowEvent;
 
-  // Msg3 聚合缓冲: tcRnti -> 所有同一 TC-RNTI 上的 Msg3
+  // Msg3 聚合缓冲
   std::map<uint16_t, std::vector<RrcSetupRequest>> m_msg3WindowBuf;
-  EventId  m_msg3WindowEvent;              // 当前 Msg3 窗口处理事件
+  EventId  m_msg3WindowEvent;
 
-  // 下行 RA 广播订阅者 (每个 UE 注册一对回调, 自己按 rnti/preambleId 过滤)
+  // 下行 RA 广播订阅者
   std::vector<Callback<void, const RarMessage&>>      m_rarSubscribers;
   std::vector<Callback<void, const RrcSetupMessage&>> m_msg4Subscribers;
 
-  uint16_t m_tcRntiCounter;                // 下一个可分配的 TC-RNTI (从 0x8001 开始)
+  uint16_t m_tcRntiCounter;
 
   // 可配置时延参数
-  Time m_prachWindowDuration;              // 前导码聚合窗口 (1 ms 默认)
-  Time m_rarProcessingDelay;               // gNB 处理 RAR 的本地时延
-  Time m_rarTxDelay;                       // RAR 单程传播 (GEO ~300 ms)
-  Time m_msg3WindowDuration;               // Msg3 聚合/去重窗口
-  Time m_msg4ProcessingDelay;              // gNB 处理 Msg4 的本地时延
-  Time m_msg4TxDelay;                      // Msg4 单程传播 (GEO ~300 ms)
+  Time m_prachWindowDuration;
+  Time m_rarProcessingDelay;
+  Time m_rarTxDelay;
+  Time m_msg3WindowDuration;
+  Time m_msg4ProcessingDelay;
+  Time m_msg4TxDelay;
 
   // ---------- 2 步 RA 运行时状态 ----------
   struct MsgAArrival {
     uint32_t preambleId;
     uint64_t ueIdentity;
     Time     arrivalTime;
-    uint32_t raRnti;       // UE 提供的 RA-RNTI, 区分不同 PRACH occasion
+    uint32_t raRnti;
   };
   std::vector<MsgAArrival> m_msgAWindowBuf;
   EventId  m_msgAWindowEvent;
 
-  // MsgB 下行广播订阅者 (独立于 4 步的 m_rarSubscribers)
   std::vector<Callback<void, const MsgB&>> m_msgBSubscribers;
 
-  // 2 步 RA 可配置时延
-  Time m_msgAWindowDuration;               // MsgA 聚合窗口 (500μs)
-  Time m_msgBProcessingDelay;              // gNB 处理 MsgB 的本地时延
-  Time m_msgBTxDelay;                      // MsgB 单程传播 (GEO ~300 ms)
+  Time m_msgAWindowDuration;
+  Time m_msgBProcessingDelay;
+  Time m_msgBTxDelay;
 
   // ---------- 上行传播时延 ----------
-  Time m_uplinkPropDelay;                  // UE → 卫星 → gNB 上行单程 (GEO ~300 ms)
+  Time m_uplinkPropDelay;
 
   // 2 步 RA 辅助函数
   void ProcessMsgAWindow ();
   void DispatchMsgB (MsgB msgB);
+
+  // ---------- qyh 增量字段 (S2): 链路自适应 / RA 解调钩子 ----------
+  Ptr<CqiPredictor>         m_cqiPredictor;
+  Ptr<CqiAmcController>     m_cqiAmc;
+  Ptr<PrachDetectionModel>  m_prachDetectionModel;
+  double                    m_defaultPrachSnrDb {20.0};
+  uint32_t                  m_numPrachPreambles {64};
+  /// 属性 UseCqiAmcPredictor: 为 true 时把 CqiAmcPredictor 注入为 m_cqiPredictor。
+  bool                      m_useCqiAmcPredictor {false};
+  /// 是否已按 m_useCqiAmcPredictor 完成惰性注入 (保证属性设置后才生效, 只注入一次)。
+  bool                      m_cqiAmcPredictorApplied {false};
+  /// 按 m_useCqiAmcPredictor 惰性注入 CqiAmcPredictor (幂等)。
+  void MaybeApplyCqiAmcPredictor ();
 };
 
 } // namespace ns3

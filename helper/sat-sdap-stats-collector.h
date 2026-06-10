@@ -30,7 +30,7 @@ public:
     SatSdapStatsCollector ();
     virtual ~SatSdapStatsCollector ();
 
-    // TracedCallback sinks (match SatSdap trace signatures)
+    // TracedCallback sinks (match NtnSdap trace signatures)
     void OnTxSdap (uint16_t rnti, uint8_t qfi, uint8_t lcid, uint32_t size);
     void OnRxSdap (uint16_t rnti, uint8_t qfi, uint8_t lcid, uint32_t size, uint64_t delayNs);
 

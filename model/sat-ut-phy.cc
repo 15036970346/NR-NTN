@@ -95,24 +95,44 @@ double SatUtPhy::GetInterferenceFromTrace (uint32_t beamId) {
 }
 
 double SatUtPhy::GetCoChannelInterference (uint32_t beamId) {
-    // 共道干扰: 来自使用相同频率的其他波束的干扰
-    // GEO卫星场景下，同频波束复用会产生共道干扰
-    // 模拟: -85dBm ~ -100dBm，取决于频率复用距离
+    // 同色波束 C/I_co 解析模型 (helper 注入 FrequencyReuse 后启用):
+    //   I_co_total = serving_rsrp - C/I_co + 10*log10(n_interfering_co_beams)
+    //   其中 C/I_co = main_lobe_gain - side_lobe_gain (dB), 单干扰束的载干比。
+    //   n_interfering = FrequencyReuse 给出的同色其他波束数 (4 色 -> 1~2 个, 7 色 -> 0 个)。
+    // 未注入 FreqReuse 时退回到旧 mock (保持回归数值稳定)。
+    if (m_freqReuse) {
+        std::vector<uint32_t> interferers = m_freqReuse->GetInterferingBeams (beamId);
+        if (interferers.empty ()) {
+            NS_LOG_DEBUG ("Co-channel I=0 for beam " << beamId
+                          << " (reuseFactor=" << (uint32_t) m_freqReuse->GetReuseFactor ()
+                          << ", no co-color neighbors)");
+            return -200.0;  // 实质归零
+        }
+        const double singleInterfererDbm = m_lastRsrp - m_coBeamCIDb;
+        const double totalDbm = singleInterfererDbm + 10.0 * std::log10 ((double) interferers.size ());
+        NS_LOG_DEBUG ("Co-channel I for beam " << beamId
+                      << ": " << totalDbm << " dBm ("
+                      << interferers.size () << " co-color beams, C/I_co=" << m_coBeamCIDb << " dB)");
+        return totalDbm;
+    }
+
+    // === legacy mock (无 FreqReuse 注入) ===
     double interferenceDbm = -90.0 + (beamId % 7) * 2.0;
-    
-    // 如果有多个活跃干扰源，功率叠加
-    uint32_t numInterferers = 3; // 假设3个主要共道干扰源
+    uint32_t numInterferers = 3;
     double totalInterferenceMw = 0.0;
     for (uint32_t i = 0; i < numInterferers; ++i) {
-        double interfDbm = interferenceDbm - i * 3.0; // 每个干扰源递减3dB
+        double interfDbm = interferenceDbm - i * 3.0;
         totalInterferenceMw += std::pow(10.0, interfDbm / 10.0);
     }
-    
     double totalInterferenceDbm = 10.0 * std::log10(totalInterferenceMw);
-    NS_LOG_DEBUG ("Co-channel interference for Beam " << beamId << ": " 
+    NS_LOG_DEBUG ("Co-channel interference (mock) for Beam " << beamId << ": "
                   << totalInterferenceDbm << " dBm (" << numInterferers << " sources)");
     return totalInterferenceDbm;
 }
+
+void SatUtPhy::SetFrequencyReuse (Ptr<FrequencyReuse> fr) { m_freqReuse = fr; }
+void SatUtPhy::SetCoBeamCIDb (double ciDb)                { m_coBeamCIDb = ciDb; }
+void SatUtPhy::SetCurrentBeamId (uint32_t beamId)         { m_currentBeamId = beamId; }
 
 double SatUtPhy::GetAdjacentChannelInterference (uint32_t beamId) {
     // 临道干扰: 来自相邻频率资源的干扰

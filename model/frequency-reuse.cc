@@ -55,10 +55,9 @@ void FrequencyReuse::InitializeColorPattern ()
   m_colorToBeams.clear ();
   
   // 初始化颜色到RB的映射
-  // 当前项目重点为7色复用：总RB=175，每波束实际可用RB固定为25，
-  // 7个波束合计恰好占满全部RB，不再额外保留未分配资源。
-  uint32_t rbsPerColor = (m_reuseFactor == 7) ? 25 : (m_totalRbs / m_reuseFactor);
-  uint32_t remainder = (m_reuseFactor == 7) ? 0 : (m_totalRbs % m_reuseFactor);
+  // 每个颜色分配 m_totalRbs / m_reuseFactor 个RB
+  uint32_t rbsPerColor = m_totalRbs / m_reuseFactor;
+  uint32_t remainder = m_totalRbs % m_reuseFactor;
   
   for (uint8_t color = 0; color < m_reuseFactor; ++color) {
       std::vector<uint32_t> rbsForColor;
@@ -80,10 +79,40 @@ void FrequencyReuse::InitializeColorPattern ()
   NS_LOG_INFO ("  RBs per Color: " << rbsPerColor);
 }
 
+void FrequencyReuse::AddBeam (uint32_t beamId, uint8_t colorId)
+{
+  NS_LOG_FUNCTION (this << beamId << (uint32_t) colorId);
+
+  if (m_reuseFactor == 0)
+    {
+      NS_LOG_WARN ("AddBeam called before Configure(); ignoring");
+      return;
+    }
+  // 颜色映射到 [0, reuseFactor) 区间 (helper 用 1-based colorId, 这里 0-based)
+  uint8_t color = (colorId == 0) ? 0 : static_cast<uint8_t> ((colorId - 1) % m_reuseFactor);
+
+  // 重复登记时, 先把旧记录从旧色组里删
+  auto prev = m_beamToColor.find (beamId);
+  if (prev != m_beamToColor.end ())
+    {
+      auto& vec = m_colorToBeams[prev->second];
+      vec.erase (std::remove (vec.begin (), vec.end (), beamId), vec.end ());
+    }
+  m_beamToColor[beamId] = color;
+  m_colorToBeams[color].push_back (beamId);
+  NS_LOG_INFO ("FreqReuse: beam " << beamId << " -> color " << (uint32_t) color
+               << " (cluster has " << m_colorToBeams[color].size () << " beam(s))");
+}
+
 uint8_t FrequencyReuse::GetColorForBeam (uint32_t beamId) const
 {
-  // 简化的颜色分配：beamId mod reuseFactor
-  return beamId % m_reuseFactor;
+  // 优先查显式注册的映射 (helper 注入); 没注册时回落到简单算法
+  auto it = m_beamToColor.find (beamId);
+  if (it != m_beamToColor.end ())
+    {
+      return it->second;
+    }
+  return (m_reuseFactor == 0) ? 0 : static_cast<uint8_t> (beamId % m_reuseFactor);
 }
 
 std::vector<uint32_t> FrequencyReuse::GetBeamAllocation (uint32_t beamId) const
@@ -116,10 +145,6 @@ uint8_t FrequencyReuse::GetReuseFactor () const
 
 uint32_t FrequencyReuse::GetAvailableRbsPerBeam () const
 {
-  if (m_reuseFactor == 7)
-    {
-      return 25;
-    }
   return m_totalRbs / m_reuseFactor;
 }
 

@@ -2,9 +2,13 @@
 #include "ns3/resource-manager.h"
 #include "ns3/admit-control.h"
 #include "ns3/geo-beam-scheduler.h"
+#include "ns3/ntn-gw-rrc.h"
 #include "ns3/frequency-reuse.h"
 #include "ns3/sat-mac-common.h"
+#include "ns3/nr-amc.h"
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <chrono>
 #include <memory>
@@ -161,6 +165,40 @@ ExpectAdmitDecision (AdmitDecision actual, AdmitDecision expected, const std::st
   ExpectTrue (actual == expected, checkName, oss.str ());
 }
 
+// 参考 AMC: 复刻 GeoBeamScheduler::EstimateBytesPerRb 走的 NrAmc DL/UL 通路,
+// 让测试侧能算出与调度器一致的"每 RB 字节数"(避免硬编码常量与真实值脱节)。
+Ptr<NrAmc>
+GetReferenceAmc (bool isUplink)
+{
+  static Ptr<NrAmc> dlAmc = [] () {
+    Ptr<NrAmc> amc = CreateObject<NrAmc> ();
+    amc->SetDlMode ();
+    return amc;
+  } ();
+  static Ptr<NrAmc> ulAmc = [] () {
+    Ptr<NrAmc> amc = CreateObject<NrAmc> ();
+    amc->SetUlMode ();
+    return amc;
+  } ();
+  return isUplink ? ulAmc : dlAmc;
+}
+
+uint8_t
+GetReferenceMcsFromCqi (double cqi, bool isUplink)
+{
+  const uint8_t cqiIndex =
+    static_cast<uint8_t> (std::clamp (std::lround (cqi), 0l, 15l));
+  return GetReferenceAmc (isUplink)->GetMcsFromCqi (cqiIndex);
+}
+
+double
+GetReferenceBytesPerRb (double cqi, bool isUplink)
+{
+  const uint8_t mcs = GetReferenceMcsFromCqi (cqi, isUplink);
+  return std::max (1.0,
+                   static_cast<double> (GetReferenceAmc (isUplink)->GetPayloadSize (mcs, 1)));
+}
+
 } // namespace
 
 int
@@ -240,8 +278,8 @@ main (int argc, char* argv[])
                               UT_CONSUMER,
                               TRAFFIC_DATA,
                               1),
-    AdmitDecision::ADMIT_REDIRECT,
-    "Data UE should be redirected when beam 1 has no data RB left");
+    AdmitDecision::ADMIT_QUEUE,
+    "Data UE should be queued when only opportunistic (emergency-reserved) headroom remains");
 
   ExpectAdmitDecision (
     admitControl->CanAdmitUe (1,
@@ -280,8 +318,8 @@ main (int argc, char* argv[])
                               UT_CONSUMER,
                               TRAFFIC_HIGH_CAPACITY,
                               1),
-    AdmitDecision::ADMIT_REDIRECT,
-    "High-capacity data UE should redirect when effective RB demand exceeds remaining headroom");
+    AdmitDecision::ADMIT_QUEUE,
+    "High-capacity data UE should queue when its amplified RB demand would borrow protected headroom");
 
   PrintSection ("Test 3: GeoBeamScheduler DL slicing and 25 RB sharing");
 
@@ -399,7 +437,9 @@ main (int argc, char* argv[])
 
   ExpectTrue (!ulWindowCapture.m_dcis.empty (),
               "Stale-BSR GEO test should still issue at least one UL grant");
-  const double windowBytesPerRb = 133.3134; // CQI=15 -> MCS28 under current EstimateBytesPerRb()
+  // 用与调度器一致的 NrAmc UL 通路算每 RB 字节数 (旧版硬编码 133.3 是 DL 口径,
+  // 与真实 UL EstimateBytesPerRb 严重偏离, 导致 backlog 覆盖所需 RB 被低估)。
+  const double windowBytesPerRb = GetReferenceBytesPerRb (15.0, true);
   const uint32_t expectedGrantRbsUpperBound =
     static_cast<uint32_t> (std::ceil (5000.0 / windowBytesPerRb));
   const uint32_t consumerPerGrantUpperBound = 6u;
@@ -419,8 +459,12 @@ main (int argc, char* argv[])
               "5000-byte stale GEO BSR should only trigger the finite number of grants needed to cover the known backlog",
               "grantCount=" + std::to_string (ulWindowCapture.m_dcis.size ()));
 
-  PrintSection ("Test 6: MeasReport should not overwrite CQI");
+  PrintSection ("Test 6: MeasReport should not overwrite established CQI (via NtnGwRrc)");
 
+  // 架构适配: ReceiveMeasReport 已从调度器迁到 NtnGwRrc。NtnGwRrc::ReceiveMeasReport
+  // 会用上报里的 serving/bestNeighbor 度量经 UpdateUeCsi 喂回调度器, 并不再使用 legacy
+  // rsrp 字段。本测试断言: 一份上报当前服务波束、且 servingMetric 与既有 CQI 一致的
+  // MeasReport 不会污染调度器已建立的 DL CQI(13.0), DL MCS 仍按 CQI=13 选出。
   Ptr<GeoBeamScheduler> measScheduler = CreateObject<GeoBeamScheduler> ();
   measScheduler->Initialize (11, 30);
 
@@ -433,12 +477,17 @@ main (int argc, char* argv[])
   DciCapture measCapture (measRnti);
   measScheduler->RegisterUeDciCallback (measRnti, MakeCallback (&DciCapture::OnDci, &measCapture));
 
+  Ptr<NtnGwRrc> measRrc = CreateObject<NtnGwRrc> ();
+  measRrc->SetScheduler (measScheduler);
+
   MeasReport report;
   report.ueId = measRnti;
   report.bestBeamId = 11;
-  report.rsrp = -85.0;
+  report.rsrp = -85.0;   // legacy 字段, 新架构忽略
+  report.servingObject = {ServiceObjectType::SERVICE_OBJECT_SAT_BEAM, 11};
+  report.servingMetric = 13.0;  // 与既有 CQI 一致的服务波束度量
   report.position = Vector (120.0, 40.0, 0.0);
-  measScheduler->ReceiveMeasReport (report);
+  measRrc->ReceiveMeasReport (report);
   measScheduler->RunScheduler ();
 
   ExpectEq (measCapture.m_dcis.size (), 1u,
@@ -446,8 +495,8 @@ main (int argc, char* argv[])
   if (!measCapture.m_dcis.empty ())
     {
       const DciInfo& measDci = measCapture.m_dcis.front ();
-      ExpectEq (measDci.mcs, 24u,
-                "RSRP should not overwrite CQI when computing DL MCS");
+      ExpectEq (measDci.mcs, GetReferenceMcsFromCqi (13.0, false),
+                "Serving-metric MeasReport should keep CQI=13 driven DL MCS (legacy RSRP ignored)");
     }
 
   PrintSection ("Test 7: PRACH reserve should reduce DL traffic budget");
@@ -572,32 +621,66 @@ main (int argc, char* argv[])
   ExpectEq (splitUlOnlyCapture.m_dcis.size (), 0u,
             "UE with only UL buffer and zero DL buffer should not enter DL scheduling");
 
-  PrintSection ("Test 9: MeasReport should trigger beam handover without corrupting context");
+  PrintSection ("Test 9: A3 MeasReport via NtnGwRrc should trigger beam handover without corrupting context");
 
+  // 架构适配: 切换"决策"已迁到 NtnGwRrc。这里构造 NtnGwRrc + AdmitControl + ResourceManager,
+  // 投递一份 A3 上报 (serving=SAT_BEAM:21, bestNeighbor=SAT_BEAM:22), 由 NtnGwRrc::ReceiveMeasReport
+  // 做准入并经 scheduler->ExecuteHandover 把 UE 从波束 21 搬到波束 22, 同时保留 DL/UL 待发缓存。
   Ptr<GeoBeamScheduler> handoverScheduler = CreateObject<GeoBeamScheduler> ();
   handoverScheduler->Initialize (21, 30);
+
+  Ptr<ResourceManager> handoverRm = CreateObject<ResourceManager> ();
+  Ptr<AdmitControl> handoverAdmit = CreateObject<AdmitControl> ();
+  handoverAdmit->SetResourceManager (handoverRm);
+  handoverAdmit->SetBeamTotalRbs (21, 25);
+  handoverAdmit->SetBeamTotalRbs (22, 25);
+  handoverRm->ResetBeamAllocation (21, false);
+  handoverRm->ResetBeamAllocation (22, false);
+  handoverScheduler->SetAdmitControl (handoverAdmit);
+
+  Ptr<NtnGwRrc> handoverRrc = CreateObject<NtnGwRrc> ();
+  handoverRrc->SetScheduler (handoverScheduler);
+  handoverRrc->SetAdmitControl (handoverAdmit);
 
   const uint16_t handoverRnti = 701;
   handoverScheduler->AddUeContext (handoverRnti, UT_CONSUMER, TRAFFIC_DATA);
   handoverScheduler->AddUeInfo (handoverRnti, 21);
   handoverScheduler->UpdateUeCsi (handoverRnti, 11.0);
-  handoverScheduler->UpdateUeDlBufferStatus (handoverRnti, 3200);
-  handoverScheduler->ReceiveBsr ({handoverRnti, 0, 1600});
+  // 新架构对切换也走准入控制: 目标波束须能保证该 UE 的 RB 需求。EstimateRequiredRbs
+  // 现走 NrAmc 同主路径口径(已删除 latestCqi*2.5 魔数), 整缓存折算出的 raw RB 远大于
+  // 波束预算, 因此对 DATA UE 收敛到准入闸上限 m_dataAdmitRbCap(=4), 低于空波束的保证
+  // 余量, 切换被准入。缓存值仍要被切换完整保留。
+  handoverScheduler->UpdateUeDlBufferStatus (handoverRnti, 500);
+  handoverScheduler->ReceiveBsr ({handoverRnti, 0, 400});
 
   MeasReport handoverReport;
   handoverReport.ueId = handoverRnti;
   handoverReport.bestBeamId = 22;
-  handoverReport.rsrp = -82.0;
+  handoverReport.rsrp = -82.0;   // legacy 字段, 新架构忽略
+  handoverReport.eventType = MeasEventType::MEAS_EVENT_A3;
+  handoverReport.servingObject = {ServiceObjectType::SERVICE_OBJECT_SAT_BEAM, 21};
+  // 注意: NtnGwRrc::ReceiveMeasReport 把 serving/bestNeighbor 度量当作 CQI 喂给
+  // scheduler->UpdateUeCsi, 因此这里给 CQI 量纲 (1-15) 而非 dBm RSRP。邻区(目标)CQI 更优。
+  handoverReport.servingMetric = 8.0;
+  handoverReport.bestNeighborObject = {ServiceObjectType::SERVICE_OBJECT_SAT_BEAM, 22};
+  handoverReport.bestNeighborMetric = 11.0;
   handoverReport.position = Vector (300.0, 120.0, 0.0);
-  handoverScheduler->ReceiveMeasReport (handoverReport);
+  handoverRrc->ReceiveMeasReport (handoverReport);
+
+  // 切换成功 -> UE 现处于波束 22; 服务对象记录也应指向波束 22。
+  const HandoverStatsSummary hoSummary = handoverRrc->GetHandoverStats ();
+  ExpectEq (hoSummary.successes, 1u,
+            "A3 MeasReport should yield exactly one successful beam handover");
+  ExpectEq (handoverScheduler->GetUeContext (handoverRnti).currentBeamId, 22u,
+            "NtnGwRrc handover should move the UE context onto the reported best beam");
 
   HandoverUeContext exportedAfterReport = handoverScheduler->ExportUeContext (handoverRnti, 23);
   ExpectEq (exportedAfterReport.sourceBeamId, 22u,
-            "ReceiveMeasReport should move UE context to the reported best beam before later exports");
-  ExpectEq (exportedAfterReport.unsentDlBufferBytes, 3200u,
-            "Handover export should preserve unsent DL buffer bytes");
-  ExpectEq (exportedAfterReport.unsentUlBufferBytes, 1600u,
-            "Handover export should preserve unsent UL buffer bytes");
+            "Post-handover export should see the UE on the new best beam 22");
+  ExpectEq (exportedAfterReport.unsentDlBufferBytes, 500u,
+            "Handover should preserve unsent DL buffer bytes through the context move");
+  ExpectEq (exportedAfterReport.unsentUlBufferBytes, 400u,
+            "Handover should preserve unsent UL buffer bytes through the context move");
 
   PrintSection ("Test 10: Load balancing should move low-priority UE to a lighter beam");
 
@@ -638,6 +721,12 @@ main (int argc, char* argv[])
 
   PrintSection ("Test 11: PRACH/RAR should honor Msg3 power-control UE type");
 
+  // 时序适配: 当前调度器把 RA 建模为真实 GEO 链路, ReceivePrachPreamble 会先延迟
+  // m_uplinkPropDelay (~300 ms 单程) 才把前导码入窗, 再经 PRACH 窗口 + RAR 处理/发送
+  // 时延派发 RAR。SetRaConfig 不再压缩上行传播时延 (旧版会把它收成 rarTxDelay), 因此停
+  // 机时间必须覆盖完整 GEO RA 往返 (~300 ms+), 这里用 400 ms。
+  const Time raGeoSettleTime = MilliSeconds (400);
+
   Ptr<GeoBeamScheduler> raScheduler = CreateObject<GeoBeamScheduler> ();
   raScheduler->Initialize (41, 30);
   raScheduler->SetRaConfig (MicroSeconds (100),
@@ -658,7 +747,7 @@ main (int argc, char* argv[])
   portablePreamble.isRetransmission = false;
   raScheduler->ReceivePrachPreamble (portablePreamble);
 
-  Simulator::Stop (MilliSeconds (1));
+  Simulator::Stop (raGeoSettleTime);
   Simulator::Run ();
 
   ExpectEq (portableRarCapture.m_rars.size (), 1u,
@@ -689,15 +778,14 @@ main (int argc, char* argv[])
   consumerPreamble.isRetransmission = false;
   raSchedulerConsumer->ReceivePrachPreamble (consumerPreamble);
 
-  Simulator::Stop (MilliSeconds (2));
+  Simulator::Stop (raGeoSettleTime);
   Simulator::Run ();
 
   ExpectEq (consumerRarCapture.m_rars.size (), 1u,
             "Single consumer PRACH preamble should produce one RAR");
   if (!portableRarCapture.m_rars.empty () && !consumerRarCapture.m_rars.empty ())
     {
-      ExpectTrue (consumerRarCapture.m_rars.front ().ulGrantTxPowerDbm >=
-                  0.0,
+      ExpectTrue (consumerRarCapture.m_rars.front ().ulGrantTxPowerDbm >= 0.0,
                   "Consumer Msg3 grant power should remain a valid positive value");
       ExpectTrue (consumerRarCapture.m_rars.front ().ulGrantTxPowerDbm <= 50.0 + 1e-6,
                   "Consumer Msg3 grant power should remain capped by the consumer EIRP");

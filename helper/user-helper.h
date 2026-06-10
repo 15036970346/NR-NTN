@@ -46,6 +46,7 @@ public:
   
   void SetNrHelper (Ptr<NrHelper> nrHelper);
   void SetConsumerShare (double consumerShare);
+  /// qyh 增量: 在 portable 中 HTTP 业务占比 (剩下走 VoIP)
   void SetPortableHttpShare (double portableHttpShare);
 
   /**
@@ -91,7 +92,7 @@ private:
 
   uint16_t m_beamId;
   double m_consumerShare;
-  double m_portableHttpShare;
+  double m_portableHttpShare {0.5};   // qyh 增量
   std::vector<BeamInfo> m_beams;  //!< 多个波束信息
   MobilityHelper m_mobility;
   Ipv4AddressHelper m_ipv4;  //!< 保持兼容，保留私有成员
