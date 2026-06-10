@@ -1,5 +1,5 @@
 /*
- * 文件路径：contrib/0603geo-sat/model/admit-control.h
+ * 文件路径：contrib/geo-sat/model/admit-control.h
  * 功能：GEO卫星准入控制与波束协调模块
  * 实现：在切换发生时判断目标波束是否有足够资源接纳新用户
  *

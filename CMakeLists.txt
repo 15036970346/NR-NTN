@@ -3,8 +3,6 @@
 # 合并版本：geosat-qyh + geosat-xys
 
 # 1. 定义模块名称
-# (检查修复: 原交付为 "0603geo-sat" — 数字开头的模块名会让 ns-3 的 lib<name> 变量为空,
-#  导致 add_library ALIAS 报错、configure 失败。模块名不能以数字开头, 改回 geo-sat。)
 set(name geo-sat)
 
 # 2. 源文件列表 (.cc)

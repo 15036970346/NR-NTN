@@ -80,6 +80,40 @@ struct SatUeContext {
   double   clpcOffsetDb {0.0};       // 上行闭环功控累积修正项 f(i) (dB)
 };
 
+// 阶段1: SPS(半静态)调度模式。运行时三选一互斥(详见设计讨论)。
+//  - SPS_OFF       : 不启用 SPS(默认; 等价历史 m_spsEnabled=false)
+//  - SPS_LEGACY    : 旧"周期性固定带宽"实现(TryScheduleDlSps/UlSps), 仅作 A/B 对比
+//  - SPS_CONFIGURED: 新持久 grant 状态机(激活/复用/隐式释放, 频域钉死 RBG)
+enum class SpsMode {
+  SPS_OFF = 0,
+  SPS_LEGACY = 1,
+  SPS_CONFIGURED = 2
+};
+
+// 阶段1: 半静态授权(configured grant)。一条 grant 跨多个周期复用同一组 RBG。
+//  与"现 SPS 每周期重分/重发"的根本区别: 激活一次→存下来→周期复用, 不再逐周期重决策。
+struct SatSpsGrant {
+  std::vector<uint32_t> rbgBitmap;   // 激活时在 SPS 区锁定的 RBG 逻辑索引(持久, 复用按回原位)
+  uint8_t  mcs {0};
+  uint32_t tbSize {0};               // 当前 MCS/RBG 下每周期 TBS 字节
+  Time     period;                   // 该 grant 的 SPS 周期
+  Time     nextTime;                 // 下次到期复用时刻(含错峰相位)
+  uint8_t  emptyTxCounter {0};       // 连续到期无数据计数 -> 隐式释放
+  uint8_t  conflictCounter {0};      // 连续 RBG 冲突计数 -> 隐式释放
+  bool     active {false};
+  bool     isUplink {false};
+  uint32_t beamId {0};               // 激活时所在波束(复用只在同波束尝试)
+  // 功率域半静态 NOMA 绑定(阶段3 用, 先留字段不启用)
+  uint16_t nomaPartnerRnti {0};
+  double   nomaBeta {0.0};
+};
+
+// 阶段1: SPS 统计(注: DCI 真实节省口径要到阶段2 UE 侧 configured grant 后才成立)。
+struct SatSpsStats {
+  uint64_t dlActivations {0}, dlReuse {0}, dlReleaseEmpty {0}, dlReleaseConflict {0};
+  uint64_t ulActivations {0}, ulReuse {0}, ulReleaseEmpty {0}, ulReleaseConflict {0};
+};
+
 // 用于切换上下文转移的结构体 (并集: qyh 丰富字段 + 0603 多目标 ServiceObject)
 struct HandoverUeContext {
     uint16_t rnti;
@@ -351,9 +385,20 @@ private:
   // 由 RSRP 推算每-UE 上行路径损耗(dB), 并写回 ctx.pathLossDb
   double DerivePathLossFromRsrp (double rsrpDbm) const;
   // 静态(SPS)固定 RB
-  uint32_t GetSpsFixedRbs (const SatUeContext& ctx) const;
+  uint32_t GetSpsClassRbs (const SatUeContext& ctx) const;  // 不受 m_spsEnabled 门控的按类 RB(供 Legacy/Configured 共用)
+  uint32_t GetSpsFixedRbs (const SatUeContext& ctx) const;  // = m_spsEnabled ? GetSpsClassRbs : 0 (历史语义不变)
   bool TryScheduleDlSps (uint16_t rnti, uint32_t beamId, uint32_t& availableRbs);
   bool TryScheduleUlSps (uint16_t rnti, uint32_t beamId);
+  // ---- 阶段1: 半静态 configured-grant 状态机(DL) ----
+  SpsMode SpsModeEnum () const { return static_cast<SpsMode> (m_spsMode); } // uint -> 强类型枚举
+  uint8_t SpsLcidForUe (const SatUeContext& ctx) const;       // 该 UE 的 SPS 逻辑信道 id(阶段1 单流, 固定)
+  bool    IsSpsEligible (const SatUeContext& ctx) const;      // 是否走半静态(周期业务: 应急/语音/便携)
+  void    ScheduleDlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsServed);   // 复用到期 grant + 隐式释放
+  void    ActivateDlSpsGrants (uint32_t beamId, const std::vector<uint16_t>& order,
+                               std::set<uint16_t>& spsServed);                   // 给合格 UE 新建 grant
+  void    ServeDlSpsGrant (uint16_t rnti, SatSpsGrant& grant);                   // 实发一次(扣 buffer + DCI)
+  void    ReleaseDlSpsGrant (const std::pair<uint16_t,uint8_t>& key, bool dueToConflict);
+  Time    ComputeStaggeredNextTime (uint16_t rnti, Time now, Time period) const; // 错峰: 给每 UE 稳定相位偏移
   ServicePriority MapTrafficTypeToPriority (TrafficType trafficType);
   double CalculateWrrWeight (ServicePriority priority, UtType utType);
   double EstimateBytesPerRb (double cqi, bool isUplink) const;
@@ -478,6 +523,18 @@ private:
   uint32_t m_spsEmergencyRbs;
   uint32_t m_spsPortableFloorRbs;
   Time m_spsPeriod;
+  // ---------- 阶段1: 半静态 configured-grant 状态机 ----------
+  // 模式以 uint 存储(0=Off/1=Legacy/2=Configured), 经 SpsModeEnum() 取强类型枚举比较。
+  // (用 Uinteger 属性而非 Enum 属性, 规避 ns-3.40 EnumValue 对 enum class 成员的设值坑。)
+  uint32_t m_spsMode;                 // 运行时三选一(默认 0=SPS_OFF)
+  Time     m_spsGrantPeriod;          // configured grant 周期(默认 20ms VoIP)
+  uint8_t  m_spsImplicitReleaseAfter; // 连续无数据/冲突 N 次后隐式释放(默认 3)
+  uint32_t m_spsActivationMinBytes;   // 激活下限字节(默认 1)
+  bool     m_spsStaggerEnabled;       // 错峰开关(默认 true)
+  bool     m_spsHarqEnabled;          // SPS 是否挂 HARQ(GEO 周期小包默认 false: 关 HARQ 用保守 MCS)
+  std::map<std::pair<uint16_t,uint8_t>, SatSpsGrant> m_dlSpsGrants; // key=(rnti,lcid)
+  std::map<std::pair<uint16_t,uint8_t>, SatSpsGrant> m_ulSpsGrants; // (阶段1 UL 暂留, 下一小步填)
+  SatSpsStats m_spsStats;
   // 上行闭环功控(CLPC)配置
   bool m_clpcEnabled;
   double m_targetUlSinrDb;

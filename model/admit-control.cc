@@ -1,5 +1,5 @@
 /*
- * 文件路径：contrib/0603geo-sat/model/admit-control.cc
+ * 文件路径：contrib/geo-sat/model/admit-control.cc
  * 功能：GEO卫星准入控制与波束协调模块实现
  *
  * 合并说明：以 qyh 原版(功能完整: isUplink/utType/trafficType 感知的多因子准入)

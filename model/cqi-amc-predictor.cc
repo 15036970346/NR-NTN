@@ -1,5 +1,5 @@
 /*
- * 文件路径：contrib/0603geo-sat/model/cqi-amc-predictor.cc
+ * 文件路径：contrib/geo-sat/model/cqi-amc-predictor.cc
  * 功能：CqiAmcPredictor 实现 — 把 CqiAmcController 适配为 CqiPredictor。
  */
 #include "cqi-amc-predictor.h"

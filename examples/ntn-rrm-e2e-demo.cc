@@ -1,5 +1,5 @@
 /*
- * 文件: contrib/0603geo-sat/examples/ntn-rrm-e2e-demo.cc
+ * 文件: contrib/geo-sat/examples/ntn-rrm-e2e-demo.cc
  *
  * NTN 资源管理 — 生产级端到端演示 (RRM End-to-End Demo)
  * ====================================================================
