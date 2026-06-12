@@ -128,6 +128,12 @@ struct DciInfo {
     uint8_t harqProcessId {INVALID_HARQ_PROCESS_ID}; // DL HARQ 进程号
     uint8_t harqRv {0};      // 当前传输使用的冗余版本 RV
     bool isHarqRetransmission {false}; // 是否为 HARQ 重传
+    // ---- 阶段2: 半静态(SPS / configured-grant)语义 ----
+    // UE 侧据此区分: 激活/重配(本 DCI 配置 configured grant)、释放、或周期复用(无 DCI)。
+    //   isReuse 在 UE 侧推断为 spsPeriodMs>0 && !spsActivation && !spsRelease。
+    bool     spsActivation {false}; // 半静态激活/重配 DCI(UE 据此建立/更新 configured grant)
+    bool     spsRelease {false};    // 半静态释放 DCI(UE 据此清除 configured grant)
+    uint32_t spsPeriodMs {0};       // configured grant 周期(ms); >0 表示这是一条半静态授权
 };
 
 // 3. PUCCH信息结构体 (上行控制信息 - UCI)

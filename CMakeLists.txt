@@ -284,3 +284,38 @@ build_lib_example(
     SOURCE_FILES examples/ntn-rrm-e2e-demo.cc
     LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
 )
+
+# --- 阶段1 SPS 时间驱动专项冒烟 (激活/复用/隐式释放/重激活 跨多周期跑全 + 断言) ---
+build_lib_example(
+    NAME ntn-sps-smoke
+    SOURCE_FILES examples/ntn-sps-smoke.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段4 SPS overbooking 统计复用消融 (factor 扫 1.0/1.5/2.0, 接入路数 vs 冲突率) ---
+build_lib_example(
+    NAME ntn-sps-overbook
+    SOURCE_FILES examples/ntn-sps-overbook.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段3 半静态 NOMA (SPS near 上半持续叠加动态 far) A/B 验证 ---
+build_lib_example(
+    NAME ntn-sps-noma
+    SOURCE_FILES examples/ntn-sps-noma.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段2 真省 DCI (configured grant: 复用不发 DCI) 验证 ---
+build_lib_example(
+    NAME ntn-sps-dci
+    SOURCE_FILES examples/ntn-sps-dci.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段5 SPS 实验矩阵/消融 (三域指标汇总 + 写 CSV 供绘图) ---
+build_lib_example(
+    NAME ntn-sps-experiment
+    SOURCE_FILES examples/ntn-sps-experiment.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)

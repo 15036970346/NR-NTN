@@ -181,6 +181,27 @@ GeoBeamScheduler::GetTypeId (void)
                    BooleanValue (false),
                    MakeBooleanAccessor (&GeoBeamScheduler::m_spsHarqEnabled),
                    MakeBooleanChecker ())
+    .AddAttribute ("SpsNomaEnabled",
+                   "Phase-3 semi-static power-domain NOMA: overlay a far (weak) UE onto an SPS "
+                   "near grant's RBGs. Pairing is bound once and reused across periods (re-evaluated "
+                   "every NomaRepairPeriod). Default false. Uses NomaFarPowerFraction / NomaMinCqiGap.",
+                   BooleanValue (false),
+                   MakeBooleanAccessor (&GeoBeamScheduler::m_spsNomaEnabled),
+                   MakeBooleanChecker ())
+    .AddAttribute ("NomaRepairPeriod",
+                   "Phase-3: re-evaluate a semi-static NOMA pairing every this many reuses "
+                   "(re-pair if the far is gone or the CQI gap no longer holds).",
+                   UintegerValue (4),
+                   MakeUintegerAccessor (&GeoBeamScheduler::m_nomaRepairPeriod),
+                   MakeUintegerChecker<uint32_t> (1))
+    .AddAttribute ("SpsMcsReconfigThreshold",
+                   "Phase-2 (real DCI savings): on reuse, only re-send a DCI to reconfigure the "
+                   "configured grant when the freshly-filtered MCS drifts by >= this many steps "
+                   "from the grant's MCS. Below it the reuse is DCI-free (genuine airlink saving). "
+                   "0 = reconfigure every period (no saving).",
+                   UintegerValue (2),
+                   MakeUintegerAccessor (&GeoBeamScheduler::m_spsMcsReconfigThreshold),
+                   MakeUintegerChecker<uint8_t> (0, 28))
     .AddAttribute ("ClpcEnabled",
                    "Enable uplink closed-loop power control (TPC from measured SINR feedback). "
                    "When false, UL power control is pure open-loop.",
@@ -307,6 +328,9 @@ GeoBeamScheduler::GeoBeamScheduler ()
     m_spsActivationMinBytes (1),
     m_spsStaggerEnabled (true),
     m_spsHarqEnabled (false),
+    m_spsNomaEnabled (false),
+    m_nomaRepairPeriod (4),
+    m_spsMcsReconfigThreshold (2),
     m_clpcEnabled (true),
     m_targetUlSinrDb (3.0),
     m_clpcMinDb (-10.0),
@@ -1828,55 +1852,121 @@ GeoBeamScheduler::ComputeStaggeredNextTime (uint16_t rnti, Time now, Time period
   return now + period + NanoSeconds (phaseNs);
 }
 
-void
-GeoBeamScheduler::ServeDlSpsGrant (uint16_t rnti, SatSpsGrant& grant)
+uint16_t
+GeoBeamScheduler::ServeDlSpsGrant (uint16_t rnti, SatSpsGrant& grant, bool isActivation)
 {
-  // 半静态"实发一次": 照搬 grant(RBG 数 + 当前 MCS), 扣 buffer, 记有效 SINR, 发 DCI。
-  // 与动态 scheduleClassQueue 的区别: 不算度量、不重选 RB, 直接用持久 grant。
+  // 半静态"实发一次": 照搬 grant(RBG 数 + configured MCS), 扣 buffer, 记有效 SINR。
+  // 阶段2(真省 DCI): 仅 激活/MCS需重配 时下发 DCI; 否则 DCI-free 复用(UE 用 configured grant)。
+  // 阶段3: 若绑定 NOMA far 且其本周期有数据, 在 near 的 RBG 上叠加 far(功率域复用)。
   SatUeContext& ctx = m_ueContextMap[rnti];
   const uint32_t rbs = static_cast<uint32_t> (grant.rbgBitmap.size ());
-  const uint32_t allocatedBytes = std::min (ctx.dlBufferStatus, grant.tbSize);
+  const double nearCqiRaw = GetSchedulingCqi (ctx, false);
+
+  // ---- 判定本周期是否激活半静态 NOMA(绑定的 far 存在、同波束、本周期有数据) ----
+  uint16_t farServed = 0;
+  bool nomaActive = false;
+  double nearEffSinrDb = SinrDbFromCqi (nearCqiRaw);
+  double nearEffCqiForMcs = nearCqiRaw;                 // 选 MCS 用的(NOMA 后)有效 CQI
+  double nearTxPowerDbm = 0.0;
+  double farEffCqi = 0.0, farEffSinrDb = 0.0, farTxPowerDbm = 0.0;
+  if (m_spsNomaEnabled && grant.nomaPartnerRnti != 0)
+    {
+      auto fit = m_ueContextMap.find (grant.nomaPartnerRnti);
+      if (fit != m_ueContextMap.end () &&
+          fit->second.currentBeamId == grant.beamId &&
+          fit->second.dlBufferStatus > 0)
+        {
+          const double farCqiRaw = GetSchedulingCqi (fit->second, false);
+          const auto eff = ComputeNomaEffectiveSinrDb (nearCqiRaw, farCqiRaw); // 1:1, β=m_nomaFarPowerFraction
+          nearEffSinrDb = eff.first;                       // near 逐层 SIC 后只承受 (1-β) 衰减
+          nearEffCqiForMcs = CqiFromSinrDb (eff.first);    // 按 NOMA 后有效 CQI 选 MCS, 防 BLER
+          nearTxPowerDbm = NomaNearTxPowerDbm ();           // near 拿 (1-β) 功率份额
+          farEffCqi = CqiFromSinrDb (eff.second);
+          farEffSinrDb = eff.second;
+          farTxPowerDbm = NomaFarTxPowerDbm ();             // far 拿 β 功率份额
+          nomaActive = true;
+        }
+    }
+
+  // ---- 阶段2: configured-grant MCS 稳定 + DCI 重配判定 ----
+  // 复用时只有当滤波后想用的 MCS 相对 grant 已配 MCS 漂移 >= 阈值, 才重发 DCI 重配;
+  // 否则沿用 configured MCS 且不发 DCI(真实空口节省)。传输始终用 grant.mcs(UE 已知)。
+  const uint8_t candidateMcs = GetMcsFromCqi (nearEffCqiForMcs, false);
+  const bool reconfig = isActivation || (m_spsMcsReconfigThreshold == 0) ||
+                        (std::abs (static_cast<int> (candidateMcs) - static_cast<int> (grant.mcs))
+                           >= static_cast<int> (m_spsMcsReconfigThreshold));
+  if (reconfig)
+    {
+      grant.mcs = candidateMcs;
+      grant.tbSize = static_cast<uint32_t> (m_dlAmc->GetPayloadSize (grant.mcs, std::max (1u, rbs)));
+    }
+  const uint32_t tb = std::max (1u, grant.tbSize);
+
+  const uint32_t allocatedBytes = std::min (ctx.dlBufferStatus, tb);
   ctx.dlBufferStatus = (ctx.dlBufferStatus > allocatedBytes) ? (ctx.dlBufferStatus - allocatedBytes) : 0;
   ctx.dlAverageThroughput = 0.9 * ctx.dlAverageThroughput + 0.1 * allocatedBytes;
   ctx.lastDlScheduledTime = Simulator::Now ();
   ctx.lastDlSpsTime = Simulator::Now ();
+  m_spsStats.dlSpsServedBytes += allocatedBytes; // 阶段5: 吞吐量统计
 
-  // 有效 SINR: 阶段1 SPS 为非 NOMA 普通发送, 等效自身 CQI(阶段3 接半静态 NOMA 再改)。
-  const double effSinrDb = SinrDbFromCqi (GetSchedulingCqi (ctx, false));
-  RecordEffectiveDlSinrDb (rnti, effSinrDb);
-  m_lastDlEffSinrDb[rnti] = effSinrDb;
+  RecordEffectiveDlSinrDb (rnti, nearEffSinrDb);
+  m_lastDlEffSinrDb[rnti] = nearEffSinrDb;
+  m_lastDlTxPowerDbm[rnti] = nearTxPowerDbm; // 数据面单一真源(无论是否发 DCI 都更新)
 
-  DciInfo dci;
-  dci.isUplinkGrant = false;
-  dci.rbAllocation = rbs;
-  dci.mcs = grant.mcs;
-  dci.txPowerDbm = 0.0;
-  dci.delayToStart = m_defaultK2Delay;
-  dci.duration = MilliSeconds (1);
-  m_lastDlTxPowerDbm[rnti] = dci.txPowerDbm;
-
-  // GEO 周期小包默认不挂 HARQ(8 进程无法覆盖 20ms 周期 × ~600ms RTT); 开启时按新传登记。
-  if (m_spsHarqEnabled && m_harqManager != nullptr &&
-      m_harqManager->GetAvailableProcessCount (rnti) > 0)
+  if (reconfig)
     {
-      const uint32_t packetBytes = std::max (1u, allocatedBytes);
-      Ptr<Packet> harqPacket = Create<Packet> (packetBytes);
-      const uint8_t pid = m_harqManager->NewTransmission (rnti, harqPacket, grant.mcs);
-      if (pid != HarqManager::INVALID_PROCESS_ID)
+      // 下发(重新)配置 DCI: UE 据此建立/更新 configured grant。
+      DciInfo dci;
+      dci.isUplinkGrant = false;
+      dci.rbAllocation = rbs;
+      dci.mcs = grant.mcs;
+      dci.txPowerDbm = nearTxPowerDbm;
+      dci.delayToStart = m_defaultK2Delay;
+      dci.duration = MilliSeconds (1);
+      dci.spsActivation = true; // 激活或重配都置位(UE 侧据此(重)配 configured grant)
+      dci.spsPeriodMs = static_cast<uint32_t> (grant.period.GetMilliSeconds ());
+      // GEO 周期小包默认不挂 HARQ; 开启时仅在发 DCI 的周期登记(DCI-free 复用不挂 HARQ)。
+      if (m_spsHarqEnabled && m_harqManager != nullptr &&
+          m_harqManager->GetAvailableProcessCount (rnti) > 0)
         {
-          dci.harqProcessId = pid;
-          dci.harqRv = 0;
-          dci.isHarqRetransmission = false;
-          m_dlHarqProcessMap[{rnti, pid}] =
-            PendingDlHarqTransmission{dci, harqPacket, packetBytes};
-          m_dlHarqEverRetx.erase ({rnti, pid});
+          const uint32_t packetBytes = std::max (1u, allocatedBytes);
+          Ptr<Packet> harqPacket = Create<Packet> (packetBytes);
+          const uint8_t pid = m_harqManager->NewTransmission (rnti, harqPacket, grant.mcs);
+          if (pid != HarqManager::INVALID_PROCESS_ID)
+            {
+              dci.harqProcessId = pid;
+              dci.harqRv = 0;
+              dci.isHarqRetransmission = false;
+              m_dlHarqProcessMap[{rnti, pid}] =
+                PendingDlHarqTransmission{dci, harqPacket, packetBytes};
+              m_dlHarqEverRetx.erase ({rnti, pid});
+            }
         }
+      SendDciToUe (rnti, dci);
+      m_spsStats.dlSpsDciSent++;
+      NS_LOG_INFO ("[SPS-CFG-DL] Beam " << grant.beamId << " | UE " << rnti
+                   << " | " << (isActivation ? "ACTIVATE" : "RECONFIG")
+                   << " | RBG=" << rbs << " | MCS=" << (uint32_t) grant.mcs
+                   << " | Bytes=" << allocatedBytes << (nomaActive ? " | +NOMA far" : ""));
+    }
+  else
+    {
+      // DCI-free 复用: 不下发任何 DCI, UE 用 configured grant 周期收(数据仍交付=扣 buffer)。
+      m_spsStats.dlSpsReuseNoDci++;
+      NS_LOG_INFO ("[SPS-CFG-DL] Beam " << grant.beamId << " | UE " << rnti
+                   << " | REUSE(no DCI) | RBG=" << rbs << " | MCS=" << (uint32_t) grant.mcs
+                   << " | Bytes=" << allocatedBytes << (nomaActive ? " | +NOMA far" : ""));
     }
 
-  NS_LOG_INFO ("[SPS-CFG-DL] Beam " << grant.beamId << " | UE " << rnti
-               << " | RBG=" << rbs << " | MCS=" << (uint32_t) grant.mcs
-               << " | Bytes=" << allocatedBytes);
-  SendDciToUe (rnti, dci);
+  // ---- 在 near 的同一片 RBG 上叠加 far(功率域复用); 记 NOMA-SPS 配对发射 ----
+  if (nomaActive)
+    {
+      EmitNomaFarGrant (grant.nomaPartnerRnti, rbs, farEffCqi, farEffSinrDb,
+                        grant.beamId, farTxPowerDbm);
+      m_spsStats.nomaSpsPairs++;
+      farServed = grant.nomaPartnerRnti;
+    }
+  return farServed;
 }
 
 void
@@ -1900,9 +1990,12 @@ GeoBeamScheduler::ScheduleDlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsSe
           releaseEmpty.push_back (kv.first); // UE 不在了 -> 释放
           continue;
         }
+      // 关键: 持有 configured grant 的 UE 永远不走动态调度(即使本周期未到期),
+      // 否则未到期轮次会被动态二次授权, 破坏 SPS 语义。
+      spsServed.insert (rnti);
       if (now < grant.nextTime)
         {
-          continue; // 未到期
+          continue; // 未到期(已排除出动态, 不在此周期发送)
         }
       grant.nextTime += grant.period; // 消费这个 due(无论成败, 不在同周期反复重试)
 
@@ -1917,9 +2010,11 @@ GeoBeamScheduler::ScheduleDlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsSe
         }
       grant.emptyTxCounter = 0;
 
-      // 频域半静态: 把同一组 RBG 索引按回原位; 冲突(越界/被占/超预算)则累计冲突计数。
-      if (!m_resourceManager->ReserveSpsRbgs (beamId, grant.rbgBitmap, false))
+      // 频域: 本周期 first-fit 认领 rbgSize 个物理 RBG; 认领不到(本轮物理区满)= 冲突事件。
+      std::vector<uint32_t> claimed = m_resourceManager->ClaimSpsRbgs (beamId, grant.rbgSize, false);
+      if (claimed.empty ())
         {
+          m_spsStats.dlConflictEvents++;
           if (++grant.conflictCounter >= m_spsImplicitReleaseAfter)
             {
               releaseConflict.push_back (kv.first);
@@ -1927,15 +2022,22 @@ GeoBeamScheduler::ScheduleDlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsSe
           continue;
         }
       grant.conflictCounter = 0;
+      grant.rbgBitmap = claimed; // 更新本周期认领到的物理 RBG
 
-      // 周期性刷新 MCS/TBS(用滤波 CQI), 防止 grant 锁定 MCS 随 ~600ms 环漂移而陈旧。
-      const double cqi = GetSchedulingCqi (ctx, false);
-      grant.mcs = GetMcsFromCqi (cqi, false);
-      grant.tbSize = EstimateTbsBytes (cqi, static_cast<uint32_t> (grant.rbgBitmap.size ()), false);
-
-      ServeDlSpsGrant (rnti, grant);
+      // MCS/TBS 的"按需重配 + DCI 节省"由 ServeDlSpsGrant 统一决策(滤波 CQI 漂移超阈才重配并发 DCI)。
+      const uint16_t farServed = ServeDlSpsGrant (rnti, grant, /*isActivation=*/false);
+      if (farServed != 0)
+        {
+          spsServed.insert (farServed); // far 经 NOMA 叠加服务, 排除出动态/动态NOMA
+        }
       spsServed.insert (rnti);
       m_spsStats.dlReuse++;
+      // 阶段3: 每 NomaRepairPeriod 次复用重评估一次半静态配对(far 失效/CQI差不达标则重配)。
+      if (m_spsNomaEnabled && ++grant.reuseSinceRepair >= m_nomaRepairPeriod)
+        {
+          grant.reuseSinceRepair = 0;
+          MaybeRepairSpsNomaPair (grant, rnti, spsServed);
+        }
     }
 
   for (const auto& k : releaseEmpty)
@@ -1980,29 +2082,50 @@ GeoBeamScheduler::ActivateDlSpsGrants (uint32_t beamId, const std::vector<uint16
           continue;
         }
 
-      // grant 尺寸: 按类 cap 与 buffer 反推取小; RBG 来自 SPS 区。
+      // grant 尺寸: 按类 cap 与 buffer 反推取小。
       const double cqi = GetSchedulingCqi (ctx, false);
       const uint32_t cap = std::max (1u, GetSpsClassRbs (ctx));
       const uint32_t needRbs = std::max (1u, RbsForBytes (cqi, ctx.dlBufferStatus, cap, false));
       const uint32_t grantRbs = std::min (needRbs, cap);
-      std::vector<uint32_t> rbgs = m_resourceManager->AllocateSpsRbgs (beamId, grantRbs, false);
-      if (rbgs.empty ())
+      // 逻辑准入(可超订): 账面 = floor(region × factor) 满则拒绝。
+      if (!m_resourceManager->AdmitSpsGrant (beamId, grantRbs, false))
         {
-          continue; // SPS 区已满 / 未启用(DlSpsRegionRbs=0)
+          m_spsStats.dlAdmitRejects++;
+          continue;
+        }
+      // 首周期物理认领; 若本轮物理区已满则撤销准入, 下轮再试。
+      std::vector<uint32_t> claimed = m_resourceManager->ClaimSpsRbgs (beamId, grantRbs, false);
+      if (claimed.empty ())
+        {
+          m_resourceManager->ReleaseSpsAdmission (beamId, grantRbs, false);
+          m_spsStats.dlConflictEvents++;
+          continue;
         }
 
       SatSpsGrant grant;
       grant.active = true;
       grant.isUplink = false;
       grant.beamId = beamId;
-      grant.rbgBitmap = rbgs;
+      grant.rbgSize = grantRbs;
+      grant.rbgBitmap = claimed;
       grant.mcs = GetMcsFromCqi (cqi, false);
-      grant.tbSize = EstimateTbsBytes (cqi, static_cast<uint32_t> (rbgs.size ()), false);
+      grant.tbSize = EstimateTbsBytes (cqi, grantRbs, false);
       grant.period = m_spsGrantPeriod;
       grant.nextTime = m_spsStaggerEnabled ? ComputeStaggeredNextTime (rnti, now, grant.period)
                                            : (now + grant.period);
 
-      ServeDlSpsGrant (rnti, grant); // 首传立即发
+      // 阶段3: 激活时半静态绑定一个 far(纯动态、CQI 差距达标、本周期有数据);
+      //        一次配对写入 grant, 跨周期复用(区别于动态 NOMA 的逐轮重配)。
+      if (m_spsNomaEnabled)
+        {
+          grant.nomaPartnerRnti = FindSpsNomaFar (beamId, cqi, spsServed);
+          grant.nomaBeta = m_nomaFarPowerFraction;
+        }
+      const uint16_t farServed = ServeDlSpsGrant (rnti, grant, /*isActivation=*/true); // 首传发激活 DCI(含 far 叠加)
+      if (farServed != 0)
+        {
+          spsServed.insert (farServed);
+        }
       m_dlSpsGrants[key] = grant;
       spsServed.insert (rnti);
       m_spsStats.dlActivations++;
@@ -2017,8 +2140,20 @@ GeoBeamScheduler::ReleaseDlSpsGrant (const std::pair<uint16_t, uint8_t>& key, bo
     {
       return;
     }
-  // 清掉本轮可能的 RBG 占用(若未占用则为安全 no-op), 释放回退计数由 RM 处理。
-  m_resourceManager->FreeSpsRbgs (it->second.beamId, it->second.rbgBitmap, false);
+  // 回退逻辑准入账(让出账面额度, 供其它 UE 接入)。本轮物理认领随 ResetBeamAllocation 自清。
+  m_resourceManager->ReleaseSpsAdmission (it->second.beamId, it->second.rbgSize, false);
+  // 阶段2: 下发释放 DCI(UE 据此清除 configured grant)。
+  {
+    DciInfo rel;
+    rel.isUplinkGrant = false;
+    rel.rbAllocation = 0;
+    rel.mcs = 0;
+    rel.delayToStart = m_defaultK2Delay;
+    rel.duration = MilliSeconds (1);
+    rel.spsRelease = true;
+    SendDciToUe (key.first, rel);
+    m_spsStats.dlSpsDciSent++;
+  }
   if (dueToConflict)
     {
       m_spsStats.dlReleaseConflict++;
@@ -2031,6 +2166,314 @@ GeoBeamScheduler::ReleaseDlSpsGrant (const std::pair<uint16_t, uint8_t>& key, bo
                << " lcid=" << (uint32_t) key.second
                << " reason=" << (dueToConflict ? "conflict" : "empty/gone"));
   m_dlSpsGrants.erase (it);
+}
+
+uint16_t
+GeoBeamScheduler::FindSpsNomaFar (uint32_t beamId, double nearCqi,
+                                  const std::set<uint16_t>& exclude) const
+{
+  // 已被其它 SPS grant 绑定的 far(避免一个 far 被多个 near 叠加)。
+  std::set<uint16_t> alreadyBound;
+  for (const auto& kv : m_dlSpsGrants)
+    {
+      if (kv.second.nomaPartnerRnti != 0)
+        {
+          alreadyBound.insert (kv.second.nomaPartnerRnti);
+        }
+    }
+  auto bit = m_beamToUesMap.find (beamId);
+  if (bit == m_beamToUesMap.end ())
+    {
+      return 0;
+    }
+  // 在同波束里挑信道最差(CQI 差距最大)、满足门槛、有数据的纯动态 UE 作 far。
+  uint16_t best = 0;
+  double bestCqi = std::numeric_limits<double>::max ();
+  for (uint16_t rnti : bit->second)
+    {
+      if (exclude.count (rnti) > 0 || alreadyBound.count (rnti) > 0)
+        {
+          continue;
+        }
+      auto cit = m_ueContextMap.find (rnti);
+      if (cit == m_ueContextMap.end ())
+        {
+          continue;
+        }
+      const SatUeContext& c = cit->second;
+      if (c.currentBeamId != beamId || IsSpsEligible (c) || c.dlBufferStatus == 0)
+        {
+          continue; // far 取纯动态(非SPS)UE 且本周期有数据(阶段3 范围: 1 SPS near + 1 动态 far)
+        }
+      const double farCqi = GetSchedulingCqi (c, false);
+      if ((nearCqi - farCqi) < m_nomaMinCqiGap)
+        {
+          continue; // CQI 差距门槛不达标
+        }
+      if (farCqi < bestCqi)
+        {
+          bestCqi = farCqi;
+          best = rnti;
+        }
+    }
+  return best;
+}
+
+void
+GeoBeamScheduler::MaybeRepairSpsNomaPair (SatSpsGrant& grant, uint16_t nearRnti,
+                                          const std::set<uint16_t>& exclude)
+{
+  auto nearIt = m_ueContextMap.find (nearRnti);
+  if (nearIt == m_ueContextMap.end ())
+    {
+      return;
+    }
+  const double nearCqi = GetSchedulingCqi (nearIt->second, false);
+
+  // 现配对是否仍然有效: far 存在、同波束、CQI 差距仍达标。
+  bool stillValid = false;
+  if (grant.nomaPartnerRnti != 0)
+    {
+      auto fit = m_ueContextMap.find (grant.nomaPartnerRnti);
+      if (fit != m_ueContextMap.end () && fit->second.currentBeamId == grant.beamId)
+        {
+          const double farCqi = GetSchedulingCqi (fit->second, false);
+          stillValid = (nearCqi - farCqi) >= m_nomaMinCqiGap;
+        }
+    }
+  if (!stillValid)
+    {
+      // 半静态 ≠ 永久: 失效则重新配对(找不到合适 far 则解绑)。
+      const uint16_t newFar = FindSpsNomaFar (grant.beamId, nearCqi, exclude);
+      if (newFar != grant.nomaPartnerRnti)
+        {
+          NS_LOG_INFO ("[SPS-NOMA] 重评估配对 near=" << nearRnti
+                       << " old far=" << grant.nomaPartnerRnti
+                       << " -> new far=" << newFar);
+        }
+      grant.nomaPartnerRnti = newFar;
+    }
+}
+
+// =================================================================
+// 阶段1: 半静态 configured-grant 状态机 (UL, 与 DL 对称)
+// =================================================================
+void
+GeoBeamScheduler::ServeUlSpsGrant (uint16_t rnti, SatSpsGrant& grant, bool isActivation)
+{
+  // UL 半静态"实发一次": grant 的 RBG 已在 RM 预留, 经 ProcessUlGrant(preReserved=true)
+  // 完成功控(AdjustUtTxPower+CLPC)/UL CQI ledger/SINR 反馈记账。
+  // 阶段2(真省 DCI): 仅 激活/MCS需重配 时下发 UL grant DCI; 否则 DCI-free 复用(UE 用 UL configured grant)。
+  auto ctxIt = m_ueContextMap.find (rnti);
+  if (ctxIt == m_ueContextMap.end ())
+    {
+      return;
+    }
+  SatUeContext& ctx = ctxIt->second;
+  const uint32_t rbs = static_cast<uint32_t> (grant.rbgBitmap.size ());
+  // configured-grant MCS 稳定 + 按需重配: 滤波 UL CQI 想用的 MCS 漂移超阈才重配并发 DCI。
+  const uint8_t candidateMcs = GetMcsFromCqi (GetSchedulingCqi (ctx, true), true);
+  const bool reconfig = isActivation || (m_spsMcsReconfigThreshold == 0) ||
+                        (std::abs (static_cast<int> (candidateMcs) - static_cast<int> (grant.mcs))
+                           >= static_cast<int> (m_spsMcsReconfigThreshold));
+  if (reconfig)
+    {
+      grant.mcs = candidateMcs;
+      grant.tbSize = static_cast<uint32_t> (m_ulAmc->GetPayloadSize (grant.mcs, std::max (1u, rbs)));
+    }
+  ProcessUlGrant (rnti, rbs, grant.mcs, /*preReserved=*/true, /*sendDci=*/reconfig);
+  if (reconfig)
+    {
+      m_spsStats.ulSpsDciSent++;
+    }
+  else
+    {
+      m_spsStats.ulSpsReuseNoDci++;
+    }
+  NS_LOG_INFO ("[SPS-CFG-UL] Beam " << grant.beamId << " | UE " << rnti
+               << " | " << (reconfig ? (isActivation ? "ACTIVATE" : "RECONFIG") : "REUSE(no DCI)")
+               << " | RBG=" << rbs << " | MCS=" << (uint32_t) grant.mcs);
+}
+
+void
+GeoBeamScheduler::ScheduleUlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsServed)
+{
+  const Time now = Simulator::Now ();
+  std::vector<std::pair<uint16_t, uint8_t>> releaseEmpty;
+  std::vector<std::pair<uint16_t, uint8_t>> releaseConflict;
+
+  for (auto& kv : m_ulSpsGrants)
+    {
+      const uint16_t rnti = kv.first.first;
+      SatSpsGrant& grant = kv.second;
+      if (!grant.active || grant.beamId != beamId)
+        {
+          continue;
+        }
+      auto ctxIt = m_ueContextMap.find (rnti);
+      if (ctxIt == m_ueContextMap.end ())
+        {
+          releaseEmpty.push_back (kv.first);
+          continue;
+        }
+      // 关键: 持有 configured grant 的 UE 永远不走动态 UL 调度(即使本周期未到期)。
+      spsServed.insert (rnti);
+      if (now < grant.nextTime)
+        {
+          continue; // 未到期(已排除出动态)
+        }
+      grant.nextTime += grant.period; // 消费 due
+
+      SatUeContext& ctx = ctxIt->second;
+      const bool hasUlData = (GetEffectiveUlDemandBytes (ctx) > 0) || ctx.srPending;
+      if (!hasUlData)
+        {
+          if (++grant.emptyTxCounter >= m_spsImplicitReleaseAfter)
+            {
+              releaseEmpty.push_back (kv.first);
+            }
+          continue;
+        }
+      grant.emptyTxCounter = 0;
+
+      std::vector<uint32_t> claimed = m_resourceManager->ClaimSpsRbgs (beamId, grant.rbgSize, true);
+      if (claimed.empty ())
+        {
+          m_spsStats.ulConflictEvents++;
+          if (++grant.conflictCounter >= m_spsImplicitReleaseAfter)
+            {
+              releaseConflict.push_back (kv.first);
+            }
+          continue;
+        }
+      grant.conflictCounter = 0;
+      grant.rbgBitmap = claimed;
+
+      ServeUlSpsGrant (rnti, grant, /*isActivation=*/false);
+      spsServed.insert (rnti);
+      m_spsStats.ulReuse++;
+    }
+
+  for (const auto& k : releaseEmpty)
+    {
+      ReleaseUlSpsGrant (k, false);
+    }
+  for (const auto& k : releaseConflict)
+    {
+      ReleaseUlSpsGrant (k, true);
+    }
+}
+
+void
+GeoBeamScheduler::ActivateUlSpsGrants (uint32_t beamId, const std::vector<uint16_t>& order,
+                                       std::set<uint16_t>& spsServed)
+{
+  const Time now = Simulator::Now ();
+  for (uint16_t rnti : order)
+    {
+      if (spsServed.count (rnti) > 0)
+        {
+          continue;
+        }
+      auto ctxIt = m_ueContextMap.find (rnti);
+      if (ctxIt == m_ueContextMap.end ())
+        {
+          continue;
+        }
+      SatUeContext& ctx = ctxIt->second;
+      if (ctx.currentBeamId != beamId || !IsSpsEligible (ctx))
+        {
+          continue;
+        }
+      const std::pair<uint16_t, uint8_t> key{rnti, SpsLcidForUe (ctx)};
+      auto git = m_ulSpsGrants.find (key);
+      if (git != m_ulSpsGrants.end () && git->second.active)
+        {
+          continue; // 已有活跃 grant(尚未到期), 由 reuse 处理
+        }
+      const uint32_t demand = GetEffectiveUlDemandBytes (ctx);
+      if (demand < m_spsActivationMinBytes)
+        {
+          continue;
+        }
+
+      const double cqi = GetSchedulingCqi (ctx, true);
+      const uint32_t cap = std::max (1u, GetSpsClassRbs (ctx));
+      const uint32_t powerLimitedMaxRbs =
+        m_resourceManager->GetMaxPowerLimitedUlRbs (ctx.utType, ctx.pathLossDb);
+      if (powerLimitedMaxRbs == 0)
+        {
+          continue; // 功率受限连 1 RB 都发不出
+        }
+      const uint32_t needRbs = std::max (1u, RbsForBytes (cqi, demand, cap, true));
+      const uint32_t grantRbs = std::min ({needRbs, cap, powerLimitedMaxRbs});
+      // 逻辑准入(可超订)。
+      if (!m_resourceManager->AdmitSpsGrant (beamId, grantRbs, true))
+        {
+          m_spsStats.ulAdmitRejects++;
+          continue;
+        }
+      // 首周期物理认领; 本轮物理区满则撤销准入下轮再试。
+      std::vector<uint32_t> claimed = m_resourceManager->ClaimSpsRbgs (beamId, grantRbs, true);
+      if (claimed.empty ())
+        {
+          m_resourceManager->ReleaseSpsAdmission (beamId, grantRbs, true);
+          m_spsStats.ulConflictEvents++;
+          continue;
+        }
+
+      SatSpsGrant grant;
+      grant.active = true;
+      grant.isUplink = true;
+      grant.beamId = beamId;
+      grant.rbgSize = grantRbs;
+      grant.rbgBitmap = claimed;
+      grant.mcs = GetMcsFromCqi (cqi, true);
+      grant.tbSize = EstimateTbsBytes (cqi, grantRbs, true);
+      grant.period = m_spsGrantPeriod;
+      grant.nextTime = m_spsStaggerEnabled ? ComputeStaggeredNextTime (rnti, now, grant.period)
+                                           : (now + grant.period);
+
+      ServeUlSpsGrant (rnti, grant, /*isActivation=*/true); // 首次授权发激活 DCI
+      m_ulSpsGrants[key] = grant;
+      spsServed.insert (rnti);
+      m_spsStats.ulActivations++;
+    }
+}
+
+void
+GeoBeamScheduler::ReleaseUlSpsGrant (const std::pair<uint16_t, uint8_t>& key, bool dueToConflict)
+{
+  auto it = m_ulSpsGrants.find (key);
+  if (it == m_ulSpsGrants.end ())
+    {
+      return;
+    }
+  m_resourceManager->ReleaseSpsAdmission (it->second.beamId, it->second.rbgSize, true);
+  // 阶段2: 下发 UL 释放 DCI(UE 据此清除 UL configured grant)。
+  {
+    DciInfo rel;
+    rel.isUplinkGrant = true;
+    rel.rbAllocation = 0;
+    rel.mcs = 0;
+    rel.delayToStart = m_defaultK2Delay;
+    rel.duration = MilliSeconds (1);
+    rel.spsRelease = true;
+    SendDciToUe (key.first, rel);
+    m_spsStats.ulSpsDciSent++;
+  }
+  if (dueToConflict)
+    {
+      m_spsStats.ulReleaseConflict++;
+    }
+  else
+    {
+      m_spsStats.ulReleaseEmpty++;
+    }
+  NS_LOG_INFO ("[SPS-CFG-UL] Release grant rnti=" << key.first
+               << " lcid=" << (uint32_t) key.second
+               << " reason=" << (dueToConflict ? "conflict" : "empty/gone"));
+  m_ulSpsGrants.erase (it);
 }
 
 //估算每个 RB 可承载字节数 (走 NrAmc, 单RB口径; 仅用于 IPF 速率度量)
@@ -3391,9 +3834,9 @@ uint16_t GeoBeamScheduler::AllocateTcRnti ()
 }
 
 //上行授权核心函数 UL grant 必须同时满足 beam RB 剩余约束和 UE 功率约束
-uint32_t GeoBeamScheduler::ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs)
+uint32_t GeoBeamScheduler::ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs, bool preReserved, bool sendDci)
 {
-  NS_LOG_FUNCTION (this << rnti << rbAllocation << (uint32_t)mcs);
+  NS_LOG_FUNCTION (this << rnti << rbAllocation << (uint32_t)mcs << preReserved);
 
   if (m_ueContextMap.find (rnti) == m_ueContextMap.end ()) {
       NS_LOG_WARN ("[UL Grant] UE " << rnti << " 上下文不存在!");
@@ -3403,23 +3846,32 @@ uint32_t GeoBeamScheduler::ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation,
   SatUeContext& ctx = m_ueContextMap[rnti];
   const uint32_t beamId = ctx.currentBeamId;
   BeginUlSchedulingPeriod (beamId);
-  const uint32_t powerLimitedMaxRbs =
-    m_resourceManager->GetMaxPowerLimitedUlRbs (ctx.utType, ctx.pathLossDb);
-  const uint32_t requestedAfterPowerLimit = std::min (rbAllocation, powerLimitedMaxRbs);
-  if (requestedAfterPowerLimit == 0)
-    {
-      NS_LOG_WARN ("[UL Grant] UE " << rnti
-                   << " 因终端功率上限受限，无法在非削顶条件下分配任何 UL RB");
-      return 0;
-    }
   const uint32_t remainingBeforeGrant = m_resourceManager->GetRemainingRbs (beamId, true);
-  const uint32_t approvedRb =
-    m_resourceManager->AllocateSpectrum (beamId, requestedAfterPowerLimit, true);
-
-  if (approvedRb == 0)
+  uint32_t requestedAfterPowerLimit = rbAllocation;
+  uint32_t approvedRb;
+  if (preReserved)
     {
-      NS_LOG_WARN ("[UL Grant] Beam " << beamId << " 无可用上行RB，授权被拒绝!");
-      return 0;
+      // SPS: 这些 RB 已由 AllocateSpsRbgs/ReserveSpsRbgs 在 RM 预留并计入 ulUsedRbs,
+      // 不再走功率受限裁剪与 AllocateSpectrum(否则双重占用)。功率值仍按本数计算。
+      approvedRb = rbAllocation;
+    }
+  else
+    {
+      const uint32_t powerLimitedMaxRbs =
+        m_resourceManager->GetMaxPowerLimitedUlRbs (ctx.utType, ctx.pathLossDb);
+      requestedAfterPowerLimit = std::min (rbAllocation, powerLimitedMaxRbs);
+      if (requestedAfterPowerLimit == 0)
+        {
+          NS_LOG_WARN ("[UL Grant] UE " << rnti
+                       << " 因终端功率上限受限，无法在非削顶条件下分配任何 UL RB");
+          return 0;
+        }
+      approvedRb = m_resourceManager->AllocateSpectrum (beamId, requestedAfterPowerLimit, true);
+      if (approvedRb == 0)
+        {
+          NS_LOG_WARN ("[UL Grant] Beam " << beamId << " 无可用上行RB，授权被拒绝!");
+          return 0;
+        }
     }
 
   // 构建上行授权DCI
@@ -3465,7 +3917,11 @@ uint32_t GeoBeamScheduler::ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation,
                << " | 当前UL Buffer=" << ctx.ulBufferStatus << " bytes"
                << " | PendingGrantBytes=" << ctx.pendingUlGrantBytes);
 
-  SendDciToUe (rnti, dci);
+  // 阶段2: UL configured-grant 的 DCI-free 复用——完成上面所有记账, 但不下发 UL DCI。
+  if (sendDci)
+    {
+      SendDciToUe (rnti, dci);
+    }
   return approvedRb;
 }
 
@@ -3486,9 +3942,16 @@ void GeoBeamScheduler::RunUlSchedulerForBeam (uint32_t beamId)
       return;
     }
 
-  // 步骤 0 : 上行静态(SPS)预分配
+  // 步骤 0 : 上行半静态/静态 预分配 (SpsMode 三选一; 默认 OFF 与基线一致)
   std::set<uint16_t> spsServed;
-  if (m_spsEnabled)
+  const bool legacyUlSps = (SpsModeEnum () == SpsMode::SPS_LEGACY) ||
+                           (SpsModeEnum () == SpsMode::SPS_OFF && m_spsEnabled);
+  if (SpsModeEnum () == SpsMode::SPS_CONFIGURED)
+    {
+      ScheduleUlSpsReuse (beamId, spsServed);
+      ActivateUlSpsGrants (beamId, beamIt->second, spsServed);
+    }
+  else if (legacyUlSps)
     {
       for (uint16_t rnti : beamIt->second)
         {
@@ -3503,6 +3966,7 @@ void GeoBeamScheduler::RunUlSchedulerForBeam (uint32_t beamId)
         }
     }
 
+  // SPS(任一模式)可能已占用部分 UL RB; 动态侧从 RM 重新读取剩余预算(口径一致)。
   uint32_t availableRbs = m_resourceManager->GetRemainingRbs (beamId, true);
   if (availableRbs == 0)
     {

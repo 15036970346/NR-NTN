@@ -43,6 +43,18 @@ TypeId ResourceManager::GetTypeId (void)
                    UintegerValue (0),
                    MakeUintegerAccessor (&ResourceManager::m_ulSpsRegionRbs),
                    MakeUintegerChecker<uint32_t> (0, 275))
+    .AddAttribute ("DlSpsOverbookFactor",
+                   "Phase-4 statistical multiplexing: DL SPS logical admission capacity = "
+                   "floor(DlSpsRegionRbs * factor). 1.0 = no overbooking (default).",
+                   DoubleValue (1.0),
+                   MakeDoubleAccessor (&ResourceManager::m_dlSpsOverbookFactor),
+                   MakeDoubleChecker<double> (1.0, 8.0))
+    .AddAttribute ("UlSpsOverbookFactor",
+                   "Phase-4 statistical multiplexing: UL SPS logical admission capacity = "
+                   "floor(UlSpsRegionRbs * factor). 1.0 = no overbooking (default).",
+                   DoubleValue (1.0),
+                   MakeDoubleAccessor (&ResourceManager::m_ulSpsOverbookFactor),
+                   MakeDoubleChecker<double> (1.0, 8.0))
     .AddAttribute ("P0NominalPusch",
                    "Target received power P_0 at the satellite gNB (dBm).",
                    DoubleValue (-110.0),
@@ -72,6 +84,8 @@ ResourceManager::ResourceManager ()
     m_ulBeamBudgetRbs (25),
     m_dlSpsRegionRbs (0),
     m_ulSpsRegionRbs (0),
+    m_dlSpsOverbookFactor (1.0),
+    m_ulSpsOverbookFactor (1.0),
     m_maxEirpPortable (63.0),   // 对应 33 dBW 的便携式终端发射物理极限
     m_maxEirpConsumer (50.0),   // 对应 20 dBW 的消费级手机发射物理极限
     m_beamPowerBudgetDbm (50.0),
@@ -191,7 +205,7 @@ ResourceManager::AllocateSharedSpectrum (uint32_t beamId, uint32_t requestedRbs,
 }
 
 // =================================================================
-// 阶段0: SPS 频域分区 —— 按"具体 RBG 索引"分配 / 复用 / 释放
+// 阶段0/4: SPS 频域分区 + overbooking —— 逻辑准入 / 每周期物理认领 / 释放
 // =================================================================
 bool
 ResourceManager::IsSpsRbgFree (uint32_t beamId, uint32_t rbg, bool isUplink) const
@@ -210,27 +224,82 @@ ResourceManager::IsSpsRbgFree (uint32_t beamId, uint32_t rbg, bool isUplink) con
   return busy.find (rbg) == busy.end ();
 }
 
+uint32_t
+ResourceManager::GetSpsAdmitCapRbs (bool isUplink) const
+{
+  // 账面准入容量 = floor(region × factor)。factor=1.0 ⇒ 账面=物理(不超订)。
+  const uint32_t region = isUplink ? m_ulSpsRegionRbs : m_dlSpsRegionRbs;
+  const double factor = isUplink ? m_ulSpsOverbookFactor : m_dlSpsOverbookFactor;
+  return static_cast<uint32_t> (std::floor (static_cast<double> (region) * factor));
+}
+
+uint32_t
+ResourceManager::GetSpsAdmittedRbs (uint32_t beamId, bool isUplink) const
+{
+  auto it = m_beamUsageMap.find (beamId);
+  if (it == m_beamUsageMap.end ())
+    {
+      return 0;
+    }
+  return isUplink ? it->second.ulSpsAdmittedRbs : it->second.dlSpsAdmittedRbs;
+}
+
+bool
+ResourceManager::AdmitSpsGrant (uint32_t beamId, uint32_t count, bool isUplink)
+{
+  NS_LOG_FUNCTION (this << beamId << count << isUplink);
+  if (count == 0)
+    {
+      return false;
+    }
+  const uint32_t cap = GetSpsAdmitCapRbs (isUplink);
+  if (cap == 0)
+    {
+      return false; // SPS 区未启用
+    }
+  BeamAllocationUsage& usage = GetOrCreateBeamUsage (beamId);
+  uint32_t& admitted = isUplink ? usage.ulSpsAdmittedRbs : usage.dlSpsAdmittedRbs;
+  if (admitted + count > cap)
+    {
+      return false; // 账面已满(连超订额度也用尽)
+    }
+  admitted += count;
+  return true;
+}
+
+void
+ResourceManager::ReleaseSpsAdmission (uint32_t beamId, uint32_t count, bool isUplink)
+{
+  auto it = m_beamUsageMap.find (beamId);
+  if (it == m_beamUsageMap.end ())
+    {
+      return;
+    }
+  uint32_t& admitted = isUplink ? it->second.ulSpsAdmittedRbs : it->second.dlSpsAdmittedRbs;
+  admitted = (admitted > count) ? (admitted - count) : 0;
+}
+
 std::vector<uint32_t>
-ResourceManager::AllocateSpsRbgs (uint32_t beamId, uint32_t count, bool isUplink)
+ResourceManager::ClaimSpsRbgs (uint32_t beamId, uint32_t count, bool isUplink)
 {
   NS_LOG_FUNCTION (this << beamId << count << isUplink);
   std::vector<uint32_t> picked;
   const uint32_t region = isUplink ? m_ulSpsRegionRbs : m_dlSpsRegionRbs;
   if (region == 0 || count == 0)
     {
-      return picked; // SPS 区未启用或无需求
+      return picked;
     }
 
   BeamAllocationUsage& usage = GetOrCreateBeamUsage (beamId);
   std::set<uint32_t>& busy = isUplink ? usage.ulSpsBusy : usage.dlSpsBusy;
-
-  // 受三重约束: 不超过请求数、不超过区内剩余空闲槽位、不超过剩余计数预算。
   const uint32_t remainingBudget = GetRemainingRbs (beamId, isUplink);
+
+  // 本轮 first-fit 收集 count 个空闲物理槽位(受区大小与计数预算约束)。
   for (uint32_t slot = 0; slot < region && picked.size () < count; ++slot)
     {
       if (picked.size () >= remainingBudget)
         {
-          break; // 计数预算已无空间, 即便区内还有槽位也不能再占(避免超预算)
+          break;
         }
       if (busy.find (slot) == busy.end ())
         {
@@ -238,7 +307,12 @@ ResourceManager::AllocateSpsRbgs (uint32_t beamId, uint32_t count, bool isUplink
         }
     }
 
-  // 原子提交: 标记占用并联动计数(每个 SPS 索引对应一个 RB 计数额度)。
+  if (picked.size () < count)
+    {
+      // 原子: 凑不齐 count 个(本周期物理区已满) ⇒ 不认领任何, 返回空(调度器记为冲突)。
+      return std::vector<uint32_t> ();
+    }
+
   for (uint32_t slot : picked)
     {
       busy.insert (slot);
@@ -251,55 +325,7 @@ ResourceManager::AllocateSpsRbgs (uint32_t beamId, uint32_t count, bool isUplink
     {
       usage.dlUsedRbs += static_cast<uint32_t> (picked.size ());
     }
-
-  NS_LOG_INFO ("RRM SPS Allocate | Beam=" << beamId
-               << " | Dir=" << (isUplink ? "UL" : "DL")
-               << " | Requested=" << count
-               << " | Region=" << region
-               << " ===> Picked=" << picked.size () << " RBG slots");
   return picked;
-}
-
-bool
-ResourceManager::ReserveSpsRbgs (uint32_t beamId, const std::vector<uint32_t>& rbgs, bool isUplink)
-{
-  NS_LOG_FUNCTION (this << beamId << rbgs.size () << isUplink);
-  if (rbgs.empty ())
-    {
-      return true; // 空 bitmap 视为成功(无须占用)
-    }
-  const uint32_t region = isUplink ? m_ulSpsRegionRbs : m_dlSpsRegionRbs;
-  BeamAllocationUsage& usage = GetOrCreateBeamUsage (beamId);
-  std::set<uint32_t>& busy = isUplink ? usage.ulSpsBusy : usage.dlSpsBusy;
-
-  // 预检: 所有索引必须在区内、当前空闲, 且计数预算放得下整组(原子, 不超预算)。
-  const uint32_t remainingBudget = GetRemainingRbs (beamId, isUplink);
-  if (rbgs.size () > remainingBudget)
-    {
-      return false;
-    }
-  for (uint32_t rbg : rbgs)
-    {
-      if (rbg >= region || busy.find (rbg) != busy.end ())
-        {
-          return false; // 越界或冲突 -> 整体失败
-        }
-    }
-
-  // 全部通过, 提交占用 + 联动计数。
-  for (uint32_t rbg : rbgs)
-    {
-      busy.insert (rbg);
-    }
-  if (isUplink)
-    {
-      usage.ulUsedRbs += static_cast<uint32_t> (rbgs.size ());
-    }
-  else
-    {
-      usage.dlUsedRbs += static_cast<uint32_t> (rbgs.size ());
-    }
-  return true;
 }
 
 void

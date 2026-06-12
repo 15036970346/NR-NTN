@@ -93,7 +93,8 @@ enum class SpsMode {
 // 阶段1: 半静态授权(configured grant)。一条 grant 跨多个周期复用同一组 RBG。
 //  与"现 SPS 每周期重分/重发"的根本区别: 激活一次→存下来→周期复用, 不再逐周期重决策。
 struct SatSpsGrant {
-  std::vector<uint32_t> rbgBitmap;   // 激活时在 SPS 区锁定的 RBG 逻辑索引(持久, 复用按回原位)
+  uint32_t rbgSize {0};              // 该 grant 每周期需要的 RBG 数(持久; overbooking 下账面按此准入)
+  std::vector<uint32_t> rbgBitmap;   // 本周期 first-fit 认领到的物理 RBG 索引(每周期更新; 供日志/NOMA叠加)
   uint8_t  mcs {0};
   uint32_t tbSize {0};               // 当前 MCS/RBG 下每周期 TBS 字节
   Time     period;                   // 该 grant 的 SPS 周期
@@ -103,15 +104,26 @@ struct SatSpsGrant {
   bool     active {false};
   bool     isUplink {false};
   uint32_t beamId {0};               // 激活时所在波束(复用只在同波束尝试)
-  // 功率域半静态 NOMA 绑定(阶段3 用, 先留字段不启用)
-  uint16_t nomaPartnerRnti {0};
-  double   nomaBeta {0.0};
+  // 功率域半静态 NOMA 绑定(阶段3): 一次配对写入, 跨周期复用, 每 NomaRepairPeriod 重评估。
+  uint16_t nomaPartnerRnti {0};      // 绑定的 far(弱信道)UE; 0=未配对
+  double   nomaBeta {0.0};           // far 功率份额 β(配对时锁定)
+  uint32_t reuseSinceRepair {0};     // 距上次配对重评估的复用次数
 };
 
 // 阶段1: SPS 统计(注: DCI 真实节省口径要到阶段2 UE 侧 configured grant 后才成立)。
 struct SatSpsStats {
   uint64_t dlActivations {0}, dlReuse {0}, dlReleaseEmpty {0}, dlReleaseConflict {0};
   uint64_t ulActivations {0}, ulReuse {0}, ulReleaseEmpty {0}, ulReleaseConflict {0};
+  // 阶段4(overbooking): 每周期物理认领失败次数(冲突事件, 冲突率分子) 与 激活被账面上限拒绝次数。
+  uint64_t dlConflictEvents {0}, ulConflictEvents {0};
+  uint64_t dlAdmitRejects {0}, ulAdmitRejects {0};
+  // 阶段3(半静态 NOMA): SPS grant 上成功叠加 far 的次数(半持续配对发射次数)。
+  uint64_t nomaSpsPairs {0};
+  // 阶段2(真省 DCI): 实际下发的 SPS DCI 数(激活+重配+释放) 与 无 DCI 复用次数(真实节省)。
+  uint64_t dlSpsDciSent {0}, dlSpsReuseNoDci {0};
+  uint64_t ulSpsDciSent {0}, ulSpsReuseNoDci {0};
+  // 阶段5(统计): SPS DL 累计交付字节(吞吐量指标)。
+  uint64_t dlSpsServedBytes {0};
 };
 
 // 用于切换上下文转移的结构体 (并集: qyh 丰富字段 + 0603 多目标 ServiceObject)
@@ -329,6 +341,25 @@ public:
   void RunScheduler ();
   void SendControlMsg (uint16_t rnti, uint8_t msgType);
 
+  // ---- 阶段1 SPS 测试/统计访问器 ----
+  const SatSpsStats& GetSpsStats () const { return m_spsStats; }
+  uint32_t GetDlSpsGrantCount () const { return static_cast<uint32_t> (m_dlSpsGrants.size ()); }
+  uint32_t GetUlSpsGrantCount () const { return static_cast<uint32_t> (m_ulSpsGrants.size ()); }
+  uint32_t GetSpsAdmittedRbs (uint32_t beamId, bool isUplink) const
+  { return m_resourceManager ? m_resourceManager->GetSpsAdmittedRbs (beamId, isUplink) : 0u; }
+  // 供测试/外部按周期驱动 UL 一轮: 模拟 DoSchedUlTriggerReq 的 per-TTI 行为——
+  // 先推进 UL 轮次并重置各 beam 的 UL 预算, 再运行 UL 调度。这样 SPS 的 RBG 预留发生在
+  // 重置之后, 不会被 ProcessUlGrant 内的 BeginUlSchedulingPeriod 误清(后者见已有轮次即跳过)。
+  void RunUlSchedulingRound ()
+  {
+    const uint64_t round = ++m_nextUlSchedulingRoundId;
+    for (const auto& beamPair : m_beamToUesMap)
+      {
+        BeginUlSchedulingPeriod (beamPair.first, round);
+      }
+    RunUlScheduler ();
+  }
+
   // ==================== 功能验证演示访问器 (functional-demo.cc 专用) ====================
   // 谨慎、最小: 只读地暴露调度器内部已有的 "每RB字节估算" 与 "调度用CQI(经预测器处理)",
   // 以及一个 UE 优先级直设接口(供构造应急/语音/数据三类对比)。不改变调度流程。
@@ -345,7 +376,11 @@ public:
   void ReceivePucchInfo (const PucchInfo& pucchInfo);
   void ReceiveBsr (const BsR_MAC_CE& bsr);
   void ReceiveUlMacPdu (Ptr<Packet> packet);
-  uint32_t ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs);
+  // preReserved=true: rbAllocation 个 RB 已在 RM 预留(SPS 走 ClaimSpsRbgs), 跳过功率受限裁剪与
+  // AllocateSpectrum, 直接据此发 UL grant(复用功控/ledger/CLPC 逻辑)。
+  // sendDci=false(阶段2 UL configured-grant DCI-free 复用): 完成功控/ledger 记账但不下发 UL DCI。
+  uint32_t ProcessUlGrant (uint16_t rnti, uint32_t rbAllocation, uint8_t mcs,
+                           bool preReserved = false, bool sendDci = true);
 
   // ==================== 4 步随机接入接口 (基站侧) ====================
   void ReceivePrachPreamble (const PrachPreamble& preamble);
@@ -396,9 +431,20 @@ private:
   void    ScheduleDlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsServed);   // 复用到期 grant + 隐式释放
   void    ActivateDlSpsGrants (uint32_t beamId, const std::vector<uint16_t>& order,
                                std::set<uint16_t>& spsServed);                   // 给合格 UE 新建 grant
-  void    ServeDlSpsGrant (uint16_t rnti, SatSpsGrant& grant);                   // 实发一次(扣 buffer + DCI)
+  // 实发一次(扣 buffer); 阶段3: 绑定 NOMA far 且其本周期有数据则叠加 far, 返回被叠加 far rnti(否则0)。
+  // 阶段2(真省 DCI): isActivation=true 必发激活 DCI; 复用时仅当 MCS 需重配才发 DCI, 否则 DCI-free。
+  uint16_t ServeDlSpsGrant (uint16_t rnti, SatSpsGrant& grant, bool isActivation);
   void    ReleaseDlSpsGrant (const std::pair<uint16_t,uint8_t>& key, bool dueToConflict);
   Time    ComputeStaggeredNextTime (uint16_t rnti, Time now, Time period) const; // 错峰: 给每 UE 稳定相位偏移
+  // ---- 阶段3: 半静态 NOMA(在 SPS DL grant 上叠加 far) ----
+  uint16_t FindSpsNomaFar (uint32_t beamId, double nearCqi, const std::set<uint16_t>& exclude) const;
+  void     MaybeRepairSpsNomaPair (SatSpsGrant& grant, uint16_t nearRnti, const std::set<uint16_t>& exclude);
+  // ---- 阶段1: 半静态 configured-grant 状态机(UL, 与 DL 对称) ----
+  void    ScheduleUlSpsReuse (uint32_t beamId, std::set<uint16_t>& spsServed);   // 复用到期 UL grant + 隐式释放
+  void    ActivateUlSpsGrants (uint32_t beamId, const std::vector<uint16_t>& order,
+                               std::set<uint16_t>& spsServed);                   // 给合格 UE 新建 UL grant
+  void    ServeUlSpsGrant (uint16_t rnti, SatSpsGrant& grant, bool isActivation); // 发一次 UL 授权; 阶段2: 仅激活/重配发 DCI
+  void    ReleaseUlSpsGrant (const std::pair<uint16_t,uint8_t>& key, bool dueToConflict);
   ServicePriority MapTrafficTypeToPriority (TrafficType trafficType);
   double CalculateWrrWeight (ServicePriority priority, UtType utType);
   double EstimateBytesPerRb (double cqi, bool isUplink) const;
@@ -532,6 +578,9 @@ private:
   uint32_t m_spsActivationMinBytes;   // 激活下限字节(默认 1)
   bool     m_spsStaggerEnabled;       // 错峰开关(默认 true)
   bool     m_spsHarqEnabled;          // SPS 是否挂 HARQ(GEO 周期小包默认 false: 关 HARQ 用保守 MCS)
+  bool     m_spsNomaEnabled;          // 阶段3: 在 SPS grant 上叠加半静态 NOMA far(默认 false)
+  uint32_t m_nomaRepairPeriod;        // 阶段3: 每多少次复用重评估一次半静态配对(默认 4)
+  uint8_t  m_spsMcsReconfigThreshold; // 阶段2: 复用时 MCS 漂移 >= 此阈值才重发 DCI 重配; 否则 DCI-free(默认 2)
   std::map<std::pair<uint16_t,uint8_t>, SatSpsGrant> m_dlSpsGrants; // key=(rnti,lcid)
   std::map<std::pair<uint16_t,uint8_t>, SatSpsGrant> m_ulSpsGrants; // (阶段1 UL 暂留, 下一小步填)
   SatSpsStats m_spsStats;
