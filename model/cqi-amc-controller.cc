@@ -289,4 +289,18 @@ CqiAmcController::GetKalmanR (uint16_t rnti) const
   return (it == m_kalman.end ()) ? 0.0 : it->second.R;
 }
 
+double
+CqiAmcController::GetPredictVariance (uint16_t rnti) const
+{
+  auto it = m_kalman.find (rnti);
+  if (it == m_kalman.end () || !it->second.initialized)
+    return 0.0;
+  // 前向预测方差 (文档简化式, 恒正): P00 + H²·P11。
+  // (完整式含 +2H·P01, 但滤波收敛后 P01<0 且 H=510 会把它过度抵消到 ≤0; 取简化式更稳。)
+  const auto& P = it->second.P;
+  const double H = static_cast<double> (m_horizonH);
+  const double var = P[0][0] + H * H * P[1][1];
+  return std::max (0.0, var);
+}
+
 } // namespace ns3

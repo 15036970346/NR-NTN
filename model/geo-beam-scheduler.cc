@@ -906,14 +906,19 @@ void GeoBeamScheduler::UpdateUeDlCqi (uint16_t rnti, double cqi)
 
 uint8_t GeoBeamScheduler::GetMcsForNewTx (uint16_t rnti)
 {
+  return GetMcsForNewTx (rnti, 0.0);
+}
+
+uint8_t GeoBeamScheduler::GetMcsForNewTx (uint16_t rnti, double cqiBias)
+{
   if (m_cqiAmc)
     {
-      // effectiveCqi = PredictCqi(H) + Δ; 统一走 NrAmc 双参版 (DL)
-      return GetMcsFromCqi (m_cqiAmc->GetEffectiveCqi (rnti), false);
+      // effectiveCqi = PredictCqi(H) + Δ (+ HARQ 策略 blerTarget→CQI 偏置); 统一走 NrAmc 双参版 (DL)
+      return GetMcsFromCqi (m_cqiAmc->GetEffectiveCqi (rnti) + cqiBias, false);
     }
   auto it = m_ueContextMap.find (rnti);
   double cqi = (it != m_ueContextMap.end ()) ? it->second.latestCqi : 7.0;
-  return GetMcsFromCqi (cqi, false);
+  return GetMcsFromCqi (cqi + cqiBias, false);
 }
 
 // ============================================================

@@ -245,6 +245,9 @@ public:
 
   /// qyh 增量: 给某 UE 选 MCS。m_cqiAmc 注入则走 EffectiveCqi 路径; 否则回退 latestCqi → GetMcsFromCqi。
   uint8_t GetMcsForNewTx (uint16_t rnti);
+  /// 带 CQI 偏置版: (effectiveCqi 或 latestCqi) + cqiBias → MCS。供 HARQ 策略把 blerTarget
+  /// 转成 MCS 偏置 (激进目标→正偏置抬 MCS, 保守目标→负偏置降 MCS); 偏置在 GetMcsFromCqi 内 clamp 到 [0,15]。
+  uint8_t GetMcsForNewTx (uint16_t rnti, double cqiBias);
 
   // qyh 增量: PRACH 检测模型包装层 (lazy-create m_prachDetectionModel)
   void   EnablePrachDetectionErrors (bool enabled);

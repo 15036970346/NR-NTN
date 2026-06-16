@@ -26,6 +26,7 @@ set(source_files
 
     # ==================== HARQ 增强 ====================
     model/harq-manager.cc                # 8进程 HARQ-IR 重传
+    model/harq-policy-controller.cc      # 预测式 AMC+HARQ 联合策略选择器 (CQI预测驱动)
 
     # ==================== qyh 增量: 链路自适应 / RA 解调 ====================
     model/cqi-predictor.cc               # CQI 预测器抽象接口 (直通默认)
@@ -95,6 +96,7 @@ set(header_files
 
     # ==================== HARQ ====================
     model/harq-manager.h
+    model/harq-policy-controller.h       # 预测式 AMC+HARQ 联合策略选择器
 
     # ==================== qyh 增量: 链路自适应 / RA 解调 ====================
     model/cqi-predictor.h
