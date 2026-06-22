@@ -3,8 +3,6 @@
 # 合并版本：geosat-qyh + geosat-xys
 
 # 1. 定义模块名称
-# (检查修复: 原交付为 "0603geo-sat" — 数字开头的模块名会让 ns-3 的 lib<name> 变量为空,
-#  导致 add_library ALIAS 报错、configure 失败。模块名不能以数字开头, 改回 geo-sat。)
 set(name geo-sat)
 
 # 2. 源文件列表 (.cc)
@@ -26,6 +24,7 @@ set(source_files
 
     # ==================== HARQ 增强 ====================
     model/harq-manager.cc                # 8进程 HARQ-IR 重传
+    model/harq-policy-controller.cc      # 预测式 AMC+HARQ 联合策略选择器 (CQI预测驱动)
 
     # ==================== qyh 增量: 链路自适应 / RA 解调 ====================
     model/cqi-predictor.cc               # CQI 预测器抽象接口 (直通默认)
@@ -95,6 +94,7 @@ set(header_files
 
     # ==================== HARQ ====================
     model/harq-manager.h
+    model/harq-policy-controller.h       # 预测式 AMC+HARQ 联合策略选择器
 
     # ==================== qyh 增量: 链路自适应 / RA 解调 ====================
     model/cqi-predictor.h
@@ -284,5 +284,40 @@ build_lib_example(
 build_lib_example(
     NAME ntn-rrm-e2e-demo
     SOURCE_FILES examples/ntn-rrm-e2e-demo.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段1 SPS 时间驱动专项冒烟 (激活/复用/隐式释放/重激活 跨多周期跑全 + 断言) ---
+build_lib_example(
+    NAME ntn-sps-smoke
+    SOURCE_FILES examples/ntn-sps-smoke.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段4 SPS overbooking 统计复用消融 (factor 扫 1.0/1.5/2.0, 接入路数 vs 冲突率) ---
+build_lib_example(
+    NAME ntn-sps-overbook
+    SOURCE_FILES examples/ntn-sps-overbook.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段3 半静态 NOMA (SPS near 上半持续叠加动态 far) A/B 验证 ---
+build_lib_example(
+    NAME ntn-sps-noma
+    SOURCE_FILES examples/ntn-sps-noma.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段2 真省 DCI (configured grant: 复用不发 DCI) 验证 ---
+build_lib_example(
+    NAME ntn-sps-dci
+    SOURCE_FILES examples/ntn-sps-dci.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
+# --- 阶段5 SPS 实验矩阵/消融 (三域指标汇总 + 写 CSV 供绘图) ---
+build_lib_example(
+    NAME ntn-sps-experiment
+    SOURCE_FILES examples/ntn-sps-experiment.cc
     LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
 )

@@ -1,5 +1,5 @@
 /*
- * 文件路径：contrib/0603geo-sat/model/cqi-amc-predictor.h
+ * 文件路径：contrib/geo-sat/model/cqi-amc-predictor.h
  * 功能：把 CqiAmcController (OLLA 外环 + Kalman CQI 预测) 适配为 CqiPredictor 接口，
  *       从而经 GeoBeamScheduler::SetCqiPredictor 无侵入地接入资源管理。
  *

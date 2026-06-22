@@ -94,6 +94,12 @@ public:
   /** Kalman 内部状态 (L, R), 供 example/日志读取。 */
   double GetKalmanL (uint16_t rnti) const;
   double GetKalmanR (uint16_t rnti) const;
+  /**
+   * H 步前向预测的方差 Var(L + R·H) = P00 + 2·H·P01 + H²·P11 (由当前协方差外推)。
+   * 未初始化/无估计返回 0。供 HarqPolicyController 的不确定度风险项 (sigma=sqrt(此值)):
+   * 预测越不可信 → 方差越大 → 越该上冗余。
+   */
+  double GetPredictVariance (uint16_t rnti) const;
 
   // --- 参数 getter (供 example 输出/记录) ---
   uint32_t GetHorizonH () const { return m_horizonH; }
