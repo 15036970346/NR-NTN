@@ -287,6 +287,13 @@ build_lib_example(
     LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
 )
 
+# --- 端到端基本仿真流程 + 2.9 性能验证 (场景->RA->调度->真实数据面+HARQ->切换; flow/capacity/perf) ---
+build_lib_example(
+    NAME ntn-e2e-flow
+    SOURCE_FILES examples/ntn-e2e-flow.cc
+    LIBRARIES_TO_LINK ${libgeo-sat} ${liblte} ${libnr}
+)
+
 # --- 阶段1 SPS 时间驱动专项冒烟 (激活/复用/隐式释放/重激活 跨多周期跑全 + 断言) ---
 build_lib_example(
     NAME ntn-sps-smoke

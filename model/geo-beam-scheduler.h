@@ -368,6 +368,9 @@ public:
   // 以及一个 UE 优先级直设接口(供构造应急/语音/数据三类对比)。不改变调度流程。
   /// 公共包装: 走 CQI→MCS→NrAmc 通路返回每 RB 可承载字节数。
   double EstimateBytesPerRbForCqi (double cqi, bool isUplink) const { return EstimateBytesPerRb (cqi, isUplink); }
+  // 对目标 RB 数求真实 TBS 字节(NR TBS 随 RB 非线性, 走 NrAmc::GetPayloadSize(mcs,rbs));
+  // 取代单RB×N 线性外推, 供例子按已分配 RB 计真实吞吐 (峰值速率)。
+  uint32_t EstimateTbsBytes (double cqi, uint32_t rbs, bool isUplink) const;
   /// 公共包装: 返回某 UE 本轮调度实际使用的 CQI(关预测器=实测直通, 开=Kalman+OLLA有效CQI)。
   double GetSchedulingCqiForUe (uint16_t rnti, bool isUplink) const;
   /// 直接设置某 UE 的业务优先级(用于构造 EMERGENCY 等无法由业务类型映射得到的等级)。
@@ -451,9 +454,6 @@ private:
   ServicePriority MapTrafficTypeToPriority (TrafficType trafficType);
   double CalculateWrrWeight (ServicePriority priority, UtType utType);
   double EstimateBytesPerRb (double cqi, bool isUplink) const;
-  // 对目标 RB 数求真实 TBS 字节(NR TBS 随 RB 非线性, 直接走 NrAmc::GetPayloadSize(mcs,rbs))。
-  // 用于"按已分配 RB 计实发字节"与"按 buffer 反推所需 RB", 取代单RB×N 线性外推。
-  uint32_t EstimateTbsBytes (double cqi, uint32_t rbs, bool isUplink) const;
   // 二分: 返回承载 targetBytes 所需的最小 RB 数(clamp 到 maxRbs); targetBytes==0 → 0。
   uint32_t RbsForBytes (double cqi, uint32_t targetBytes, uint32_t maxRbs, bool isUplink) const;
   double CalculateLocationFactor (const Vector& position) const;
